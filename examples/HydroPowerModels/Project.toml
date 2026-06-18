@@ -1,0 +1,20 @@
+[deps]
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+CUDSS_jll = "4889d778-9329-5762-9fec-0578a5d30366"
+ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+DecisionRulesExa = "7c3e91a4-d8f2-4b6a-9e15-a2c4f7b80d53"
+ExaModels = "1037b233-b668-4ce9-9b63-f9f681f55dd2"
+Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+MadNLP = "2621e9c9-9eb4-46b1-8089-e8c72242dfb6"
+MadNLPGPU = "d72a61cc-809d-412f-99be-fd81f4b8a598"
+Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
+Wandb = "ad70616a-06c9-5745-b1f1-6a5f42545108"
+Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
+cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
+
+[sources]
+DecisionRulesExa = {path = "../.."}
