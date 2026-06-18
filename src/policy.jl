@@ -19,7 +19,7 @@ struct MLPPolicy{M}
     output_dim::Int
 end
 
-Flux.@functor MLPPolicy
+Flux.@layer MLPPolicy
 
 function (π::MLPPolicy)(input)
     y = π.model(input)
@@ -68,7 +68,7 @@ struct StateConditionedPolicy{E,C}
     n_state::Int
 end
 
-Flux.@functor StateConditionedPolicy
+Flux.@layer StateConditionedPolicy
 
 function (m::StateConditionedPolicy)(input)
     w = reshape(input[1:m.n_uncertainty], :, 1)   # (n_unc, 1) for LSTM
