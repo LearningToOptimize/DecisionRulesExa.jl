@@ -17,7 +17,7 @@ Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 
 [compat]
 ChainRulesCore = "1.25"
-ExaModels = "0.8"
+ExaModels = "0.8, 0.11"
 Flux = "0.16"
 MadNLP = "0.9, 0.10"
 MadNLPGPU = "0.9, 0.10"
