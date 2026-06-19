@@ -168,6 +168,128 @@ function simulate_tsddr(
     return (objective = result.objective, lambda = F.(Array(λ)))
 end
 
+function _rollout_xhat_flat(model, initial_state, w_flat, T::Int, F)
+    nw = length(w_flat) ÷ T
+    nx = length(initial_state)
+    Flux.reset!(model)
+    buf = Zygote.Buffer(zeros(F, nx * T))
+    prev = F.(initial_state)
+    for t in 1:T
+        wt = F.(w_flat[(t-1)*nw+1 : t*nw])
+        xt = model(vcat(wt, prev))
+        for i in 1:nx
+            buf[(t-1)*nx + i] = xt[i]
+        end
+        prev = xt
+    end
+    return copy(buf)
+end
+
+_has_critic(::NoCriticControlVariate) = false
+_has_critic(::AbstractCriticControlVariate) = true
+
+function _validate_critic_training_args(;
+    actor_gradient_mode,
+    critic_cv_weight,
+    dual_actor_weight,
+    critic_actor_weight,
+    critic_updates_per_batch,
+    critic_buffer_size,
+    critic_rollout_samples_per_batch,
+    num_cheap_critic_samples_per_batch,
+)
+    actor_gradient_mode in (:control_variate, :surrogate) ||
+        error("actor_gradient_mode must be :control_variate or :surrogate")
+    critic_cv_weight >= 0 || error("critic_cv_weight must be nonnegative")
+    dual_actor_weight >= 0 || error("dual_actor_weight must be nonnegative")
+    critic_actor_weight >= 0 || error("critic_actor_weight must be nonnegative")
+    critic_updates_per_batch >= 0 || error("critic_updates_per_batch must be nonnegative")
+    critic_buffer_size >= 0 || error("critic_buffer_size must be nonnegative")
+    if critic_rollout_samples_per_batch !== nothing
+        critic_rollout_samples_per_batch >= 0 ||
+            error("critic_rollout_samples_per_batch must be nonnegative or nothing")
+    end
+    num_cheap_critic_samples_per_batch >= 0 ||
+        error("num_cheap_critic_samples_per_batch must be nonnegative")
+    return true
+end
+
+function _resolve_critic_training_target(target, has_critic::Bool)
+    has_critic || return DeterministicEquivalentCriticTarget()
+    target isa AbstractCriticTrainingTarget && return target
+    if target === :deterministic_equivalent || target === :de
+        return DeterministicEquivalentCriticTarget()
+    elseif target === :rollout
+        error("critic_training_target=:rollout requires a RolloutCriticTarget(...) configuration")
+    else
+        error("critic_training_target must be RolloutCriticTarget(...), DeterministicEquivalentCriticTarget(), :rollout, or :deterministic_equivalent")
+    end
+end
+
+function _critic_sample_from_rollout(
+    model,
+    initial_state,
+    target::RolloutCriticTarget,
+    w_flat,
+    lambda,
+    F,
+    solver_state,
+)
+    result = rollout_tsddr(
+        model,
+        initial_state,
+        target.stage_problem,
+        w_flat;
+        horizon = target.horizon,
+        n_uncertainty = target.n_uncertainty,
+        set_stage_parameters! = target.set_stage_parameters!,
+        realized_state = target.realized_state,
+        objective_no_target_penalty = target.objective_no_target_penalty,
+        madnlp_kwargs = target.madnlp_kwargs,
+        warmstart = target.warmstart,
+        policy_state = target.policy_state,
+        solver_state = solver_state,
+        reuse_solver = target.reuse_solver,
+    )
+    result === nothing && return nothing
+
+    objective = target.objective_value === :objective ?
+        result.objective : result.objective_no_target_penalty
+    xhat_flat = F.(vcat(result.target_trajectory...))
+    return CriticSample(F.(initial_state), F.(w_flat), xhat_flat, objective, F.(lambda))
+end
+
+function _rollout_critic_samples(
+    model,
+    initial_state,
+    target::RolloutCriticTarget,
+    de_samples,
+    F,
+    max_samples,
+    solver_state,
+)
+    isempty(de_samples) && return CriticSample[]
+    n = max_samples === nothing ? length(de_samples) : min(Int(max_samples), length(de_samples))
+    n == 0 && return CriticSample[]
+    idx = n == length(de_samples) ? eachindex(de_samples) : randperm(length(de_samples))[1:n]
+    samples = CriticSample[]
+    for i in idx
+        s = de_samples[i]
+        sample = _critic_sample_from_rollout(
+            model,
+            initial_state,
+            target,
+            s.uncertainty,
+            s.target_multipliers,
+            F,
+            solver_state,
+        )
+        sample === nothing && continue
+        push!(samples, sample)
+    end
+    return samples
+end
+
 # ── train_tsddr ───────────────────────────────────────────────────────────────
 
 """
@@ -202,6 +324,20 @@ Keyword arguments (mirror `train_multistage`):
 - `problem_pool`            : vector of `(de, p_x0, p_target, p_uncertainty)` tuples
                               for parallel GPU solves; each entry gets its own MadNLP solver
                               and samples are distributed round-robin across the pool
+- `control_variate`         : optional `ScalarCriticControlVariate`; default
+                              `NoCriticControlVariate()` recovers the original update
+- `critic_training_target`  : `RolloutCriticTarget(...)` for rollout-objective
+                              critic fitting, or `DeterministicEquivalentCriticTarget()`
+                              / `:deterministic_equivalent` for DE ablations
+- `critic_rollout_samples_per_batch`: number of solved batch scenarios to rerun
+                              through stage-wise rollout for critic targets;
+                              `nothing` uses all successful solved scenarios
+- `actor_gradient_mode`     : `:control_variate` or `:surrogate`
+- `num_cheap_critic_samples_per_batch`: extra policy rollouts used only for
+                              critic actor terms; these do not trigger NLP solves
+- `external_critic_samples`  : mutable vector; `record_loss` can push
+                              `CriticSample`s (e.g. from `critic_samples_from_evaluation`)
+                              to feed the critic replay buffer without extra solves
 """
 function train_tsddr(
     model,
@@ -225,10 +361,39 @@ function train_tsddr(
     madnlp_kwargs            = NamedTuple(),
     warmstart::Bool          = true,
     problem_pool             = nothing,
+    control_variate::AbstractCriticControlVariate = NoCriticControlVariate(),
+    actor_gradient_mode::Symbol = :control_variate,
+    critic_cv_weight::Real   = 1.0,
+    dual_actor_weight::Real  = 1.0,
+    critic_actor_weight::Real = 1.0,
+    critic_updates_per_batch::Int = 1,
+    critic_buffer_size::Int  = 0,
+    critic_batch_size        = nothing,
+    critic_training_target   = :rollout,
+    critic_rollout_samples_per_batch = nothing,
+    num_cheap_critic_samples_per_batch::Int = 0,
+    critic_optimizer         = Flux.Adam(1f-3),
+    external_critic_samples  = nothing,
 )
     T    = det_equivalent.horizon
     F    = eltype(initial_state)
     nx   = length(initial_state)
+
+    _validate_critic_training_args(
+        actor_gradient_mode = actor_gradient_mode,
+        critic_cv_weight = critic_cv_weight,
+        dual_actor_weight = dual_actor_weight,
+        critic_actor_weight = critic_actor_weight,
+        critic_updates_per_batch = critic_updates_per_batch,
+        critic_buffer_size = critic_buffer_size,
+        critic_rollout_samples_per_batch = critic_rollout_samples_per_batch,
+        num_cheap_critic_samples_per_batch = num_cheap_critic_samples_per_batch,
+    )
+    has_critic = _has_critic(control_variate)
+    resolved_critic_training_target = _resolve_critic_training_target(
+        critic_training_target,
+        has_critic,
+    )
 
     # ── Build worker pool ────────────────────────────────────────────────────
     if problem_pool === nothing
@@ -277,6 +442,12 @@ function train_tsddr(
     end
 
     opt_state = Flux.setup(optimizer, model)
+    critic_opt_state = has_critic ? Flux.setup(critic_optimizer, control_variate.critic) : nothing
+    critic_buffer = CriticReplayBuffer(critic_buffer_size)
+    critic_rollout_solver_state = resolved_critic_training_target isa RolloutCriticTarget &&
+        resolved_critic_training_target.reuse_solver ?
+        _make_solver(resolved_critic_training_target.stage_problem.model,
+                     resolved_critic_training_target.madnlp_kwargs) : nothing
 
     try
 
@@ -339,31 +510,138 @@ function train_tsddr(
 
         # Step 3: Collect valid results
         valid   = Vector{Tuple{Vector{F}, Vector{F}}}()
+        de_samples = CriticSample[]
         obj_sum = 0.0
-        for r in solve_ok
+        for (s, r) in enumerate(solve_ok)
             r === nothing && continue
             push!(valid, (r[1], r[2]))
+            if has_critic
+                _, xhat_flat = sample_data[s]
+                push!(de_samples, CriticSample(F.(initial_state), r[1], xhat_flat, r[3], r[2]))
+            end
             obj_sum += r[3]
         end
         n_ok     = length(valid)
         mean_obj = n_ok > 0 ? obj_sum / n_ok : NaN
 
+        if has_critic && n_ok > 0 && critic_updates_per_batch > 0
+            valid_samples = if resolved_critic_training_target isa RolloutCriticTarget
+                _rollout_critic_samples(
+                    model,
+                    initial_state,
+                    resolved_critic_training_target,
+                    de_samples,
+                    F,
+                    critic_rollout_samples_per_batch,
+                    critic_rollout_solver_state,
+                )
+            else
+                de_samples
+            end
+            if external_critic_samples !== nothing && !isempty(external_critic_samples)
+                merged = Any[]
+                append!(merged, valid_samples)
+                append!(merged, external_critic_samples)
+                empty!(external_critic_samples)
+                valid_samples = merged
+            end
+            if critic_buffer_size > 0
+                push_critic_samples!(critic_buffer, valid_samples)
+                critic_samples = critic_buffer.samples
+            else
+                critic_samples = valid_samples
+            end
+            for _ in 1:critic_updates_per_batch
+                update_critic!(
+                    critic_opt_state,
+                    control_variate,
+                    critic_samples;
+                    batch_size = critic_batch_size,
+                )
+            end
+        end
+
         # ── Gradient: ∇_θ (1/n) Σ_s ⟨λ_s, rollout_s(θ)⟩ ────────────────────
         if n_ok > 0
-            gs = Zygote.gradient(model) do m
-                total = zero(F)
-                for (w_flat_s, λf) in valid
-                    nw = length(w_flat_s) ÷ T
-                    Flux.reset!(m)
-                    prev_ad = F.(initial_state)
-                    for t in 1:T
-                        wt      = F.(w_flat_s[(t-1)*nw+1 : t*nw])
-                        xt      = m(vcat(wt, prev_ad))
-                        total   = total + sum(λf[(t-1)*nx+1 : t*nx] .* xt)
-                        prev_ad = xt
+            if !has_critic
+                gs = Zygote.gradient(model) do m
+                    total = zero(F)
+                    for (w_flat_s, λf) in valid
+                        nw = length(w_flat_s) ÷ T
+                        Flux.reset!(m)
+                        prev_ad = F.(initial_state)
+                        for t in 1:T
+                            wt      = F.(w_flat_s[(t-1)*nw+1 : t*nw])
+                            xt      = m(vcat(wt, prev_ad))
+                            total   = total + sum(λf[(t-1)*nx+1 : t*nx] .* xt)
+                            prev_ad = xt
+                        end
                     end
+                    total / F(n_ok)
                 end
-                total / F(n_ok)
+            else
+                solved_weights = Vector{Tuple{Vector{F}, Vector{F}}}()
+                for sample in de_samples
+                    λf = F.(sample.target_multipliers)
+                    if actor_gradient_mode === :control_variate
+                        if critic_cv_weight == 0
+                            actor_weight = λf
+                        else
+                            gx = F.(critic_xhat_gradient(
+                                control_variate,
+                                sample.initial_state,
+                                sample.uncertainty,
+                                sample.xhat,
+                            ))
+                            _check_critic_sample_shapes(sample, gx)
+                            actor_weight = λf .- F(critic_cv_weight) .* gx
+                        end
+                    else
+                        actor_weight = F(dual_actor_weight) .* λf
+                    end
+                    push!(solved_weights, (F.(sample.uncertainty), actor_weight))
+                end
+
+                critic_uncertainties = if num_cheap_critic_samples_per_batch > 0
+                    [F.(uncertainty_sampler()) for _ in 1:num_cheap_critic_samples_per_batch]
+                else
+                    [F.(sample.uncertainty) for sample in de_samples]
+                end
+
+                gs = Zygote.gradient(model) do m
+                    residual_total = zero(F)
+                    for (w_flat_s, actor_weight) in solved_weights
+                        nw = length(w_flat_s) ÷ T
+                        Flux.reset!(m)
+                        prev_ad = F.(initial_state)
+                        for t in 1:T
+                            wt      = F.(w_flat_s[(t-1)*nw+1 : t*nw])
+                            xt      = m(vcat(wt, prev_ad))
+                            residual_total =
+                                residual_total + sum(actor_weight[(t-1)*nx+1 : t*nx] .* xt)
+                            prev_ad = xt
+                        end
+                    end
+                    actor_loss = residual_total / F(n_ok)
+
+                    critic_coeff = actor_gradient_mode === :control_variate ?
+                        F(critic_cv_weight) : F(critic_actor_weight)
+                    if critic_coeff != 0 && !isempty(critic_uncertainties)
+                        critic_total = zero(actor_loss)
+                        for w_flat_s in critic_uncertainties
+                            xhat_ad = _rollout_xhat_flat(m, initial_state, w_flat_s, T, F)
+                            critic_total = critic_total + critic_value(
+                                control_variate,
+                                F.(initial_state),
+                                w_flat_s,
+                                xhat_ad,
+                            )
+                        end
+                        actor_loss = actor_loss +
+                            critic_coeff * critic_total / F(length(critic_uncertainties))
+                    end
+                    actor_loss
+                end
             end
 
             grad = materialize_tangent(gs[1])

@@ -13,6 +13,7 @@ using ChainRulesCore
 include("utils.jl")
 include("deterministic_equivalent.jl")
 include("policy.jl")
+include("critic_control_variate.jl")
 include("training.jl")
 include("rollout.jl")
 
@@ -43,6 +44,20 @@ export
     solve_succeeded,
     materialize_tangent,
     _all_finite_gradient,
+    AbstractCriticControlVariate,
+    AbstractCriticTrainingTarget,
+    NoCriticControlVariate,
+    DeterministicEquivalentCriticTarget,
+    RolloutCriticTarget,
+    ScalarCriticControlVariate,
+    CriticSample,
+    CriticReplayBuffer,
+    default_critic_featurizer,
+    critic_value,
+    critic_xhat_gradient,
+    critic_loss,
+    update_critic!,
+    critic_samples_from_evaluation,
     simulate_tsddr,
     train_tsddr,
 
