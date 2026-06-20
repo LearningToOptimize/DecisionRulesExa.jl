@@ -314,10 +314,14 @@ train_tsddr(
         if iter % EVAL_EVERY == 0
             rollout_evaluation(iter, m)
             realized_rollout_evaluation(iter, m)
+            metrics["metrics/rollout_objective_no_target_penalty"] =
+                rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_objective_no_deficit"] =
                 rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_target_violation_share"] =
                 rollout_evaluation.last_violation_share
+            metrics["metrics/rollout_realized_objective_no_target_penalty"] =
+                realized_rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_realized_objective_no_deficit"] =
                 realized_rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_realized_target_violation_share"] =

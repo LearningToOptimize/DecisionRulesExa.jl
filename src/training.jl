@@ -235,6 +235,8 @@ function _critic_sample_from_rollout(
     F,
     solver_state,
 )
+    # Keep both rollout objective variants available; target.objective_value
+    # below selects which one is used as the critic value target.
     result = rollout_tsddr(
         model,
         initial_state,

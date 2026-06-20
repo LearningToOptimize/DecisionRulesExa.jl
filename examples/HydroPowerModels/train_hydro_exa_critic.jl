@@ -62,7 +62,7 @@ const load_scaler    = 0.6
 const NUM_WORKERS    = 4
 const CRITIC_ROLLOUT_SAMPLES_PER_BATCH = 0  # eval rollouts feed the critic via external_critic_samples
 const CRITIC_POLICY_STATE = :target      # set to :realized for closed-loop critic targets
-const CRITIC_ROLLOUT_OBJECTIVE = :objective_no_target_penalty
+const CRITIC_ROLLOUT_OBJECTIVE = :objective
 const NUM_CHEAP_CRITIC_SAMPLES_PER_BATCH = 4 * NUM_WORKERS
 
 const PENALTY_SCHEDULE = [
@@ -400,11 +400,18 @@ train_tsddr(
             rollout_evaluation(iter, m)
             realized_rollout_evaluation(iter, m)
             append!(shared_critic_samples,
-                    critic_samples_from_evaluation(rollout_evaluation))
+                    critic_samples_from_evaluation(
+                        rollout_evaluation;
+                        objective_key = CRITIC_ROLLOUT_OBJECTIVE,
+                    ))
+            metrics["metrics/rollout_objective_no_target_penalty"] =
+                rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_objective_no_deficit"] =
                 rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_target_violation_share"] =
                 rollout_evaluation.last_violation_share
+            metrics["metrics/rollout_realized_objective_no_target_penalty"] =
+                realized_rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_realized_objective_no_deficit"] =
                 realized_rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_realized_target_violation_share"] =

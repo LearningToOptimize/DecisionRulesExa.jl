@@ -28,6 +28,11 @@ Required keyword callbacks match `rollout_tsddr`:
 By default `policy_state = :target`, matching the differentiable target
 recurrence used by the actor. Set `policy_state = :realized` to train on
 closed-loop realized-state rollout targets.
+
+By default `objective_value = :objective`, so critic value targets include the
+same target-penalty contribution that appears in the dual actor signal. Set
+`objective_value = :objective_no_target_penalty` to train on the rollout
+objective with target-slack penalties removed.
 """
 struct RolloutCriticTarget{S,R,O,M} <: AbstractCriticTrainingTarget
     stage_problem
@@ -54,7 +59,7 @@ function RolloutCriticTarget(
     warmstart::Bool = true,
     policy_state::Symbol = :target,
     reuse_solver::Bool = false,
-    objective_value::Symbol = :objective_no_target_penalty,
+    objective_value::Symbol = :objective,
 )
     policy_state in (:target, :realized) ||
         error("policy_state must be :target or :realized")

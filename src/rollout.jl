@@ -302,11 +302,13 @@ end
 
 Convert the last rollout evaluation results into `CriticSample`s for critic
 training.  Target multipliers are zero (rollout evaluation does not produce
-duals), so these samples contribute only to the value loss term.
+duals), so these samples contribute only to the value loss term. By default the
+critic target uses the full rollout objective; pass
+`objective_key = :objective_no_target_penalty` to remove target-slack penalties.
 """
 function critic_samples_from_evaluation(
     eval_obj::RolloutEvaluation;
-    objective_key::Symbol = :objective_no_target_penalty,
+    objective_key::Symbol = :objective,
 )
     isempty(eval_obj.last_scenario_data) && return CriticSample[]
     F = eltype(eval_obj.initial_state)
