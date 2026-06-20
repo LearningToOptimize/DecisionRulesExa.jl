@@ -171,6 +171,7 @@ lg = WandbLogger(
         "layers"          => LAYERS,
         "activation"      => string(ACTIVATION),
         "target_penalty"  => "auto=$(round(resolved_pen; digits=2))",
+        "target_penalty_l1" => "auto=$(round(resolved_pen_l1; digits=2))",
         "deficit_cost"    => DEFICIT_COST,
         "num_epochs"      => NUM_EPOCHS,
         "num_batches"     => NUM_BATCHES,
@@ -223,9 +224,14 @@ end
 hydro_realized_state(stage_prob, result) =
     Array(hydro_solution(stage_prob, result).reservoir[:, end])
 
+resolved_pen_l1 = prob.base_penalty_l1
+
 function hydro_objective_no_target_penalty(stage_prob, result)
     sol = hydro_solution(stage_prob, result)
-    return result.objective - (resolved_pen / 2) * sum(abs2, Array(sol.delta))
+    delta = Array(sol.delta)
+    penalty_l2_cost = (resolved_pen / 2) * sum(abs2, delta)
+    penalty_l1_cost = resolved_pen_l1 * sum(abs, delta)
+    return result.objective - penalty_l2_cost - penalty_l1_cost
 end
 
 Random.seed!(8789)
@@ -296,11 +302,14 @@ train_tsddr(
         if mult != current_penalty_mult[]
             current_penalty_mult[] = mult
             ρ_half_scaled = prob.base_penalty_half * mult
-            penalty_vals = fill(ρ_half_scaled, T * nHyd)
+            ρ_l1_scaled   = prob.base_penalty_l1 * mult
+            penalty_vals    = fill(ρ_half_scaled, T * nHyd)
+            penalty_l1_vals = fill(ρ_l1_scaled,   T * nHyd)
             for (p, _, _, _) in problem_pool
                 ExaModels.set_parameter!(p.core, p.p_penalty_half, penalty_vals)
+                ExaModels.set_parameter!(p.core, p.p_penalty_l1,   penalty_l1_vals)
             end
-            @info "Penalty multiplier → $mult  (ρ/2 = $(round(ρ_half_scaled; digits=2)))"
+            @info "Penalty multiplier → $mult  (ρ/2 = $(round(ρ_half_scaled; digits=2)), λ_l1 = $(round(ρ_l1_scaled; digits=2)))"
         end
         n_eval = _schedule_value(EVAL_SCHEDULE, iter, MAX_EVAL_SCENARIOS)
         rollout_evaluation.active_scenarios = n_eval
