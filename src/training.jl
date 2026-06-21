@@ -313,7 +313,10 @@ Arguments:
 - `p_x0`               : ExaModels parameter for the initial state
 - `p_target`           : ExaModels parameter for policy targets
 - `p_uncertainty`      : ExaModels parameter for per-stage uncertainty
-- `uncertainty_sampler`: `() -> w_flat` — flat vector of length `T * nw_per_stage`
+- `uncertainty_sampler`: `() -> w_flat` — flat vector of length `T * nw_per_stage`.
+                         For multi-unit problems (e.g., hydro reservoirs) the sampler
+                         should draw one joint scenario index per stage to preserve
+                         spatial correlation; see `sample_scenario` in examples.
 
 Keyword arguments (mirror `train_multistage`):
 - `num_batches`             : total gradient steps (default 100)

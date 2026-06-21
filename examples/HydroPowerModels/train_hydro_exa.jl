@@ -290,7 +290,8 @@ train_tsddr(
     () -> sample_scenario(hydro_data, T);       # returns flat Float32 vector, length T*nHyd
     num_batches          = NUM_EPOCHS * NUM_BATCHES,
     num_train_per_batch  = NUM_WORKERS,
-    optimizer            = Flux.Optimisers.OptimiserChain(
+    optimizer            = isnothing(GRAD_CLIP) ? Flux.Adam(LR) :
+                           Flux.Optimisers.OptimiserChain(
                                Flux.Optimisers.ClipGrad(GRAD_CLIP),
                                Flux.Adam(LR),
                            ),

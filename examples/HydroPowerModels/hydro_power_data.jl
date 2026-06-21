@@ -354,15 +354,20 @@ end
 """
     sample_scenario(hydro_data, T) -> Vector{Float64}
 
-Sample one inflow trajectory of length T*nHyd (flat, stage-major order).
+Sample one inflow trajectory of length `T*nHyd` (flat, stage-major order).
+
+Uses **joint** scenario sampling: at each stage one scenario index `ω` is drawn
+and applied to all hydro reservoirs, preserving the spatial correlation present
+in the historical inflow data. This matches SDDP's `SDDP.parameterize` semantics.
 """
 function sample_scenario(hydro_data::HydroData, T::Int)
     nHyd = hydro_data.nHyd
     w = Vector{Float64}(undef, T * nHyd)
     for t in 1:T
         t_row = mod1(t, hydro_data.nStagesSample)
+        # One scenario index per stage — all reservoirs share it (joint sampling).
+        j = rand(1:hydro_data.nScenarios)
         for r in 1:nHyd
-            j = rand(1:hydro_data.nScenarios)
             w[(t-1)*nHyd + r] = hydro_data.scenario_inflows[r][t_row, j]
         end
     end
