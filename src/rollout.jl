@@ -152,6 +152,7 @@ mutable struct RolloutEvaluation <: Function
     last_objective_no_target_penalty::Float64
     last_violation_share::Float64
     last_n_ok::Int
+    last_scenario_data::Vector{Any}
 end
 
 function RolloutEvaluation(
@@ -197,10 +198,12 @@ function RolloutEvaluation(
         NaN,
         NaN,
         0,
+        Any[],
     )
 end
 
 function (evaluation::RolloutEvaluation)(iter, model)
+    empty!(evaluation.last_scenario_data)
     iter % evaluation.stride == 0 || return nothing
 
     n_eval = min(evaluation.active_scenarios, length(evaluation.scenarios))
@@ -234,6 +237,7 @@ function (evaluation::RolloutEvaluation)(iter, model)
             total += result.objective
             total_no_penalty += result.objective_no_target_penalty
             n_ok += 1
+            push!(evaluation.last_scenario_data, (i, result))
         end
     else
         # Parallel path: distribute scenarios across pool
@@ -267,11 +271,12 @@ function (evaluation::RolloutEvaluation)(iter, model)
                 results[round_start + j - 1] = fetch(t)
             end
         end
-        for r in results
+        for (idx, r) in enumerate(results)
             r === nothing && continue
             total += r.objective
             total_no_penalty += r.objective_no_target_penalty
             n_ok += 1
+            push!(evaluation.last_scenario_data, (idx, r))
         end
     end
 
@@ -290,4 +295,35 @@ function (evaluation::RolloutEvaluation)(iter, model)
         evaluation.last_objective_no_target_penalty,
     )
     return nothing
+end
+
+"""
+    critic_samples_from_evaluation(eval; objective_key) -> Vector{CriticSample}
+
+Convert the last rollout evaluation results into `CriticSample`s for critic
+training.  Target multipliers are zero (rollout evaluation does not produce
+duals), so these samples contribute only to the value loss term. By default the
+critic target uses the full rollout objective; pass
+`objective_key = :objective_no_target_penalty` to remove target-slack penalties.
+"""
+function critic_samples_from_evaluation(
+    eval_obj::RolloutEvaluation;
+    objective_key::Symbol = :objective,
+)
+    isempty(eval_obj.last_scenario_data) && return CriticSample[]
+    F = eltype(eval_obj.initial_state)
+    samples = CriticSample[]
+    for (i, result) in eval_obj.last_scenario_data
+        w_flat = eval_obj.scenarios[i]
+        xhat_flat = F.(vcat(result.target_trajectory...))
+        obj = Float64(getfield(result, objective_key))
+        push!(samples, CriticSample(
+            F.(eval_obj.initial_state),
+            F.(w_flat),
+            xhat_flat,
+            obj,
+            zeros(F, length(xhat_flat)),
+        ))
+    end
+    return samples
 end

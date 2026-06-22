@@ -1,10 +1,10 @@
-# train_hydro_exa.jl
+# train_hydro_exa_critic.jl
 #
 # HydroPowerModels training with ExaModels + MadNLP (DC or AC OPF).
-# Uses train_tsddr from DecisionRulesExa — no custom functions or structs needed.
+# Uses train_tsddr from DecisionRulesExa with a scalar critic control variate.
 #
 # Usage:
-#   julia --project -t auto train_hydro_exa.jl
+#   julia --project -t auto train_hydro_exa_critic.jl
 
 using DecisionRulesExa
 using ExaModels
@@ -34,43 +34,55 @@ const DEMAND_FILE = joinpath(CASE_DIR, "demand.csv")
 
 const LAYERS      = [128, 128]
 const ACTIVATION  = sigmoid
-const NUM_STAGES  = parse(Int, get(ENV, "DR_NUM_STAGES", "126"))
-const NUM_EPOCHS  = parse(Int, get(ENV, "DR_NUM_EPOCHS", "80"))
+const NUM_STAGES  = 96
+const NUM_EPOCHS  = 80
 const NUM_BATCHES = 100
-const NUM_TRAIN_PER_BATCH = 1
-const NUM_EVAL_SCENARIOS  = 4
-const EVAL_EVERY  = 25
+const MAX_EVAL_SCENARIOS = 32
+const EVAL_EVERY = 25
+
+const EVAL_SCHEDULE = [
+    (1,   div(NUM_EPOCHS * NUM_BATCHES, 2), 4),
+    (div(NUM_EPOCHS * NUM_BATCHES, 2) + 1, NUM_EPOCHS * NUM_BATCHES, MAX_EVAL_SCENARIOS),
+]
 const LR          = 1f-3
-const GRAD_CLIP   = parse(Float32, get(ENV, "DR_GRAD_CLIP", "10"))
+const GRAD_CLIP   = 10.0f0
+const CRITIC_LR   = 5f-4
+const CRITIC_HIDDEN = [256, 128]
+const CRITIC_VALUE_LOSS_WEIGHT = 1.0
+const CRITIC_GRADIENT_LOSS_WEIGHT = 0.0
+const CRITIC_CV_WEIGHT = 0.5
+const CRITIC_UPDATES_PER_BATCH = 2
+const CRITIC_BUFFER_SIZE = 512
+const CRITIC_BATCH_SIZE = 32
 
 const TARGET_PEN_ARG = :auto
 const DEFICIT_COST   = 1e5
 const USE_GPU        = true
 const load_scaler    = 0.6
-const NUM_WORKERS    = 1
+const NUM_WORKERS    = 4
+const CRITIC_ROLLOUT_SAMPLES_PER_BATCH = 0  # eval rollouts feed the critic via external_critic_samples
+const CRITIC_POLICY_STATE = :target      # set to :realized for closed-loop critic targets
+const CRITIC_ROLLOUT_OBJECTIVE = :objective
+const NUM_CHEAP_CRITIC_SAMPLES_PER_BATCH = 4 * NUM_WORKERS
 
-const _PENALTY_MODE = get(ENV, "DR_PENALTY_SCHEDULE", "annealed")
-const PENALTY_SCHEDULE = if _PENALTY_MODE == "annealed"
-    [
-        (1,   div(NUM_EPOCHS * NUM_BATCHES, 4), 0.1),
-        (div(NUM_EPOCHS * NUM_BATCHES, 4) + 1, div(NUM_EPOCHS * NUM_BATCHES, 4) * 2, 1.0),
-        (div(NUM_EPOCHS * NUM_BATCHES, 4) * 2 + 1, div(NUM_EPOCHS * NUM_BATCHES, 4) * 3, 10.0),
-        (div(NUM_EPOCHS * NUM_BATCHES, 4) * 3 + 1, NUM_EPOCHS * NUM_BATCHES, 30.0),
-    ]
-else
-    [(1, NUM_EPOCHS * NUM_BATCHES, 1.0)]
-end
+const PENALTY_SCHEDULE = [
+    (1,   div(NUM_EPOCHS * NUM_BATCHES, 4), 0.1),
+    (div(NUM_EPOCHS * NUM_BATCHES, 4) + 1, div(NUM_EPOCHS * NUM_BATCHES, 4) * 2, 1.0),
+    (div(NUM_EPOCHS * NUM_BATCHES, 4) * 2 + 1, div(NUM_EPOCHS * NUM_BATCHES, 4) * 3, 10.0),
+    (div(NUM_EPOCHS * NUM_BATCHES, 4) * 3 + 1, NUM_EPOCHS * NUM_BATCHES, 30.0),
+]
 
-# Optional: ramp num_train_per_batch and eval scenarios over training.
-# Set to `nothing` to use fixed NUM_TRAIN_PER_BATCH / NUM_EVAL_SCENARIOS.
-const NUM_TRAIN_SCHEDULE = nothing  # e.g. [(1,500,1),(501,2000,4),(2001,4000,8)]
-const EVAL_SCHEDULE      = nothing  # e.g. [(1,2000,4),(2001,4000,32)]
+const NUM_TRAIN_SCHEDULE = [
+    (1,   div(NUM_EPOCHS * NUM_BATCHES, 5), NUM_WORKERS),
+    (div(NUM_EPOCHS * NUM_BATCHES, 5) + 1, div(NUM_EPOCHS * NUM_BATCHES, 5) * 2, 2 * NUM_WORKERS),
+    (div(NUM_EPOCHS * NUM_BATCHES, 5) * 2 + 1, div(NUM_EPOCHS * NUM_BATCHES, 5) * 3, 4 * NUM_WORKERS),
+    (div(NUM_EPOCHS * NUM_BATCHES, 5) * 3 + 1, div(NUM_EPOCHS * NUM_BATCHES, 5) * 4, 8 * NUM_WORKERS),
+    (div(NUM_EPOCHS * NUM_BATCHES, 5) * 4 + 1, NUM_EPOCHS * NUM_BATCHES, 8 * NUM_WORKERS),
+]
 
 const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = 9000)
 
-const _CLIP_TAG  = GRAD_CLIP > 0 ? "-clip$(Int(GRAD_CLIP))" : ""
-const _SCHED_TAG = _PENALTY_MODE == "annealed" ? "-anneal" : "-const"
-const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-deteq-gpu$(_CLIP_TAG)$(_SCHED_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
+const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-deteq-gpu-critic-cv-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
 const MODEL_DIR = joinpath(CASE_DIR, FORM_LABEL, "models")
 mkpath(MODEL_DIR)
 const MODEL_PATH = joinpath(MODEL_DIR, RUN_NAME * ".jld2")
@@ -135,6 +147,41 @@ x0_init = Float32.([clamp(hydro_data.initial_volumes[r],
                            hydro_data.units[r].max_vol)
                     for r in 1:nHyd])
 
+# ── Critic/control variate ───────────────────────────────────────────────────
+
+volume_scale = Float32.([max(abs(u.max_vol), abs(u.min_vol), 1.0) for u in hydro_data.units])
+inflow_scale = Float32.([
+    max(maximum(abs, hydro_data.scenario_inflows[r]), 1.0)
+    for r in 1:nHyd
+])
+
+const _full_inflow_scale = repeat(inflow_scale, T)
+const _full_volume_scale = repeat(volume_scale, T)
+
+function hydro_critic_featurizer(initial_state, w_flat, xhat_flat)
+    x0_scaled = Float32.(initial_state) ./ volume_scale
+    w_scaled = Float32.(w_flat) ./ _full_inflow_scale
+    x_scaled = Float32.(xhat_flat) ./ _full_volume_scale
+    return vcat(x0_scaled, w_scaled, x_scaled)
+end
+
+critic_input_dim = nHyd + 2 * T * nHyd
+critic_layers = Any[]
+critic_in = critic_input_dim
+for h in CRITIC_HIDDEN
+    push!(critic_layers, Flux.Dense(critic_in => h, tanh))
+    global critic_in = h
+end
+push!(critic_layers, Flux.Dense(critic_in => 1))
+critic = Flux.Chain(critic_layers...)
+
+control_variate = ScalarCriticControlVariate(
+    critic;
+    featurizer = hydro_critic_featurizer,
+    value_loss_weight = CRITIC_VALUE_LOSS_WEIGHT,
+    gradient_loss_weight = CRITIC_GRADIENT_LOSS_WEIGHT,
+)
+
 # ── Smoke test ────────────────────────────────────────────────────────────────
 
 w_mean = mean_inflow(hydro_data, T)
@@ -146,8 +193,6 @@ result0 = MadNLP.madnlp(prob.model; SOLVER_KWARGS..., print_level = MadNLP.WARN)
 @info "  Status: $(result0.status)   Objective: $(round(result0.objective; digits=4))"
 isfinite(result0.objective) || error("Smoke test returned non-finite objective")
 solve_succeeded(result0) || @warn "Smoke test did not fully converge; proceeding anyway"
-
-resolved_pen_l1 = prob.base_penalty_l1
 
 # ── Policy ────────────────────────────────────────────────────────────────────
 
@@ -173,21 +218,32 @@ lg = WandbLogger(
         "layers"          => LAYERS,
         "activation"      => string(ACTIVATION),
         "target_penalty"  => "auto=$(round(resolved_pen; digits=2))",
-        "target_penalty_l1" => "auto=$(round(resolved_pen_l1; digits=2))",
         "deficit_cost"    => DEFICIT_COST,
         "num_epochs"      => NUM_EPOCHS,
         "num_batches"     => NUM_BATCHES,
-        "num_train_per_batch" => NUM_TRAIN_PER_BATCH,
-        "num_eval_scenarios" => NUM_EVAL_SCENARIOS,
+        "max_eval_scenarios" => MAX_EVAL_SCENARIOS,
+        "eval_schedule"   => string(EVAL_SCHEDULE),
         "eval_every"      => EVAL_EVERY,
         "lr"              => LR,
         "grad_clip"       => GRAD_CLIP,
+        "critic_lr"       => CRITIC_LR,
+        "critic_hidden"   => CRITIC_HIDDEN,
+        "critic_value_loss_weight" => CRITIC_VALUE_LOSS_WEIGHT,
+        "critic_gradient_loss_weight" => CRITIC_GRADIENT_LOSS_WEIGHT,
+        "critic_cv_weight" => CRITIC_CV_WEIGHT,
+        "critic_updates_per_batch" => CRITIC_UPDATES_PER_BATCH,
+        "critic_buffer_size" => CRITIC_BUFFER_SIZE,
+        "critic_batch_size" => CRITIC_BATCH_SIZE,
+        "critic_training_target" => "rollout",
+        "critic_rollout_samples_per_batch" => CRITIC_ROLLOUT_SAMPLES_PER_BATCH,
+        "critic_policy_state" => string(CRITIC_POLICY_STATE),
+        "critic_rollout_objective" => string(CRITIC_ROLLOUT_OBJECTIVE),
+        "num_cheap_critic_samples_per_batch" => NUM_CHEAP_CRITIC_SAMPLES_PER_BATCH,
         "backend"         => USE_GPU ? "GPU" : "CPU",
         "load_scaler"     => load_scaler,
         "penalty_schedule" => string(PENALTY_SCHEDULE),
-        "num_train_schedule" => string(something(NUM_TRAIN_SCHEDULE, "fixed")),
-        "eval_schedule"   => string(something(EVAL_SCHEDULE, "fixed")),
-        "num_workers"     => NUM_WORKERS,
+        "num_train_schedule" => string(NUM_TRAIN_SCHEDULE),
+        "num_workers" => NUM_WORKERS,
     ),
 )
 
@@ -211,9 +267,8 @@ function _build_rollout_de()
     )
 end
 rollout_prob = _build_rollout_de()
-n_rollout_pool = max(NUM_WORKERS, NUM_EVAL_SCENARIOS)
-rollout_pool = [_build_rollout_de() for _ in 1:n_rollout_pool]
-@info "Rollout pool ready: $(n_rollout_pool) CPU stage-problem copies"
+rollout_pool = [_build_rollout_de() for _ in 1:NUM_WORKERS]
+@info "Rollout pool ready: $(NUM_WORKERS) CPU stage-problem copies"
 
 function set_hydro_rollout_stage!(stage_prob, state_in, wt, target, stage)
     ExaModels.set_parameter!(stage_prob.core, stage_prob.p_x0, state_in)
@@ -230,14 +285,11 @@ hydro_realized_state(stage_prob, result) =
 
 function hydro_objective_no_target_penalty(stage_prob, result)
     sol = hydro_solution(stage_prob, result)
-    delta = Array(sol.delta)
-    penalty_l2_cost = (resolved_pen / 2) * sum(abs2, delta)
-    penalty_l1_cost = resolved_pen_l1 * sum(abs, delta)
-    return result.objective - penalty_l2_cost - penalty_l1_cost
+    return result.objective - (resolved_pen / 2) * sum(abs2, Array(sol.delta))
 end
 
 Random.seed!(8789)
-eval_scenarios = [sample_scenario(hydro_data, T) for _ in 1:NUM_EVAL_SCENARIOS]
+eval_scenarios = [sample_scenario(hydro_data, T) for _ in 1:MAX_EVAL_SCENARIOS]
 rollout_evaluation = RolloutEvaluation(
     rollout_prob,
     x0_init,
@@ -252,7 +304,7 @@ rollout_evaluation = RolloutEvaluation(
     stride = EVAL_EVERY,
     policy_state = :target,
     stage_problem_pool = rollout_pool,
-    active_scenarios = NUM_EVAL_SCENARIOS,
+    active_scenarios = 4,
 )
 realized_rollout_evaluation = RolloutEvaluation(
     rollout_prob,
@@ -268,7 +320,20 @@ realized_rollout_evaluation = RolloutEvaluation(
     stride = EVAL_EVERY,
     policy_state = :realized,
     stage_problem_pool = rollout_pool,
-    active_scenarios = NUM_EVAL_SCENARIOS,
+    active_scenarios = 4,
+)
+
+critic_training_target = RolloutCriticTarget(
+    rollout_prob;
+    horizon = T,
+    n_uncertainty = nHyd,
+    set_stage_parameters! = set_hydro_rollout_stage!,
+    realized_state = hydro_realized_state,
+    objective_no_target_penalty = hydro_objective_no_target_penalty,
+    madnlp_kwargs = SOLVER_KWARGS,
+    warmstart = true,
+    policy_state = CRITIC_POLICY_STATE,
+    objective_value = CRITIC_ROLLOUT_OBJECTIVE,
 )
 
 Random.seed!(8788)
@@ -281,6 +346,7 @@ function _schedule_value(schedule, iter, default)
 end
 
 current_penalty_mult = Ref(NaN)
+shared_critic_samples = Any[]
 
 train_tsddr(
     policy,
@@ -289,37 +355,42 @@ train_tsddr(
     prob.p_x0,
     prob.p_target,
     prob.p_inflow,
-    () -> sample_scenario(hydro_data, T);
+    () -> sample_scenario(hydro_data, T);       # returns flat Float32 vector, length T*nHyd
     num_batches          = NUM_EPOCHS * NUM_BATCHES,
-    num_train_per_batch  = NUM_TRAIN_PER_BATCH,
-    optimizer            = GRAD_CLIP > 0 ?
-                           Flux.Optimisers.OptimiserChain(
+    num_train_per_batch  = NUM_WORKERS,
+    optimizer            = Flux.Optimisers.OptimiserChain(
                                Flux.Optimisers.ClipGrad(GRAD_CLIP),
                                Flux.Adam(LR),
-                           ) : Flux.Adam(LR),
+                           ),
     madnlp_kwargs        = SOLVER_KWARGS,
     warmstart            = true,
     problem_pool         = problem_pool,
+    control_variate      = control_variate,
+    actor_gradient_mode  = :control_variate,
+    critic_cv_weight     = CRITIC_CV_WEIGHT,
+    critic_updates_per_batch = CRITIC_UPDATES_PER_BATCH,
+    critic_buffer_size   = CRITIC_BUFFER_SIZE,
+    critic_batch_size    = CRITIC_BATCH_SIZE,
+    critic_training_target = critic_training_target,
+    critic_rollout_samples_per_batch = CRITIC_ROLLOUT_SAMPLES_PER_BATCH,
+    num_cheap_critic_samples_per_batch = NUM_CHEAP_CRITIC_SAMPLES_PER_BATCH,
+    critic_optimizer     = Flux.Adam(CRITIC_LR),
+    external_critic_samples = shared_critic_samples,
     adjust_hyperparameters = (iter, opt_state, n) -> begin
         mult = _schedule_value(PENALTY_SCHEDULE, iter, last(PENALTY_SCHEDULE)[3])
         if mult != current_penalty_mult[]
             current_penalty_mult[] = mult
             ρ_half_scaled = prob.base_penalty_half * mult
-            ρ_l1_scaled   = prob.base_penalty_l1 * mult
-            penalty_vals    = fill(ρ_half_scaled, T * nHyd)
-            penalty_l1_vals = fill(ρ_l1_scaled,   T * nHyd)
+            penalty_vals = fill(ρ_half_scaled, T * nHyd)
             for (p, _, _, _) in problem_pool
                 ExaModels.set_parameter!(p.core, p.p_penalty_half, penalty_vals)
-                ExaModels.set_parameter!(p.core, p.p_penalty_l1,   penalty_l1_vals)
             end
-            @info "Penalty multiplier → $mult  (ρ/2 = $(round(ρ_half_scaled; digits=2)), λ_l1 = $(round(ρ_l1_scaled; digits=2)))"
+            @info "Penalty multiplier → $mult  (ρ/2 = $(round(ρ_half_scaled; digits=2)))"
         end
-        if !isnothing(EVAL_SCHEDULE)
-            n_eval = _schedule_value(EVAL_SCHEDULE, iter, NUM_EVAL_SCENARIOS)
-            rollout_evaluation.active_scenarios = n_eval
-            realized_rollout_evaluation.active_scenarios = n_eval
-        end
-        return isnothing(NUM_TRAIN_SCHEDULE) ? n : _schedule_value(NUM_TRAIN_SCHEDULE, iter, n)
+        n_eval = _schedule_value(EVAL_SCHEDULE, iter, MAX_EVAL_SCENARIOS)
+        rollout_evaluation.active_scenarios = n_eval
+        realized_rollout_evaluation.active_scenarios = n_eval
+        return _schedule_value(NUM_TRAIN_SCHEDULE, iter, n)
     end,
     record_loss          = (iter, m, loss, tag) -> begin
         metrics = Dict{String, Any}(tag => loss, "batch" => iter)
@@ -328,6 +399,11 @@ train_tsddr(
         if iter % EVAL_EVERY == 0
             rollout_evaluation(iter, m)
             realized_rollout_evaluation(iter, m)
+            append!(shared_critic_samples,
+                    critic_samples_from_evaluation(
+                        rollout_evaluation;
+                        objective_key = CRITIC_ROLLOUT_OBJECTIVE,
+                    ))
             metrics["metrics/rollout_objective_no_target_penalty"] =
                 rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_objective_no_deficit"] =
@@ -347,6 +423,10 @@ train_tsddr(
         if !isnan(current_penalty_mult[])
             metrics["metrics/target_penalty_multiplier"] = current_penalty_mult[]
         end
+        metrics["metrics/num_train_per_batch"] =
+            _schedule_value(NUM_TRAIN_SCHEDULE, iter, 1)
+        metrics["metrics/active_eval_scenarios"] =
+            _schedule_value(EVAL_SCHEDULE, iter, MAX_EVAL_SCENARIOS)
 
         batch_in_epoch = (iter - 1) % NUM_BATCHES + 1
         if batch_in_epoch == NUM_BATCHES
@@ -358,7 +438,21 @@ train_tsddr(
             @info "Epoch $epoch/$NUM_EPOCHS  mean=$(round(mean_loss; digits=2))  ok=$n_ok/$NUM_BATCHES"
             if isfinite(mean_loss) && mean_loss < best_obj
                 global best_obj = mean_loss
-                jldsave(MODEL_PATH; model_state = Flux.state(cpu(m)))
+                jldsave(MODEL_PATH;
+                    model_state = Flux.state(cpu(m)),
+                    critic_state = Flux.state(cpu(critic)),
+                    critic_config = Dict(
+                        "mode" => "control_variate",
+                        "training_target" => "rollout",
+                        "policy_state" => string(CRITIC_POLICY_STATE),
+                        "rollout_objective" => string(CRITIC_ROLLOUT_OBJECTIVE),
+                        "critic_cv_weight" => CRITIC_CV_WEIGHT,
+                        "value_loss_weight" => CRITIC_VALUE_LOSS_WEIGHT,
+                        "gradient_loss_weight" => CRITIC_GRADIENT_LOSS_WEIGHT,
+                        "critic_rollout_samples_per_batch" => CRITIC_ROLLOUT_SAMPLES_PER_BATCH,
+                        "num_cheap_critic_samples_per_batch" => NUM_CHEAP_CRITIC_SAMPLES_PER_BATCH,
+                    ),
+                )
                 @info "  → New best: $(round(mean_loss; digits=4)) — saved $MODEL_PATH"
             end
         end

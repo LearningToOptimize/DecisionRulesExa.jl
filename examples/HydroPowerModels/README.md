@@ -39,6 +39,7 @@ Pre-solved deterministic-equivalent references (MOF format) are provided for val
 | File | Description |
 |---|---|
 | `train_hydro_exa.jl` | Main training script with penalty scheduling, parallel GPU solves, and W&B logging |
+| `train_hydro_exa_critic.jl` | Critic/control-variate variant of the main training script; uses normalized hydro features, a replay buffer, and cheap critic rollouts |
 | `hydro_power_data.jl` | Data parsing (PowerModels JSON, hydro JSON, inflows CSV) |
 | `hydro_power_exa.jl` | ExaModels problem builder for DC and AC OPF formulations |
 | `eval_exa_de.jl` | Validation script comparing ExaModels results against JuMP reference |
@@ -54,6 +55,20 @@ julia --project -t auto train_hydro_exa.jl
 ```
 
 Set `USE_GPU = true` in `train_hydro_exa.jl` (default). Requires a CUDA-capable GPU.
+
+### GPU training with critic control variate
+
+```julia
+# From this directory:
+julia --project -t auto train_hydro_exa_critic.jl
+```
+
+The critic script keeps the dual-multiplier actor update but adds a damped
+control variate (`critic_cv_weight = 0.5`) trained on the stage-wise rollout
+objective without target penalty. Its default critic rollout uses
+`policy_state = :target`; set `CRITIC_POLICY_STATE = :realized` for closed-loop
+critic labels. Deterministic-equivalent critic fitting remains available as an
+ablation through `DeterministicEquivalentCriticTarget()`.
 
 ### CPU training
 
@@ -81,6 +96,8 @@ Key parameters in `train_hydro_exa.jl`:
 - **Evaluation scheduling**: rollout evaluation starts with 4 scenarios and ramps to 32 at halfway
 - **Parallel solves**: independent NLP copies solved concurrently via `Threads.@spawn` worker pool
 - **Parallel rollout**: evaluation scenarios distributed across CPU stage-problem copies
+- **Critic variant**: optional scalar critic with value and gradient matching,
+  replay-buffer training, and cheap critic actor samples
 - **W&B logging**: training loss, rollout objectives, violation share, penalty multiplier
 
 ## Validation

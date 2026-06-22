@@ -4,50 +4,36 @@
 using Random
 using LinearAlgebra
 using DecisionRulesExa
+using MadNLP
+using Flux
 
 Random.seed!(1)
 
-# Problem dimensions
-T = 8          # horizon
-nx = 1         # state dimension (demo uses scalar)
-# controls u are also dimension nx in build_linear_tracking_problem()
+T = 8
+nx = 1
 
-# Build deterministic-equivalent NLP on CPU
 prob = build_linear_tracking_problem(
     horizon = T,
     nx = nx,
-    backend = nothing,         # CPU
+    backend = nothing,
     slack_penalty = 10.0,
     u_bounds = (-2.0, 2.0),
 )
 
-# Policy: input = [x0 ; w(1:T-1)], output = xhat(1:T)
-input_dim = nx + (T - 1) * nx
-output_dim = T * nx
-policy = MLPPolicy(input_dim, output_dim; hidden = (32, 32), act = tanh)
+policy = StateConditionedPolicy(nx, nx, nx, [32, 32])
 
-# Optional solver cache (recommended if you solve many times)
-cache = init_madnlp_cache(prob)
+sampler() = Float64.(0.1 .* randn(T * nx))
 
-# Scenario sampler
-sampler(k) = begin
-    x0 = [1.0]
-    w  = 0.1 .* randn(T - 1)   # (T-1)*nx
-    return x0, w
-end
-
-# Run a few TS-DDR iterations
-hist = train_tsddr!(
-    policy, prob;
-    n_iters = 5,
-    sampler = sampler,
-    η = 1e-2,
-    cache = cache,
-    tol = 1e-6,
-    max_iter = 200,
+train_tsddr(
+    policy,
+    [1.0],
+    prob,
+    prob.p_x0,
+    prob.p_target,
+    prob.p_w,
+    sampler;
+    num_batches = 5,
+    num_train_per_batch = 2,
+    optimizer = Flux.Adam(1f-3),
+    madnlp_kwargs = (print_level = MadNLP.ERROR, tol = 1e-6),
 )
-
-# Print last objective and a few duals
-last = hist[end]
-println("\nLast objective: ", last.result.objective)
-println("First 5 target multipliers λ: ", collect(last.lambda[1:min(5, length(last.lambda))]))

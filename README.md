@@ -21,7 +21,7 @@ Pkg.add(url="https://github.com/LearningToOptimize/DecisionRulesExa.jl.git")
 
 ```julia
 using DecisionRulesExa
-using ExaModels, Flux, Random
+using ExaModels, MadNLP, Flux, Random
 
 Random.seed!(1)
 
@@ -91,6 +91,94 @@ train_tsddr(policy, x0, prob, ..., sampler;
 ```
 
 Each pool entry gets its own MadNLP solver on a dedicated thread, with CUDA handles properly bound.
+
+## Optional Critic Control Variates
+
+`train_tsddr` can optionally train a scalar critic `C(w, xhat)`. The critic does
+not replace the deterministic-equivalent solve in the default
+`:control_variate` mode: solved target-constraint multipliers remain the
+actor's primary local sensitivity signal. Instead, the critic supplies a learned
+rollout-value guide and optional control variate.
+
+For critic fitting, the preferred target is the stage-wise rollout objective via
+`RolloutCriticTarget`, with `policy_state = :target` by default. This matches the
+differentiable target recurrence used by the actor while evaluating the true
+stage-by-stage objective. Set `policy_state = :realized` to train the critic on
+closed-loop realized-state rollout labels. For ablations, use
+`DeterministicEquivalentCriticTarget()` or `critic_training_target =
+:deterministic_equivalent` to fit the deterministic-equivalent objective instead.
+
+The default `control_variate = NoCriticControlVariate()` recovers the original
+dual-only behavior. A scalar critic can be attached with:
+
+```julia
+input_dim = length(x0) + 2 * T * nx
+critic = Chain(
+    Dense(input_dim => 128, tanh),
+    Dense(128 => 128, tanh),
+    Dense(128 => 1),
+)
+
+cv = ScalarCriticControlVariate(
+    critic;
+    featurizer = default_critic_featurizer,
+    value_loss_weight = 1.0,
+    gradient_loss_weight = 0.0,
+)
+
+critic_target = RolloutCriticTarget(
+    stage_problem;
+    horizon = T,
+    n_uncertainty = nx,
+    set_stage_parameters! = set_stage_parameters!,
+    realized_state = realized_state,
+    objective_no_target_penalty = objective_no_target_penalty,
+    policy_state = :target,
+    objective_value = :objective_no_target_penalty,
+)
+
+train_tsddr(
+    policy, x0, prob, prob.p_x0, prob.p_target, prob.p_w, sampler;
+    control_variate = cv,
+    critic_training_target = critic_target,
+    critic_rollout_samples_per_batch = 1,
+    actor_gradient_mode = :control_variate,
+    critic_cv_weight = 1.0,
+    num_cheap_critic_samples_per_batch = 32,
+    critic_updates_per_batch = 1,
+    critic_optimizer = Flux.Adam(1f-3),
+)
+```
+
+The critic loss combines value matching against the selected target objective and
+optional gradient matching against target multipliers:
+
+```julia
+value_loss_weight * mse(C(w, xhat), objective) +
+gradient_loss_weight * mse(gradient(xhat -> C(w, xhat), xhat), lambda)
+```
+
+Set either weight to zero for objective-only or gradient-only critic training.
+For rollout targets, objective-only critic training is usually the clean default,
+because DE target multipliers are not exact gradients of the realized rollout
+objective. If objectives and multipliers have very different magnitudes, prefer a
+custom featurizer and tuned loss weights; the Hydro example normalizes volumes
+and inflows before critic evaluation.
+
+Actor modes:
+
+- `:control_variate`: subtracts `critic_cv_weight * gradient_xhat(C)` from the
+  solved dual signal and adds the critic actor gradient back on solved or cheap
+  rollout samples. This is the recommended mode when dual multipliers are
+  reliable. `critic_cv_weight = 0.0` recovers dual-only updates.
+- `:surrogate`: uses a practical hybrid of solved dual gradients and critic
+  actor gradients, controlled by `dual_actor_weight` and `critic_actor_weight`.
+  This is useful when raw dual/subgradient signals are empirically noisy or
+  unstable, but it is no longer a pure unbiased control-variate estimator.
+
+`num_cheap_critic_samples_per_batch` draws additional uncertainty samples,
+rolls out the current policy, and evaluates the critic actor term without any
+extra MadNLP or ExaModels solve.
 
 ## Rollout evaluation
 

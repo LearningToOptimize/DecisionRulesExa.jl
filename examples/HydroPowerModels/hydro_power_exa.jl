@@ -55,6 +55,8 @@ struct HydroExaDEProblem
     p_target
     p_penalty_half      # ExaModels parameter for (ρ/2)*mult (length T*nHyd)
     base_penalty_half::Float64  # ρ/2 at multiplier=1
+    p_penalty_l1        # ExaModels parameter for L1 penalty (length T*nHyd)
+    base_penalty_l1::Float64    # L1 coefficient at multiplier=1
     # sizes
     nHyd::Int
     nBus::Int
@@ -142,7 +144,8 @@ end
 """
     build_hydro_de(power_data, hydro_data, T;
                    backend=nothing, float_type=Float64, formulation=:dc,
-                   target_penalty=:auto, demand_matrix=nothing,
+                   target_penalty=:auto, target_penalty_l1=:auto,
+                   demand_matrix=nothing,
                    reactive_demand_matrix=nothing, deficit_cost=nothing)
               -> HydroExaDEProblem
 
@@ -163,6 +166,10 @@ Pass a large value (e.g. 1e5, >> max thermal cost) to effectively enforce hard K
 
 `target_penalty` sets the L2 coefficient ρ for the `(ρ/2)·δ²` target slack penalty.
 Pass `:auto` (default) to use `2 × max_gen_cost`, matching JuMP's `penalty_l2 = :auto`.
+
+`target_penalty_l1` sets the L1 coefficient for the `λ·|δ|` target slack penalty.
+Pass `:auto` (default) to use the same value as L2 ρ.  Pass `nothing` to disable L1.
+The L1 term is reformulated as `λ·(δ⁺ + δ⁻)` with `δ = δ⁺ − δ⁻`, `δ⁺,δ⁻ ≥ 0`.
 """
 function build_hydro_de(power_data::PowerData,
                          hydro_data::HydroData,
@@ -171,6 +178,7 @@ function build_hydro_de(power_data::PowerData,
                          float_type::Type{<:AbstractFloat} = Float64,
                          formulation::Symbol = :dc,
                          target_penalty::Union{Real,Symbol} = :auto,
+                         target_penalty_l1::Union{Real,Symbol,Nothing} = :auto,
                          demand_matrix = nothing,
                          reactive_demand_matrix = nothing,
                          deficit_cost::Union{Nothing,Real} = nothing,
@@ -183,6 +191,7 @@ function build_hydro_de(power_data::PowerData,
         return _build_dc_hydro_de(power_data, hydro_data, T;
                                    backend=backend, float_type=float_type,
                                    target_penalty=target_penalty,
+                                   target_penalty_l1=target_penalty_l1,
                                    demand_matrix=demand_matrix,
                                    deficit_cost=deficit_cost,
                                    load_scaler=load_scaler)
@@ -190,6 +199,7 @@ function build_hydro_de(power_data::PowerData,
         return _build_ac_hydro_de(power_data, hydro_data, T;
                                    backend=backend, float_type=float_type,
                                    target_penalty=target_penalty,
+                                   target_penalty_l1=target_penalty_l1,
                                    demand_matrix=demand_matrix,
                                    reactive_demand_matrix=reactive_demand_matrix,
                                    deficit_cost=deficit_cost,
@@ -205,6 +215,7 @@ function _build_dc_hydro_de(power_data::PowerData,
                               backend    = nothing,
                               float_type::Type{<:AbstractFloat} = Float64,
                               target_penalty::Union{Real,Symbol} = :auto,
+                              target_penalty_l1::Union{Real,Symbol,Nothing} = :auto,
                               demand_matrix = nothing,
                               deficit_cost::Union{Nothing,Real} = nothing,
                               load_scaler::Real = 1.0)
@@ -215,6 +226,14 @@ function _build_dc_hydro_de(power_data::PowerData,
     nHyd    = hydro_data.nHyd
     K       = float_type(hydro_data.K)
     ρ       = float_type(target_penalty === :auto ? auto_target_penalty(power_data, hydro_data) : target_penalty)
+    ρ_l1    = if target_penalty_l1 === :auto
+        ρ
+    elseif target_penalty_l1 === nothing
+        zero(float_type)
+    else
+        float_type(target_penalty_l1)
+    end
+    use_l1  = ρ_l1 > 0
     baseMVA = float_type(power_data.baseMVA)
     cd      = float_type(deficit_cost !== nothing ? deficit_cost : power_data.cost_deficit)
 
@@ -251,8 +270,9 @@ function _build_dc_hydro_de(power_data::PowerData,
     # Spill: T*nHyd  (non-negative)
     spill = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
 
-    # Target slack δ: T*nHyd  (free, penalized quadratically)
-    delta = ExaModels.variable(core, T * nHyd)
+    # Target slack: δ = δ⁺ − δ⁻ with δ⁺,δ⁻ ≥ 0 (L1+L2 Lagrangian penalty)
+    delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
+    delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
 
     # ── Parameters ────────────────────────────────────────────────────────────
 
@@ -267,6 +287,7 @@ function _build_dc_hydro_de(power_data::PowerData,
     p_inflow       = ExaModels.parameter(core, zeros(float_type, T * nHyd))
     p_target       = ExaModels.parameter(core, zeros(float_type, T * nHyd))
     p_penalty_half = ExaModels.parameter(core, fill(float_type(ρ / 2), T * nHyd))
+    p_penalty_l1   = ExaModels.parameter(core, fill(ρ_l1, T * nHyd))
 
     # ── Objective ─────────────────────────────────────────────────────────────
 
@@ -285,11 +306,20 @@ function _build_dc_hydro_de(power_data::PowerData,
         for item in def_cost_items
     )
 
+    # L2 penalty: (ρ/2)·(δ⁺ − δ⁻)²
     delta_items = [(idx = _ri(nHyd, t, r),) for t in 1:T for r in 1:nHyd]
     ExaModels.objective(core,
-        p_penalty_half[item.idx] * delta[item.idx]^2
+        p_penalty_half[item.idx] * (delta_pos[item.idx] - delta_neg[item.idx])^2
         for item in delta_items
     )
+
+    # L1 penalty: λ·(δ⁺ + δ⁻)
+    if use_l1
+        ExaModels.objective(core,
+            p_penalty_l1[item.idx] * (delta_pos[item.idx] + delta_neg[item.idx])
+            for item in delta_items
+        )
+    end
 
     # ── Constraints ───────────────────────────────────────────────────────────
     n_con = 0
@@ -417,12 +447,13 @@ function _build_dc_hydro_de(power_data::PowerData,
     n_con += T * nHyd
 
     # ── TARGET CONSTRAINTS (ADDED LAST) ───────────────────────────────────────
+    # x̂ − x − (δ⁺ − δ⁻) = 0
     target_items = [(param_idx = _ri(nHyd, t, r),
                      res_idx   = _ri(nHyd, t+1, r),
                      delta_idx = _ri(nHyd, t, r))
                     for t in 1:T for r in 1:nHyd]
     ExaModels.constraint(core,
-        p_target[item.param_idx] - reservoir[item.res_idx] - delta[item.delta_idx]
+        p_target[item.param_idx] - reservoir[item.res_idx] - delta_pos[item.delta_idx] + delta_neg[item.delta_idx]
         for item in target_items
     )
     target_con_range = (n_con + 1):(n_con + T * nHyd)
@@ -433,6 +464,7 @@ function _build_dc_hydro_de(power_data::PowerData,
         core, model,
         p_demand, nothing, p_x0, p_inflow, p_target,
         p_penalty_half, Float64(ρ / 2),
+        p_penalty_l1, Float64(ρ_l1),
         nHyd, nBus, nGen, nBranch, T,
         :dc, target_con_range,
     )
@@ -446,6 +478,7 @@ function _build_ac_hydro_de(power_data::PowerData,
                               backend    = nothing,
                               float_type::Type{<:AbstractFloat} = Float64,
                               target_penalty::Union{Real,Symbol} = :auto,
+                              target_penalty_l1::Union{Real,Symbol,Nothing} = :auto,
                               demand_matrix = nothing,
                               reactive_demand_matrix = nothing,
                               deficit_cost::Union{Nothing,Real} = nothing,
@@ -457,6 +490,14 @@ function _build_ac_hydro_de(power_data::PowerData,
     nHyd    = hydro_data.nHyd
     K       = float_type(hydro_data.K)
     ρ       = float_type(target_penalty === :auto ? auto_target_penalty(power_data, hydro_data) : target_penalty)
+    ρ_l1    = if target_penalty_l1 === :auto
+        ρ
+    elseif target_penalty_l1 === nothing
+        zero(float_type)
+    else
+        float_type(target_penalty_l1)
+    end
+    use_l1  = ρ_l1 > 0
     baseMVA = float_type(power_data.baseMVA)
     cd      = float_type(deficit_cost !== nothing ? deficit_cost : power_data.cost_deficit)
 
@@ -513,8 +554,9 @@ function _build_ac_hydro_de(power_data::PowerData,
     # Spill: T*nHyd  (non-negative)
     spill = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
 
-    # Target slack δ: T*nHyd  (free, penalized quadratically)
-    delta = ExaModels.variable(core, T * nHyd)
+    # Target slack: δ = δ⁺ − δ⁻ with δ⁺,δ⁻ ≥ 0 (L1+L2 Lagrangian penalty)
+    delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
+    delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
 
     # ── Parameters ────────────────────────────────────────────────────────────
 
@@ -536,6 +578,7 @@ function _build_ac_hydro_de(power_data::PowerData,
     p_inflow          = ExaModels.parameter(core, zeros(float_type, T * nHyd))
     p_target          = ExaModels.parameter(core, zeros(float_type, T * nHyd))
     p_penalty_half    = ExaModels.parameter(core, fill(float_type(ρ / 2), T * nHyd))
+    p_penalty_l1      = ExaModels.parameter(core, fill(ρ_l1, T * nHyd))
 
     # ── Precompute branch AC coefficients ─────────────────────────────────────
 
@@ -558,11 +601,20 @@ function _build_ac_hydro_de(power_data::PowerData,
         for item in def_cost_items
     )
 
+    # L2 penalty: (ρ/2)·(δ⁺ − δ⁻)²
     delta_items = [(idx = _ri(nHyd, t, r),) for t in 1:T for r in 1:nHyd]
     ExaModels.objective(core,
-        p_penalty_half[item.idx] * delta[item.idx]^2
+        p_penalty_half[item.idx] * (delta_pos[item.idx] - delta_neg[item.idx])^2
         for item in delta_items
     )
+
+    # L1 penalty: λ·(δ⁺ + δ⁻)
+    if use_l1
+        ExaModels.objective(core,
+            p_penalty_l1[item.idx] * (delta_pos[item.idx] + delta_neg[item.idx])
+            for item in delta_items
+        )
+    end
 
     # ── Constraints ───────────────────────────────────────────────────────────
     n_con = 0
@@ -774,12 +826,13 @@ function _build_ac_hydro_de(power_data::PowerData,
     n_con += T * nHyd
 
     # ── TARGET CONSTRAINTS (ADDED LAST) ───────────────────────────────────────
+    # x̂ − x − (δ⁺ − δ⁻) = 0
     target_items = [(param_idx = _ri(nHyd, t, r),
                      res_idx   = _ri(nHyd, t+1, r),
                      delta_idx = _ri(nHyd, t, r))
                     for t in 1:T for r in 1:nHyd]
     ExaModels.constraint(core,
-        p_target[item.param_idx] - reservoir[item.res_idx] - delta[item.delta_idx]
+        p_target[item.param_idx] - reservoir[item.res_idx] - delta_pos[item.delta_idx] + delta_neg[item.delta_idx]
         for item in target_items
     )
     target_con_range = (n_con + 1):(n_con + T * nHyd)
@@ -790,6 +843,7 @@ function _build_ac_hydro_de(power_data::PowerData,
         core, model,
         p_demand, p_reactive_demand, p_x0, p_inflow, p_target,
         p_penalty_half, Float64(ρ / 2),
+        p_penalty_l1, Float64(ρ_l1),
         nHyd, nBus, nGen, nBranch, T,
         :ac_polar, target_con_range,
     )
@@ -829,6 +883,7 @@ end
     hydro_solution(prob, result) -> NamedTuple
 
 Reshape the flat solution vector into named components.
+`delta` is reconstructed as `delta_pos - delta_neg`.
 
 DC:  (va, pg, pf, deficit, reservoir, outflow, spill, delta)
 AC:  (va, vm, pg, qg, p_fr, q_fr, p_to, q_to, deficit, deficit_q,
@@ -851,7 +906,9 @@ function hydro_solution(prob::HydroExaDEProblem, result)
         res_sol   = reshape(sol[off .+ (1:(T+1)*nH)],    nH, T+1); off += (T+1)*nH
         out_sol   = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
         spill_sol = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
-        delta_sol = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
+        dp_sol    = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
+        dn_sol    = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
+        delta_sol = dp_sol .- dn_sol
         return (va=va_sol, pg=pg_sol, pf=pf_sol, deficit=def_sol,
                 reservoir=res_sol, outflow=out_sol, spill=spill_sol, delta=delta_sol)
     else  # :ac_polar
@@ -868,7 +925,9 @@ function hydro_solution(prob::HydroExaDEProblem, result)
         res_sol    = reshape(sol[off .+ (1:(T+1)*nH)],    nH, T+1); off += (T+1)*nH
         out_sol    = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
         spill_sol  = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
-        delta_sol  = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
+        dp_sol     = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
+        dn_sol     = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
+        delta_sol  = dp_sol .- dn_sol
         return (va=va_sol, vm=vm_sol, pg=pg_sol, qg=qg_sol,
                 p_fr=p_fr_sol, q_fr=q_fr_sol, p_to=p_to_sol, q_to=q_to_sol,
                 deficit=def_sol, deficit_q=def_q_sol,

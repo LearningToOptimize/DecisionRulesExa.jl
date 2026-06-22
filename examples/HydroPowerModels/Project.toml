@@ -1,6 +1,7 @@
 [deps]
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+CUDSS = "45b445bb-4962-46a0-9369-b4df9d0f772e"
 CUDSS_jll = "4889d778-9329-5762-9fec-0578a5d30366"
 ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
 DecisionRulesExa = "7c3e91a4-d8f2-4b6a-9e15-a2c4f7b80d53"
