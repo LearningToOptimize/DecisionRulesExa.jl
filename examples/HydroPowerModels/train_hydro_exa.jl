@@ -35,15 +35,11 @@ const DEMAND_FILE = joinpath(CASE_DIR, "demand.csv")
 const LAYERS      = [128, 128]
 const ACTIVATION  = sigmoid
 const NUM_STAGES  = 96
-const NUM_EPOCHS  = 20
+const NUM_EPOCHS  = 40
 const NUM_BATCHES = 100
-const MAX_EVAL_SCENARIOS = 32
-const EVAL_EVERY = 25
-
-const EVAL_SCHEDULE = [
-    (1,   div(NUM_EPOCHS * NUM_BATCHES, 2), 4),
-    (div(NUM_EPOCHS * NUM_BATCHES, 2) + 1, NUM_EPOCHS * NUM_BATCHES, MAX_EVAL_SCENARIOS),
-]
+const NUM_TRAIN_PER_BATCH = 1
+const NUM_EVAL_SCENARIOS  = 4
+const EVAL_EVERY  = 25
 const LR          = 1f-3
 const GRAD_CLIP   = parse(Float32, get(ENV, "DR_GRAD_CLIP", "10"))
 
@@ -51,7 +47,7 @@ const TARGET_PEN_ARG = :auto
 const DEFICIT_COST   = 1e5
 const USE_GPU        = true
 const load_scaler    = 0.6
-const NUM_WORKERS    = 4
+const NUM_WORKERS    = 1
 
 const _PENALTY_MODE = get(ENV, "DR_PENALTY_SCHEDULE", "annealed")
 const PENALTY_SCHEDULE = if _PENALTY_MODE == "annealed"
@@ -65,13 +61,10 @@ else
     [(1, NUM_EPOCHS * NUM_BATCHES, 1.0)]
 end
 
-const NUM_TRAIN_SCHEDULE = [
-    (1,   div(NUM_EPOCHS * NUM_BATCHES, 5), NUM_WORKERS),
-    (div(NUM_EPOCHS * NUM_BATCHES, 5) + 1, div(NUM_EPOCHS * NUM_BATCHES, 5) * 2, 2 * NUM_WORKERS),
-    (div(NUM_EPOCHS * NUM_BATCHES, 5) * 2 + 1, div(NUM_EPOCHS * NUM_BATCHES, 5) * 3, 4 * NUM_WORKERS),
-    (div(NUM_EPOCHS * NUM_BATCHES, 5) * 3 + 1, div(NUM_EPOCHS * NUM_BATCHES, 5) * 4, 8 * NUM_WORKERS),
-    (div(NUM_EPOCHS * NUM_BATCHES, 5) * 4 + 1, NUM_EPOCHS * NUM_BATCHES, 8 * NUM_WORKERS),
-]
+# Optional: ramp num_train_per_batch and eval scenarios over training.
+# Set to `nothing` to use fixed NUM_TRAIN_PER_BATCH / NUM_EVAL_SCENARIOS.
+const NUM_TRAIN_SCHEDULE = nothing  # e.g. [(1,500,1),(501,2000,4),(2001,4000,8)]
+const EVAL_SCHEDULE      = nothing  # e.g. [(1,2000,4),(2001,4000,32)]
 
 const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = 9000)
 
@@ -154,6 +147,8 @@ result0 = MadNLP.madnlp(prob.model; SOLVER_KWARGS..., print_level = MadNLP.WARN)
 isfinite(result0.objective) || error("Smoke test returned non-finite objective")
 solve_succeeded(result0) || @warn "Smoke test did not fully converge; proceeding anyway"
 
+resolved_pen_l1 = prob.base_penalty_l1
+
 # ── Policy ────────────────────────────────────────────────────────────────────
 
 policy = StateConditionedPolicy(nHyd, nHyd, nHyd, LAYERS;
@@ -182,16 +177,17 @@ lg = WandbLogger(
         "deficit_cost"    => DEFICIT_COST,
         "num_epochs"      => NUM_EPOCHS,
         "num_batches"     => NUM_BATCHES,
-        "max_eval_scenarios" => MAX_EVAL_SCENARIOS,
-        "eval_schedule"   => string(EVAL_SCHEDULE),
+        "num_train_per_batch" => NUM_TRAIN_PER_BATCH,
+        "num_eval_scenarios" => NUM_EVAL_SCENARIOS,
         "eval_every"      => EVAL_EVERY,
         "lr"              => LR,
         "grad_clip"       => GRAD_CLIP,
         "backend"         => USE_GPU ? "GPU" : "CPU",
         "load_scaler"     => load_scaler,
         "penalty_schedule" => string(PENALTY_SCHEDULE),
-        "num_train_schedule" => string(NUM_TRAIN_SCHEDULE),
-        "num_workers" => NUM_WORKERS,
+        "num_train_schedule" => string(something(NUM_TRAIN_SCHEDULE, "fixed")),
+        "eval_schedule"   => string(something(EVAL_SCHEDULE, "fixed")),
+        "num_workers"     => NUM_WORKERS,
     ),
 )
 
@@ -215,8 +211,9 @@ function _build_rollout_de()
     )
 end
 rollout_prob = _build_rollout_de()
-rollout_pool = [_build_rollout_de() for _ in 1:NUM_WORKERS]
-@info "Rollout pool ready: $(NUM_WORKERS) CPU stage-problem copies"
+n_rollout_pool = max(NUM_WORKERS, NUM_EVAL_SCENARIOS)
+rollout_pool = [_build_rollout_de() for _ in 1:n_rollout_pool]
+@info "Rollout pool ready: $(n_rollout_pool) CPU stage-problem copies"
 
 function set_hydro_rollout_stage!(stage_prob, state_in, wt, target, stage)
     ExaModels.set_parameter!(stage_prob.core, stage_prob.p_x0, state_in)
@@ -231,8 +228,6 @@ end
 hydro_realized_state(stage_prob, result) =
     Array(hydro_solution(stage_prob, result).reservoir[:, end])
 
-resolved_pen_l1 = prob.base_penalty_l1
-
 function hydro_objective_no_target_penalty(stage_prob, result)
     sol = hydro_solution(stage_prob, result)
     delta = Array(sol.delta)
@@ -242,7 +237,7 @@ function hydro_objective_no_target_penalty(stage_prob, result)
 end
 
 Random.seed!(8789)
-eval_scenarios = [sample_scenario(hydro_data, T) for _ in 1:MAX_EVAL_SCENARIOS]
+eval_scenarios = [sample_scenario(hydro_data, T) for _ in 1:NUM_EVAL_SCENARIOS]
 rollout_evaluation = RolloutEvaluation(
     rollout_prob,
     x0_init,
@@ -257,7 +252,7 @@ rollout_evaluation = RolloutEvaluation(
     stride = EVAL_EVERY,
     policy_state = :target,
     stage_problem_pool = rollout_pool,
-    active_scenarios = 4,
+    active_scenarios = NUM_EVAL_SCENARIOS,
 )
 realized_rollout_evaluation = RolloutEvaluation(
     rollout_prob,
@@ -273,7 +268,7 @@ realized_rollout_evaluation = RolloutEvaluation(
     stride = EVAL_EVERY,
     policy_state = :realized,
     stage_problem_pool = rollout_pool,
-    active_scenarios = 4,
+    active_scenarios = NUM_EVAL_SCENARIOS,
 )
 
 Random.seed!(8788)
@@ -294,9 +289,9 @@ train_tsddr(
     prob.p_x0,
     prob.p_target,
     prob.p_inflow,
-    () -> sample_scenario(hydro_data, T);       # returns flat Float32 vector, length T*nHyd
+    () -> sample_scenario(hydro_data, T);
     num_batches          = NUM_EPOCHS * NUM_BATCHES,
-    num_train_per_batch  = NUM_WORKERS,
+    num_train_per_batch  = NUM_TRAIN_PER_BATCH,
     optimizer            = GRAD_CLIP > 0 ?
                            Flux.Optimisers.OptimiserChain(
                                Flux.Optimisers.ClipGrad(GRAD_CLIP),
@@ -319,10 +314,12 @@ train_tsddr(
             end
             @info "Penalty multiplier → $mult  (ρ/2 = $(round(ρ_half_scaled; digits=2)), λ_l1 = $(round(ρ_l1_scaled; digits=2)))"
         end
-        n_eval = _schedule_value(EVAL_SCHEDULE, iter, MAX_EVAL_SCENARIOS)
-        rollout_evaluation.active_scenarios = n_eval
-        realized_rollout_evaluation.active_scenarios = n_eval
-        return _schedule_value(NUM_TRAIN_SCHEDULE, iter, n)
+        if !isnothing(EVAL_SCHEDULE)
+            n_eval = _schedule_value(EVAL_SCHEDULE, iter, NUM_EVAL_SCENARIOS)
+            rollout_evaluation.active_scenarios = n_eval
+            realized_rollout_evaluation.active_scenarios = n_eval
+        end
+        return isnothing(NUM_TRAIN_SCHEDULE) ? n : _schedule_value(NUM_TRAIN_SCHEDULE, iter, n)
     end,
     record_loss          = (iter, m, loss, tag) -> begin
         metrics = Dict{String, Any}(tag => loss, "batch" => iter)
@@ -350,10 +347,6 @@ train_tsddr(
         if !isnan(current_penalty_mult[])
             metrics["metrics/target_penalty_multiplier"] = current_penalty_mult[]
         end
-        metrics["metrics/num_train_per_batch"] =
-            _schedule_value(NUM_TRAIN_SCHEDULE, iter, 1)
-        metrics["metrics/active_eval_scenarios"] =
-            _schedule_value(EVAL_SCHEDULE, iter, MAX_EVAL_SCENARIOS)
 
         batch_in_epoch = (iter - 1) % NUM_BATCHES + 1
         if batch_in_epoch == NUM_BATCHES
