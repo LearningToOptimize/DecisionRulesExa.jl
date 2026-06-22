@@ -21,7 +21,7 @@ Pkg.add(url="https://github.com/LearningToOptimize/DecisionRulesExa.jl.git")
 
 ```julia
 using DecisionRulesExa
-using ExaModels, Flux, Random
+using ExaModels, MadNLP, Flux, Random
 
 Random.seed!(1)
 
