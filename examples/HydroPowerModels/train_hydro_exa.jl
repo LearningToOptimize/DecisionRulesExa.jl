@@ -34,8 +34,8 @@ const DEMAND_FILE = joinpath(CASE_DIR, "demand.csv")
 
 const LAYERS      = [128, 128]
 const ACTIVATION  = sigmoid
-const NUM_STAGES  = 96
-const NUM_EPOCHS  = 40
+const NUM_STAGES  = parse(Int, get(ENV, "DR_NUM_STAGES", "126"))
+const NUM_EPOCHS  = parse(Int, get(ENV, "DR_NUM_EPOCHS", "80"))
 const NUM_BATCHES = 100
 const NUM_TRAIN_PER_BATCH = 1
 const NUM_EVAL_SCENARIOS  = 4
