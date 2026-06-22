@@ -41,3 +41,4 @@ logs/
 
 # Slurm batch scripts (user-specific, not part of the package)
 *.sbatch
+*.sh

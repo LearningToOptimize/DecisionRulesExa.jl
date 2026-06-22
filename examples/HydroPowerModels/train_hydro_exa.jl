@@ -14,7 +14,7 @@ using Wandb, Logging
 using JLD2
 using MadNLP
 using MadNLPGPU, KernelAbstractions, CUDA
-using CUDSS_jll, cuDNN
+using CUDSS, CUDSS_jll, cuDNN
 
 const SCRIPT_DIR = dirname(@__FILE__)
 include(joinpath(SCRIPT_DIR, "hydro_power_data.jl"))
@@ -45,7 +45,7 @@ const EVAL_SCHEDULE = [
     (div(NUM_EPOCHS * NUM_BATCHES, 2) + 1, NUM_EPOCHS * NUM_BATCHES, MAX_EVAL_SCENARIOS),
 ]
 const LR          = 1f-3
-const GRAD_CLIP   = 10.0f0
+const GRAD_CLIP   = parse(Float32, get(ENV, "DR_GRAD_CLIP", "10"))
 
 const TARGET_PEN_ARG = :auto
 const DEFICIT_COST   = 1e5
@@ -53,12 +53,17 @@ const USE_GPU        = true
 const load_scaler    = 0.6
 const NUM_WORKERS    = 4
 
-const PENALTY_SCHEDULE = [
-    (1,   div(NUM_EPOCHS * NUM_BATCHES, 4), 0.1),
-    (div(NUM_EPOCHS * NUM_BATCHES, 4) + 1, div(NUM_EPOCHS * NUM_BATCHES, 4) * 2, 1.0),
-    (div(NUM_EPOCHS * NUM_BATCHES, 4) * 2 + 1, div(NUM_EPOCHS * NUM_BATCHES, 4) * 3, 10.0),
-    (div(NUM_EPOCHS * NUM_BATCHES, 4) * 3 + 1, NUM_EPOCHS * NUM_BATCHES, 30.0),
-]
+const _PENALTY_MODE = get(ENV, "DR_PENALTY_SCHEDULE", "annealed")
+const PENALTY_SCHEDULE = if _PENALTY_MODE == "annealed"
+    [
+        (1,   div(NUM_EPOCHS * NUM_BATCHES, 4), 0.1),
+        (div(NUM_EPOCHS * NUM_BATCHES, 4) + 1, div(NUM_EPOCHS * NUM_BATCHES, 4) * 2, 1.0),
+        (div(NUM_EPOCHS * NUM_BATCHES, 4) * 2 + 1, div(NUM_EPOCHS * NUM_BATCHES, 4) * 3, 10.0),
+        (div(NUM_EPOCHS * NUM_BATCHES, 4) * 3 + 1, NUM_EPOCHS * NUM_BATCHES, 30.0),
+    ]
+else
+    [(1, NUM_EPOCHS * NUM_BATCHES, 1.0)]
+end
 
 const NUM_TRAIN_SCHEDULE = [
     (1,   div(NUM_EPOCHS * NUM_BATCHES, 5), NUM_WORKERS),
@@ -70,7 +75,9 @@ const NUM_TRAIN_SCHEDULE = [
 
 const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = 9000)
 
-const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-deteq-gpu-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
+const _CLIP_TAG  = GRAD_CLIP > 0 ? "-clip$(Int(GRAD_CLIP))" : ""
+const _SCHED_TAG = _PENALTY_MODE == "annealed" ? "-anneal" : "-const"
+const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-deteq-gpu$(_CLIP_TAG)$(_SCHED_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
 const MODEL_DIR = joinpath(CASE_DIR, FORM_LABEL, "models")
 mkpath(MODEL_DIR)
 const MODEL_PATH = joinpath(MODEL_DIR, RUN_NAME * ".jld2")
@@ -290,11 +297,11 @@ train_tsddr(
     () -> sample_scenario(hydro_data, T);       # returns flat Float32 vector, length T*nHyd
     num_batches          = NUM_EPOCHS * NUM_BATCHES,
     num_train_per_batch  = NUM_WORKERS,
-    optimizer            = isnothing(GRAD_CLIP) ? Flux.Adam(LR) :
+    optimizer            = GRAD_CLIP > 0 ?
                            Flux.Optimisers.OptimiserChain(
                                Flux.Optimisers.ClipGrad(GRAD_CLIP),
                                Flux.Adam(LR),
-                           ),
+                           ) : Flux.Adam(LR),
     madnlp_kwargs        = SOLVER_KWARGS,
     warmstart            = true,
     problem_pool         = problem_pool,
