@@ -1,0 +1,401 @@
+Precompiling packages...
+ 134580.2 ms  ✓ Pkg (serial)
+  1 dependency successfully precompiled in 135 seconds
+  Installing known registries into `/tmp/ar_julia_depot`
+       Added `General` registry to /tmp/ar_julia_depot/registries
+    Updating registry at `/tmp/ar_julia_depot/registries/General.toml`
+     Cloning git-repo `https://github.com/klamike/ExaModels.jl`
+    Updating git-repo `https://github.com/klamike/ExaModels.jl`
+     Cloning git-repo `https://github.com/klamike/ParametricNLPModels.jl.git`
+    Updating git-repo `https://github.com/klamike/ParametricNLPModels.jl.git`
+     Cloning git-repo `https://github.com/klamike/MadNLP.jl.git`
+    Updating git-repo `https://github.com/klamike/MadNLP.jl.git`
+     Cloning git-repo `https://github.com/MadNLP/MadDiff.jl.git`
+    Updating git-repo `https://github.com/MadNLP/MadDiff.jl.git`
+   Installed RealDot ───────────────────── v0.1.0
+   Installed GPUArraysCore ─────────────── v0.2.0
+   Installed MLCore ────────────────────── v1.0.2
+   Installed DiffRules ─────────────────── v1.16.0
+   Installed Adapt ─────────────────────── v4.6.1
+   Installed IRTools ───────────────────── v0.4.17
+   Installed IrrationalConstants ───────── v0.2.6
+   Installed MUMPS_seq_jll ─────────────── v500.800.200+0
+   Installed SciMLPublic ───────────────── v1.0.1
+   Installed ShowCases ─────────────────── v0.1.0
+   Installed Functors ──────────────────── v0.5.2
+   Installed Flux ──────────────────────── v0.16.10
+   Installed TableTraits ───────────────── v1.0.1
+   Installed DiffResults ───────────────── v1.1.0
+   Installed NNlib ─────────────────────── v0.9.36
+   Installed ProgressLogging ───────────── v0.1.6
+   Installed SpecialFunctions ──────────── v2.8.0
+   Installed Tables ────────────────────── v1.12.1
+   Installed PtrArrays ─────────────────── v1.4.0
+   Installed Preferences ───────────────── v1.5.2
+   Installed HashArrayMappedTries ──────── v0.2.0
+   Installed DataAPI ───────────────────── v1.16.0
+   Installed TimerOutputs ──────────────── v0.5.29
+   Installed Zygote ────────────────────── v0.7.11
+   Installed ADTypes ───────────────────── v1.22.0
+   Installed SolverCore ────────────────── v0.3.10
+   Installed AbstractFFTs ──────────────── v1.5.0
+   Installed Optimisers ────────────────── v0.4.7
+   Installed IteratorInterfaceExtensions ─ v1.0.0
+   Installed NaNMath ───────────────────── v1.1.4
+   Installed Setfield ──────────────────── v1.1.2
+   Installed ConstructionBase ──────────── v1.6.0
+   Installed JLLWrappers ───────────────── v1.8.0
+   Installed StaticArraysCore ──────────── v1.4.4
+   Installed StaticArrays ──────────────── v1.9.18
+   Installed OneHotArrays ──────────────── v0.2.11
+   Installed DataValueInterfaces ───────── v1.0.0
+   Installed LLVMExtra_jll ─────────────── v0.0.43+1
+   Installed OrderedCollections ────────── v1.8.2
+   Installed PrecompileTools ───────────── v1.3.4
+   Installed EnzymeCore ────────────────── v0.8.20
+   Installed StructArrays ──────────────── v0.7.3
+   Installed FastClosures ──────────────── v0.3.2
+   Installed DelimitedFiles ────────────── v1.9.1
+   Installed CEnum ─────────────────────── v0.5.0
+   Installed AMD ───────────────────────── v0.5.3
+   Installed ForwardDiff ───────────────── v1.4.1
+   Installed ScopedValues ──────────────── v1.6.2
+   Installed LinearOperators ───────────── v2.14.1
+   Installed ChainRulesCore ────────────── v1.26.1
+   Installed GPUArrays ─────────────────── v11.5.8
+   Installed FillArrays ────────────────── v1.16.0
+   Installed MLDataDevices ─────────────── v1.17.10
+   Installed Reexport ──────────────────── v1.2.2
+   Installed CommonSubexpressions ──────── v0.3.1
+   Installed Statistics ────────────────── v1.11.1
+   Installed LogExpFunctions ───────────── v1.0.1
+   Installed LDLFactorizations ─────────── v0.10.2
+   Installed DataStructures ────────────── v0.19.5
+   Installed OpenBLAS32_jll ────────────── v0.3.33+1
+   Installed Requires ──────────────────── v1.3.1
+   Installed ChainRules ────────────────── v1.73.0
+   Installed ZygoteRules ───────────────── v0.2.7
+   Installed AliasTables ───────────────── v1.1.3
+   Installed ExprTools ─────────────────── v0.1.10
+   Installed StatsAPI ──────────────────── v1.8.0
+   Installed OpenSpecFun_jll ───────────── v0.5.6+0
+   Installed MLUtils ───────────────────── v0.4.9
+   Installed SparseInverseSubset ───────── v0.1.2
+   Installed METIS_jll ─────────────────── v5.1.3+0
+   Installed SortingAlgorithms ─────────── v1.2.3
+   Installed SimpleTraits ──────────────── v0.9.6
+   Installed MacroTools ────────────────── v0.5.16
+   Installed StatsBase ─────────────────── v0.34.12
+   Installed KernelAbstractions ────────── v0.9.41
+   Installed Compat ────────────────────── v4.18.1
+   Installed UnsafeAtomics ─────────────── v0.3.1
+   Installed Missings ──────────────────── v1.2.0
+   Installed DocStringExtensions ───────── v0.9.5
+   Installed LLVM ──────────────────────── v9.9.0
+   Installed NLPModels ─────────────────── v0.21.12
+   Installed Atomix ────────────────────── v1.1.3
+  Installing 5 artifacts
+   Installed artifact OpenSpecFun 194.9 KiB
+   Installed artifact METIS       1.1 MiB
+   Installed artifact MUMPS_seq   8.6 MiB
+   Installed artifact LLVMExtra   3.2 MiB
+   Installed artifact OpenBLAS32  10.2 MiB
+    Updating `/storage/scratch1/9/arosemberg3/DecisionRulesExa.jl/Project.toml`
+  [d360d2e6] + ChainRulesCore v1.26.1
+  [1037b233] + ExaModels v0.9.5 `https://github.com/klamike/ExaModels.jl#mk/param_ad`
+  [587475ba] + Flux v0.16.10
+  [0873d656] + MadDiff v0.1.0 `https://github.com/MadNLP/MadDiff.jl.git#main`
+  [2621e9c9] + MadNLP v0.9.1 `https://github.com/klamike/MadNLP.jl.git#mk/moi_param`
+  [a4795742] + NLPModels v0.21.12
+  [1ff82034] + ParametricNLPModels v0.1.0 `https://github.com/klamike/ParametricNLPModels.jl.git#main`
+  [e88e6eb3] + Zygote v0.7.11
+  [37e2e46d] ~ LinearAlgebra ⇒ v1.12.0
+  [9a3f8284] ~ Random ⇒ v1.11.0
+    Updating `/storage/scratch1/9/arosemberg3/DecisionRulesExa.jl/Manifest.toml`
+  [47edcb42] + ADTypes v1.22.0
+  [14f7f29c] + AMD v0.5.3
+  [621f4979] + AbstractFFTs v1.5.0
+  [79e6a3ab] + Adapt v4.6.1
+  [66dad0bd] + AliasTables v1.1.3
+  [a9b6321e] + Atomix v1.1.3
+  [fa961155] + CEnum v0.5.0
+  [082447d4] + ChainRules v1.73.0
+  [d360d2e6] + ChainRulesCore v1.26.1
+  [bbf7d656] + CommonSubexpressions v0.3.1
+  [34da2185] + Compat v4.18.1
+  [187b0558] + ConstructionBase v1.6.0
+  [9a962f9c] + DataAPI v1.16.0
+  [864edb3b] + DataStructures v0.19.5
+  [e2d170a0] + DataValueInterfaces v1.0.0
+  [8bb1440f] + DelimitedFiles v1.9.1
+  [163ba53b] + DiffResults v1.1.0
+  [b552c78f] + DiffRules v1.16.0
+  [ffbed154] + DocStringExtensions v0.9.5
+  [f151be2c] + EnzymeCore v0.8.20
+  [1037b233] + ExaModels v0.9.5 `https://github.com/klamike/ExaModels.jl#mk/param_ad`
+  [e2ba6199] + ExprTools v0.1.10
+  [9aa1b823] + FastClosures v0.3.2
+  [1a297f60] + FillArrays v1.16.0
+  [587475ba] + Flux v0.16.10
+  [f6369f11] + ForwardDiff v1.4.1
+  [d9f16b24] + Functors v0.5.2
+  [0c68f7d7] + GPUArrays v11.5.8
+  [46192b85] + GPUArraysCore v0.2.0
+  [076d061b] + HashArrayMappedTries v0.2.0
+  [7869d1d1] + IRTools v0.4.17
+  [92d709cd] + IrrationalConstants v0.2.6
+  [82899510] + IteratorInterfaceExtensions v1.0.0
+  [692b3bcd] + JLLWrappers v1.8.0
+  [63c18a36] + KernelAbstractions v0.9.41
+  [40e66cde] + LDLFactorizations v0.10.2
+  [929cbde3] + LLVM v9.9.0
+  [5c8ed15e] + LinearOperators v2.14.1
+  [2ab3a3ac] + LogExpFunctions v1.0.1
+  [c2834f40] + MLCore v1.0.2
+  [7e8f7934] + MLDataDevices v1.17.10
+  [f1d291b0] + MLUtils v0.4.9
+  [1914dd2f] + MacroTools v0.5.16
+  [0873d656] + MadDiff v0.1.0 `https://github.com/MadNLP/MadDiff.jl.git#main`
+  [2621e9c9] + MadNLP v0.9.1 `https://github.com/klamike/MadNLP.jl.git#mk/moi_param`
+  [e1d29d7a] + Missings v1.2.0
+  [a4795742] + NLPModels v0.21.12
+  [872c559c] + NNlib v0.9.36
+  [77ba4419] + NaNMath v1.1.4
+  [0b1bfda6] + OneHotArrays v0.2.11
+  [3bd65402] + Optimisers v0.4.7
+⌅ [bac558e1] + OrderedCollections v1.8.2
+  [1ff82034] + ParametricNLPModels v0.1.0 `https://github.com/klamike/ParametricNLPModels.jl.git#main`
+  [aea7be01] + PrecompileTools v1.3.4
+  [21216c6a] + Preferences v1.5.2
+  [33c8b6b6] + ProgressLogging v0.1.6
+  [43287f4e] + PtrArrays v1.4.0
+  [c1ae055f] + RealDot v0.1.0
+  [189a3867] + Reexport v1.2.2
+  [ae029012] + Requires v1.3.1
+  [431bcebd] + SciMLPublic v1.0.1
+  [7e506255] + ScopedValues v1.6.2
+  [efcf1570] + Setfield v1.1.2
+  [605ecd9f] + ShowCases v0.1.0
+  [699a6c99] + SimpleTraits v0.9.6
+  [ff4d7338] + SolverCore v0.3.10
+  [a2af1166] + SortingAlgorithms v1.2.3
+  [dc90abb0] + SparseInverseSubset v0.1.2
+  [276daf66] + SpecialFunctions v2.8.0
+  [90137ffa] + StaticArrays v1.9.18
+  [1e83bf80] + StaticArraysCore v1.4.4
+  [10745b16] + Statistics v1.11.1
+  [82ae8749] + StatsAPI v1.8.0
+  [2913bbd2] + StatsBase v0.34.12
+  [09ab397b] + StructArrays v0.7.3
+  [3783bdb8] + TableTraits v1.0.1
+  [bd369af6] + Tables v1.12.1
+  [a759f4b9] + TimerOutputs v0.5.29
+  [013be700] + UnsafeAtomics v0.3.1
+  [e88e6eb3] + Zygote v0.7.11
+  [700de1a5] + ZygoteRules v0.2.7
+  [dad2f222] + LLVMExtra_jll v0.0.43+1
+  [d00139f3] + METIS_jll v5.1.3+0
+⌅ [d7ed1dd3] + MUMPS_seq_jll v500.800.200+0
+  [656ef2d0] + OpenBLAS32_jll v0.3.33+1
+  [efe28fd5] + OpenSpecFun_jll v0.5.6+0
+  [0dad84c5] + ArgTools v1.1.2
+  [56f22d72] + Artifacts v1.11.0
+  [2a0f44e3] + Base64 v1.11.0
+  [ade2ca70] + Dates v1.11.0
+  [8ba89e20] + Distributed v1.11.0
+  [f43a241f] + Downloads v1.7.0
+  [7b1f6079] + FileWatching v1.11.0
+  [9fa8497b] + Future v1.11.0
+  [b77e0a4c] + InteractiveUtils v1.11.0
+  [ac6e5ff7] + JuliaSyntaxHighlighting v1.12.0
+  [4af54fe1] + LazyArtifacts v1.11.0
+  [b27032c2] + LibCURL v0.6.4
+  [76f85450] + LibGit2 v1.11.0
+  [8f399da3] + Libdl v1.11.0
+  [37e2e46d] ~ LinearAlgebra ⇒ v1.12.0
+  [56ddb016] + Logging v1.11.0
+  [d6f4376e] + Markdown v1.11.0
+  [a63ad114] + Mmap v1.11.0
+  [ca575930] + NetworkOptions v1.3.0
+  [44cfe95a] + Pkg v1.12.1
+  [de0858da] + Printf v1.11.0
+  [9a3f8284] ~ Random ⇒ v1.11.0
+  [ea8e919c] + SHA v0.7.0
+  [9e88b42a] + Serialization v1.11.0
+  [6462fe0b] + Sockets v1.11.0
+  [2f01184e] + SparseArrays v1.12.0
+  [f489334b] + StyledStrings v1.11.0
+  [4607b0f0] + SuiteSparse
+  [fa267f1f] + TOML v1.0.3
+  [a4e569a6] + Tar v1.10.0
+  [8dfed614] + Test v1.11.0
+  [cf7118a7] + UUIDs v1.11.0
+  [4ec0a83e] + Unicode v1.11.0
+  [e66e0078] + CompilerSupportLibraries_jll v1.3.0+1
+  [deac9b47] + LibCURL_jll v8.15.0+0
+  [e37daf67] + LibGit2_jll v1.9.0+0
+  [29816b5a] + LibSSH2_jll v1.11.3+1
+  [14a3606d] + MozillaCACerts_jll v2025.11.4
+  [4536629a] + OpenBLAS_jll v0.3.29+0
+  [05823500] + OpenLibm_jll v0.8.7+0
+  [458c3c95] + OpenSSL_jll v3.5.4+0
+  [bea87d4a] + SuiteSparse_jll v7.8.3+2
+  [83775a58] + Zlib_jll v1.3.1+2
+  [8e850b90] + libblastrampoline_jll v5.15.0+0
+  [8e850ede] + nghttp2_jll v1.64.0+1
+  [3f19e933] + p7zip_jll v17.7.0+0
+        Info Packages marked with ⌅ have new versions available but compatibility constraints restrict them from upgrading. To see why use `status --outdated -m`
+Precompiling packages...
+   1589.6 ms  ✓ StatsAPI
+   1654.0 ms  ✓ OpenLibm_jll
+   2018.0 ms  ✓ ExprTools
+   2168.2 ms  ✓ IteratorInterfaceExtensions
+   2365.6 ms  ✓ Future
+   2377.6 ms  ✓ CompilerSupportLibraries_jll
+   2729.1 ms  ✓ AbstractFFTs
+   2782.7 ms  ✓ Serialization
+   2699.1 ms  ✓ SuiteSparse_jll
+   2962.1 ms  ✓ Statistics
+   3617.2 ms  ✓ ADTypes
+   2188.6 ms  ✓ Unicode
+   1970.9 ms  ✓ DataValueInterfaces
+   2043.8 ms  ✓ RealDot
+   1972.7 ms  ✓ Reexport
+   4913.5 ms  ✓ FillArrays
+   2447.6 ms  ✓ PtrArrays
+   3653.2 ms  ✓ Requires
+   2811.7 ms  ✓ Mmap
+   2233.5 ms  ✓ HashArrayMappedTries
+   3322.7 ms  ✓ DocStringExtensions
+   2253.8 ms  ✓ Adapt
+   2196.9 ms  ✓ DataAPI
+   2525.7 ms  ✓ ProgressLogging
+   2011.7 ms  ✓ FastClosures
+   3784.1 ms  ✓ EnzymeCore
+   2446.2 ms  ✓ SciMLPublic
+   2451.0 ms  ✓ StaticArraysCore
+   8568.2 ms  ✓ CEnum
+   1945.9 ms  ✓ TableTraits
+   9367.7 ms  ✓ ShowCases
+   2247.1 ms  ✓ FillArrays → FillArraysStatisticsExt
+   9166.5 ms  ✓ OrderedCollections
+  11603.4 ms  ✓ UnsafeAtomics
+   3583.9 ms  ✓ Preferences
+   2500.6 ms  ✓ AliasTables
+   5001.2 ms  ✓ SolverCore
+   4217.0 ms  ✓ LazyArtifacts
+   2212.7 ms  ✓ DelimitedFiles
+   2231.5 ms  ✓ ScopedValues
+   9734.9 ms  ✓ ConstructionBase
+   2052.3 ms  ✓ EnzymeCore → AdaptExt
+   8290.9 ms  ✓ NaNMath
+   2814.0 ms  ✓ GPUArraysCore
+   2007.8 ms  ✓ ADTypes → ADTypesEnzymeCoreExt
+   2185.1 ms  ✓ DiffResults
+  12683.8 ms  ✓ IrrationalConstants
+   1959.6 ms  ✓ ConstructionBase → ConstructionBaseLinearAlgebraExt
+   2269.5 ms  ✓ PrecompileTools
+   2079.7 ms  ✓ ADTypes → ADTypesConstructionBaseExt
+   2836.4 ms  ✓ Atomix
+   2785.9 ms  ✓ JLLWrappers
+   8908.0 ms  ✓ Compat
+  18064.4 ms  ✓ MacroTools
+   2357.0 ms  ✓ Compat → CompatLinearAlgebraExt
+   4036.1 ms  ✓ LogExpFunctions
+   8754.8 ms  ✓ Missings
+  14571.3 ms  ✓ InteractiveUtils
+   3785.2 ms  ✓ OpenSpecFun_jll
+   3977.8 ms  ✓ OpenBLAS32_jll
+   2878.6 ms  ✓ CommonSubexpressions
+   4445.8 ms  ✓ METIS_jll
+  16222.8 ms  ✓ Distributed
+   9887.6 ms  ✓ DataStructures
+   7296.5 ms  ✓ LLVMExtra_jll
+   6009.6 ms  ✓ Setfield
+  11206.4 ms  ✓ Tables
+   3857.2 ms  ✓ SimpleTraits
+   3156.3 ms  ✓ SortingAlgorithms
+   5762.4 ms  ✓ MUMPS_seq_jll
+  19579.7 ms  ✓ TimerOutputs
+   8599.9 ms  ✓ Functors
+   5394.0 ms  ✓ MLCore
+  10610.1 ms  ✓ ChainRulesCore
+   2222.3 ms  ✓ MLDataDevices
+   7188.3 ms  ✓ StructArrays
+   2059.8 ms  ✓ EnzymeCore → EnzymeCoreChainRulesCoreExt
+   2185.0 ms  ✓ ADTypes → ADTypesChainRulesCoreExt
+   2298.0 ms  ✓ AbstractFFTs → AbstractFFTsChainRulesCoreExt
+   2408.8 ms  ✓ MLDataDevices → FillArraysExt
+   3058.1 ms  ✓ ZygoteRules
+   1712.9 ms  ✓ StructArrays → StructArraysAdaptExt
+   2852.2 ms  ✓ MLDataDevices → ChainRulesCoreExt
+  12862.6 ms  ✓ IRTools
+   1800.9 ms  ✓ StructArrays → StructArraysLinearAlgebraExt
+  12871.3 ms  ✓ SpecialFunctions
+  26293.5 ms  ✓ SparseArrays
+   6065.7 ms  ✓ LogExpFunctions → LogExpFunctionsChainRulesCoreExt
+   2911.0 ms  ✓ SuiteSparse
+   2987.5 ms  ✓ Adapt → AdaptSparseArraysExt
+   3146.3 ms  ✓ DiffRules
+   3123.3 ms  ✓ Statistics → SparseArraysExt
+   4378.8 ms  ✓ StructArrays → StructArraysSparseArraysExt
+   4605.1 ms  ✓ FillArrays → FillArraysSparseArraysExt
+   4696.2 ms  ✓ AMD
+   4575.9 ms  ✓ MLDataDevices → SparseArraysExt
+  18795.3 ms  ✓ Test
+   3425.3 ms  ✓ SparseInverseSubset
+  10216.6 ms  ✓ Optimisers
+   6655.0 ms  ✓ LinearOperators
+   7758.3 ms  ✓ SpecialFunctions → SpecialFunctionsChainRulesCoreExt
+   1502.7 ms  ✓ Optimisers → OptimisersEnzymeCoreExt
+   1965.7 ms  ✓ Optimisers → OptimisersAdaptExt
+   8462.0 ms  ✓ ChainRulesCore → ChainRulesCoreSparseArraysExt
+   2032.8 ms  ✓ LinearOperators → LinearOperatorsChainRulesCoreExt
+   4597.6 ms  ✓ AbstractFFTs → AbstractFFTsTestExt
+   5539.3 ms  ✓ LDLFactorizations
+   4826.6 ms  ✓ NLPModels
+   2133.5 ms  ✓ LinearOperators → LinearOperatorsLDLFactorizationsExt
+   1758.3 ms  ✓ SolverCore → SolverCoreNLPModelsExt
+   1864.1 ms  ✓ ParametricNLPModels
+  11660.2 ms  ✓ StatsBase
+  11884.1 ms  ✓ ForwardDiff
+  33984.9 ms  ✓ StaticArrays
+   2249.2 ms  ✓ StaticArrays → StaticArraysStatisticsExt
+   2233.5 ms  ✓ Adapt → AdaptStaticArraysExt
+   2363.8 ms  ✓ FillArrays → FillArraysStaticArraysExt
+   2335.6 ms  ✓ ConstructionBase → ConstructionBaseStaticArraysExt
+   2526.3 ms  ✓ ForwardDiff → ForwardDiffStaticArraysExt
+  31223.6 ms  ✓ LLVM
+   5059.8 ms  ✓ StaticArrays → StaticArraysChainRulesCoreExt
+   5538.2 ms  ✓ StructArrays → StructArraysStaticArraysExt
+  10787.7 ms  ✓ ExaModels
+  17294.8 ms  ✓ ChainRules
+   4341.5 ms  ✓ UnsafeAtomics → UnsafeAtomicsLLVM
+   2227.5 ms  ✓ ExaModels → ExaModelsSpecialFunctions
+   2646.2 ms  ✓ ExaModels → ExaModelsLinearAlgebra
+   1724.8 ms  ✓ MLDataDevices → ChainRulesExt
+   8637.6 ms  ✓ KernelAbstractions
+   1954.0 ms  ✓ KernelAbstractions → LinearAlgebraExt
+   2160.4 ms  ✓ StructArrays → StructArraysGPUArraysCoreExt
+   2170.3 ms  ✓ KernelAbstractions → EnzymeExt
+   2692.2 ms  ✓ KernelAbstractions → SparseArraysExt
+   4246.6 ms  ✓ ExaModels → ExaModelsKernelAbstractions
+   7531.6 ms  ✓ NNlib
+   2077.9 ms  ✓ NNlib → NNlibSpecialFunctionsExt
+   2167.3 ms  ✓ NNlib → NNlibForwardDiffExt
+   9217.6 ms  ✓ GPUArrays
+   3032.4 ms  ✓ NNlib → NNlibEnzymeCoreExt
+   3234.8 ms  ✓ OneHotArrays
+   1949.7 ms  ✓ MLDataDevices → OneHotArraysExt
+   3767.7 ms  ✓ MLDataDevices → GPUArraysSparseArraysExt
+   6204.6 ms  ✓ MLUtils
+   1622.4 ms  ✓ MLDataDevices → MLUtilsExt
+  47188.6 ms  ✓ MadNLP
+   2255.6 ms  ✓ MadDiff
+  52260.3 ms  ✓ Zygote
+   2058.3 ms  ✓ MLDataDevices → ZygoteExt
+  12515.8 ms  ✓ Flux
+   8304.8 ms  ✓ DecisionRulesExa
+  150 dependencies successfully precompiled in 135 seconds. 24 already precompiled.
+ERROR: LoadError: Some tests did not pass: 0 passed, 0 failed, 1 errored, 0 broken.
+in expression starting at /storage/scratch1/9/arosemberg3/DecisionRulesExa.jl/test/test_subproblem_maddiff.jl:163

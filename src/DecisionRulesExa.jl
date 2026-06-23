@@ -12,9 +12,12 @@ using ChainRulesCore
 
 include("utils.jl")
 include("deterministic_equivalent.jl")
+include("subproblem.jl")
+include("subproblem_diff.jl")
 include("policy.jl")
 include("critic_control_variate.jl")
 include("training.jl")
+include("subproblem_training.jl")
 include("rollout.jl")
 
 export
@@ -60,6 +63,15 @@ export
     critic_samples_from_evaluation,
     simulate_tsddr,
     train_tsddr,
+
+    # Stage-wise subproblem training (MadDiff)
+    SubproblemDEProblem,
+    build_subproblem,
+    build_linear_tracking_subproblem,
+    dynamics_multipliers,
+    realized_state,
+    solve_subproblem,
+    train_subproblem_tsddr,
 
     # Stage-wise rollout evaluation
     rollout_tsddr,

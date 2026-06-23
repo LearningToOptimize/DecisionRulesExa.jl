@@ -1,0 +1,251 @@
+Precompiling packages...
+ 134497.6 ms  ✓ Pkg (serial)
+  1 dependency successfully precompiled in 135 seconds
+  Installing known registries into `/tmp/ar_julia_depot`
+       Added `General` registry to /tmp/ar_julia_depot/registries
+    Updating registry at `/tmp/ar_julia_depot/registries/General.toml`
+     Cloning git-repo `https://github.com/klamike/ExaModels.jl`
+    Updating git-repo `https://github.com/klamike/ExaModels.jl`
+     Cloning git-repo `https://github.com/klamike/MadNLP.jl.git`
+    Updating git-repo `https://github.com/klamike/MadNLP.jl.git`
+     Cloning git-repo `https://github.com/MadNLP/MadDiff.jl.git`
+    Updating git-repo `https://github.com/MadNLP/MadDiff.jl.git`
+     Cloning git-repo `https://github.com/klamike/ParametricNLPModels.jl.git`
+    Updating git-repo `https://github.com/klamike/ParametricNLPModels.jl.git`
+    Updating git-repo `https://github.com/klamike/MadNLP.jl.git`
+ERROR: Unsatisfiable requirements detected for package CUDA [052768ef]:
+ CUDA [052768ef] log:
+ ├─possible versions are: 0.1.0 - 6.2.0 or uninstalled
+ ├─restricted to versions 6 by DecisionRulesExa [7c3e91a4], leaving only versions: 6.0.0 - 6.2.0
+ │ └─DecisionRulesExa [7c3e91a4] log:
+ │   ├─possible versions are: 0.1.0 or uninstalled
+ │   └─DecisionRulesExa [7c3e91a4] is fixed to version 0.1.0
+ └─restricted to versions 5 by ExaModels [1037b233] — no versions left
+   └─ExaModels [1037b233] log:
+     ├─possible versions are: 0.9.5 or uninstalled
+     ├─restricted to versions 0.9 - 0.11 by DecisionRulesExa [7c3e91a4], leaving only versions: 0.9.5
+     │ └─DecisionRulesExa [7c3e91a4] log: see above
+     └─ExaModels [1037b233] is fixed to version 0.9.5
+Stacktrace:
+  [1] check_constraints(graph::Pkg.Resolve.Graph)
+    @ Pkg.Resolve /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Resolve/graphtype.jl:1052
+  [2] Pkg.Resolve.Graph(compat::Dict{Base.UUID, Dict{VersionNumber, Dict{Base.UUID, Pkg.Versions.VersionSpec}}}, compat_weak::Dict{Base.UUID, Dict{VersionNumber, Set{Base.UUID}}}, uuid_to_name::Dict{Base.UUID, String}, reqs::Dict{Base.UUID, Pkg.Versions.VersionSpec}, fixed::Dict{Base.UUID, Pkg.Resolve.Fixed}, verbose::Bool, julia_version::VersionNumber)
+    @ Pkg.Resolve /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Resolve/graphtype.jl:352
+  [3] deps_graph(env::Pkg.Types.EnvCache, registries::Vector{Pkg.Registry.RegistryInstance}, uuid_to_name::Dict{Base.UUID, String}, reqs::Dict{Base.UUID, Pkg.Versions.VersionSpec}, fixed::Dict{Base.UUID, Pkg.Resolve.Fixed}, julia_version::VersionNumber, installed_only::Bool)
+    @ Pkg.Operations /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Operations.jl:751
+  [4] resolve_versions!(env::Pkg.Types.EnvCache, registries::Vector{Pkg.Registry.RegistryInstance}, pkgs::Vector{PackageSpec}, julia_version::VersionNumber, installed_only::Bool)
+    @ Pkg.Operations /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Operations.jl:557
+  [5] up(ctx::Pkg.Types.Context, pkgs::Vector{PackageSpec}, level::UpgradeLevel; skip_writing_project::Bool, preserve::Nothing)
+    @ Pkg.Operations /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Operations.jl:1997
+  [6] up
+    @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Operations.jl:1974 [inlined]
+  [7] up(ctx::Pkg.Types.Context, pkgs::Vector{PackageSpec}; level::UpgradeLevel, mode::PackageMode, preserve::Nothing, update_registry::Bool, skip_writing_project::Bool, kwargs::@Kwargs{})
+    @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:436
+  [8] up
+    @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:406 [inlined]
+  [9] up
+    @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:174 [inlined]
+ [10] instantiate(ctx::Pkg.Types.Context; manifest::Nothing, update_registry::Bool, verbose::Bool, platform::Base.BinaryPlatforms.Platform, allow_build::Bool, allow_autoprecomp::Bool, workspace::Bool, julia_version_strict::Bool, kwargs::@Kwargs{})
+    @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1298
+ [11] instantiate
+    @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1271 [inlined]
+ [12] instantiate(; kwargs::@Kwargs{})
+    @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1270
+ [13] top-level scope
+    @ none:1
+ [14] eval(m::Module, e::Any)
+    @ Core ./boot.jl:489
+ [15] exec_options(opts::Base.JLOptions)
+    @ Base ./client.jl:283
+ [16] _start()
+    @ Base ./client.jl:550
+    Updating registry at `/tmp/ar_julia_depot/registries/General.toml`
+    Updating git-repo `https://github.com/klamike/ExaModels.jl`
+    Updating git-repo `https://github.com/klamike/MadNLP.jl.git`
+    Updating git-repo `https://github.com/MadNLP/MadDiff.jl.git`
+    Updating git-repo `https://github.com/klamike/ParametricNLPModels.jl.git`
+    Updating git-repo `https://github.com/klamike/MadNLP.jl.git`
+ERROR: Unsatisfiable requirements detected for package CUDA [052768ef]:
+ CUDA [052768ef] log:
+ ├─possible versions are: 0.1.0 - 6.2.0 or uninstalled
+ ├─restricted to versions 6 by DecisionRulesExa [7c3e91a4], leaving only versions: 6.0.0 - 6.2.0
+ │ └─DecisionRulesExa [7c3e91a4] log:
+ │   ├─possible versions are: 0.1.0 or uninstalled
+ │   └─DecisionRulesExa [7c3e91a4] is fixed to version 0.1.0
+ └─restricted to versions 5 by ExaModels [1037b233] — no versions left
+   └─ExaModels [1037b233] log:
+     ├─possible versions are: 0.9.5 or uninstalled
+     ├─restricted to versions 0.9 - 0.11 by DecisionRulesExa [7c3e91a4], leaving only versions: 0.9.5
+     │ └─DecisionRulesExa [7c3e91a4] log: see above
+     └─ExaModels [1037b233] is fixed to version 0.9.5
+Stacktrace:
+  [1] check_constraints(graph::Pkg.Resolve.Graph)
+    @ Pkg.Resolve /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Resolve/graphtype.jl:1052
+  [2] Pkg.Resolve.Graph(compat::Dict{Base.UUID, Dict{VersionNumber, Dict{Base.UUID, Pkg.Versions.VersionSpec}}}, compat_weak::Dict{Base.UUID, Dict{VersionNumber, Set{Base.UUID}}}, uuid_to_name::Dict{Base.UUID, String}, reqs::Dict{Base.UUID, Pkg.Versions.VersionSpec}, fixed::Dict{Base.UUID, Pkg.Resolve.Fixed}, verbose::Bool, julia_version::VersionNumber)
+    @ Pkg.Resolve /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Resolve/graphtype.jl:352
+  [3] deps_graph(env::Pkg.Types.EnvCache, registries::Vector{Pkg.Registry.RegistryInstance}, uuid_to_name::Dict{Base.UUID, String}, reqs::Dict{Base.UUID, Pkg.Versions.VersionSpec}, fixed::Dict{Base.UUID, Pkg.Resolve.Fixed}, julia_version::VersionNumber, installed_only::Bool)
+    @ Pkg.Operations /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Operations.jl:751
+  [4] resolve_versions!(env::Pkg.Types.EnvCache, registries::Vector{Pkg.Registry.RegistryInstance}, pkgs::Vector{PackageSpec}, julia_version::VersionNumber, installed_only::Bool)
+    @ Pkg.Operations /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Operations.jl:557
+  [5] up(ctx::Pkg.Types.Context, pkgs::Vector{PackageSpec}, level::UpgradeLevel; skip_writing_project::Bool, preserve::Nothing)
+    @ Pkg.Operations /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Operations.jl:1997
+  [6] up
+    @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Operations.jl:1974 [inlined]
+  [7] up(ctx::Pkg.Types.Context, pkgs::Vector{PackageSpec}; level::UpgradeLevel, mode::PackageMode, preserve::Nothing, update_registry::Bool, skip_writing_project::Bool, kwargs::@Kwargs{})
+    @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:436
+  [8] up
+    @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:406 [inlined]
+  [9] up
+    @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:174 [inlined]
+ [10] instantiate(ctx::Pkg.Types.Context; manifest::Nothing, update_registry::Bool, verbose::Bool, platform::Base.BinaryPlatforms.Platform, allow_build::Bool, allow_autoprecomp::Bool, workspace::Bool, julia_version_strict::Bool, kwargs::@Kwargs{})
+    @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1298
+ [11] instantiate
+    @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1271 [inlined]
+ [12] instantiate(; kwargs::@Kwargs{})
+    @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1270
+ [13] top-level scope
+    @ none:1
+ [14] eval(m::Module, e::Any)
+    @ Core ./boot.jl:489
+ [15] exec_options(opts::Base.JLOptions)
+    @ Base ./client.jl:283
+ [16] _start()
+    @ Base ./client.jl:550
+    Updating registry at `/tmp/ar_julia_depot/registries/General.toml`
+    Updating git-repo `https://github.com/klamike/ExaModels.jl`
+    Updating git-repo `https://github.com/klamike/MadNLP.jl.git`
+    Updating git-repo `https://github.com/MadNLP/MadDiff.jl.git`
+    Updating git-repo `https://github.com/klamike/ParametricNLPModels.jl.git`
+    Updating git-repo `https://github.com/klamike/MadNLP.jl.git`
+ERROR: Unsatisfiable requirements detected for package CUDA [052768ef]:
+ CUDA [052768ef] log:
+ ├─possible versions are: 0.1.0 - 6.2.0 or uninstalled
+ ├─restricted to versions 6 by DecisionRulesExa [7c3e91a4], leaving only versions: 6.0.0 - 6.2.0
+ │ └─DecisionRulesExa [7c3e91a4] log:
+ │   ├─possible versions are: 0.1.0 or uninstalled
+ │   └─DecisionRulesExa [7c3e91a4] is fixed to version 0.1.0
+ └─restricted to versions 5 by ExaModels [1037b233] — no versions left
+   └─ExaModels [1037b233] log:
+     ├─possible versions are: 0.9.5 or uninstalled
+     ├─restricted to versions 0.9 - 0.11 by DecisionRulesExa [7c3e91a4], leaving only versions: 0.9.5
+     │ └─DecisionRulesExa [7c3e91a4] log: see above
+     └─ExaModels [1037b233] is fixed to version 0.9.5
+Stacktrace:
+  [1] check_constraints(graph::Pkg.Resolve.Graph)
+    @ Pkg.Resolve /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Resolve/graphtype.jl:1052
+  [2] Pkg.Resolve.Graph(compat::Dict{Base.UUID, Dict{VersionNumber, Dict{Base.UUID, Pkg.Versions.VersionSpec}}}, compat_weak::Dict{Base.UUID, Dict{VersionNumber, Set{Base.UUID}}}, uuid_to_name::Dict{Base.UUID, String}, reqs::Dict{Base.UUID, Pkg.Versions.VersionSpec}, fixed::Dict{Base.UUID, Pkg.Resolve.Fixed}, verbose::Bool, julia_version::VersionNumber)
+    @ Pkg.Resolve /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Resolve/graphtype.jl:352
+  [3] deps_graph(env::Pkg.Types.EnvCache, registries::Vector{Pkg.Registry.RegistryInstance}, uuid_to_name::Dict{Base.UUID, String}, reqs::Dict{Base.UUID, Pkg.Versions.VersionSpec}, fixed::Dict{Base.UUID, Pkg.Resolve.Fixed}, julia_version::VersionNumber, installed_only::Bool)
+    @ Pkg.Operations /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Operations.jl:751
+  [4] resolve_versions!(env::Pkg.Types.EnvCache, registries::Vector{Pkg.Registry.RegistryInstance}, pkgs::Vector{PackageSpec}, julia_version::VersionNumber, installed_only::Bool)
+    @ Pkg.Operations /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Operations.jl:557
+  [5] up(ctx::Pkg.Types.Context, pkgs::Vector{PackageSpec}, level::UpgradeLevel; skip_writing_project::Bool, preserve::Nothing)
+    @ Pkg.Operations /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Operations.jl:1997
+  [6] up
+    @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Operations.jl:1974 [inlined]
+  [7] up(ctx::Pkg.Types.Context, pkgs::Vector{PackageSpec}; level::UpgradeLevel, mode::PackageMode, preserve::Nothing, update_registry::Bool, skip_writing_project::Bool, kwargs::@Kwargs{})
+    @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:436
+  [8] up
+    @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:406 [inlined]
+  [9] up
+    @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:174 [inlined]
+ [10] instantiate(ctx::Pkg.Types.Context; manifest::Nothing, update_registry::Bool, verbose::Bool, platform::Base.BinaryPlatforms.Platform, allow_build::Bool, allow_autoprecomp::Bool, workspace::Bool, julia_version_strict::Bool, kwargs::@Kwargs{})
+    @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1298
+ [11] instantiate
+    @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1271 [inlined]
+ [12] instantiate(; kwargs::@Kwargs{})
+    @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1270
+ [13] top-level scope
+    @ none:1
+ [14] eval(m::Module, e::Any)
+    @ Core ./boot.jl:489
+ [15] exec_options(opts::Base.JLOptions)
+    @ Base ./client.jl:283
+ [16] _start()
+    @ Base ./client.jl:550
+Precompiling packages...
+   9845.6 ms  ✓ Test (serial)
+  1 dependency successfully precompiled in 10 seconds
+Precompiling packages...
+Info Given DecisionRulesExa was explicitly requested, output will be shown live [0K
+[0KERROR: LoadError: ArgumentError: Package ExaModels [1037b233-b668-4ce9-9b63-f9f681f55dd2] is required but does not seem to be installed:
+[0K - Run `Pkg.instantiate()` to install all recorded dependencies.
+[0K
+[0KStacktrace:
+[0K  [1] __require_prelocked(pkg::Base.PkgId, env::String)
+[0K    @ Base ./loading.jl:2615
+[0K  [2] _require_prelocked(uuidkey::Base.PkgId, env::String)
+[0K    @ Base ./loading.jl:2493
+[0K  [3] macro expansion
+[0K    @ ./loading.jl:2421 [inlined]
+[0K  [4] macro expansion
+[0K    @ ./lock.jl:376 [inlined]
+[0K  [5] __require(into::Module, mod::Symbol)
+[0K    @ Base ./loading.jl:2386
+[0K  [6] require(into::Module, mod::Symbol)
+[0K    @ Base ./loading.jl:2362
+[0K  [7] top-level scope
+[0K    @ /storage/scratch1/9/arosemberg3/DecisionRulesExa.jl/src/DecisionRulesExa.jl:3
+[0K  [8] include(mod::Module, _path::String)
+[0K    @ Base ./Base.jl:306
+[0K  [9] include_package_for_output(pkg::Base.PkgId, input::String, depot_path::Vector{String}, dl_load_path::Vector{String}, load_path::Vector{String}, concrete_deps::Vector{Pair{Base.PkgId, UInt128}}, source::Nothing)
+[0K    @ Base ./loading.jl:3024
+[0K [10] top-level scope
+[0K    @ stdin:5
+[0K [11] eval(m::Module, e::Any)
+[0K    @ Core ./boot.jl:489
+[0K [12] include_string(mapexpr::typeof(identity), mod::Module, code::String, filename::String)
+[0K    @ Base ./loading.jl:2870
+[0K [13] include_string
+[0K    @ ./loading.jl:2880 [inlined]
+[0K [14] exec_options(opts::Base.JLOptions)
+[0K    @ Base ./client.jl:315
+[0K [15] _start()
+[0K    @ Base ./client.jl:550
+[0Kin expression starting at /storage/scratch1/9/arosemberg3/DecisionRulesExa.jl/src/DecisionRulesExa.jl:1
+[0Kin expression starting at stdin:5
+              ✗ DecisionRulesExa (serial)
+  0 dependencies successfully precompiled in 1 seconds
+
+ERROR: LoadError: The following 1 direct dependency failed to precompile:
+
+DecisionRulesExa 
+
+Failed to precompile DecisionRulesExa [7c3e91a4-d8f2-4b6a-9e15-a2c4f7b80d53] to "/tmp/ar_julia_depot/compiled/v1.12/DecisionRulesExa/jl_F4h4CL".
+ERROR: LoadError: ArgumentError: Package ExaModels [1037b233-b668-4ce9-9b63-f9f681f55dd2] is required but does not seem to be installed:
+ - Run `Pkg.instantiate()` to install all recorded dependencies.
+
+Stacktrace:
+  [1] __require_prelocked(pkg::Base.PkgId, env::String)
+    @ Base ./loading.jl:2615
+  [2] _require_prelocked(uuidkey::Base.PkgId, env::String)
+    @ Base ./loading.jl:2493
+  [3] macro expansion
+    @ ./loading.jl:2421 [inlined]
+  [4] macro expansion
+    @ ./lock.jl:376 [inlined]
+  [5] __require(into::Module, mod::Symbol)
+    @ Base ./loading.jl:2386
+  [6] require(into::Module, mod::Symbol)
+    @ Base ./loading.jl:2362
+  [7] top-level scope
+    @ /storage/scratch1/9/arosemberg3/DecisionRulesExa.jl/src/DecisionRulesExa.jl:3
+  [8] include(mod::Module, _path::String)
+    @ Base ./Base.jl:306
+  [9] include_package_for_output(pkg::Base.PkgId, input::String, depot_path::Vector{String}, dl_load_path::Vector{String}, load_path::Vector{String}, concrete_deps::Vector{Pair{Base.PkgId, UInt128}}, source::Nothing)
+    @ Base ./loading.jl:3024
+ [10] top-level scope
+    @ stdin:5
+ [11] eval(m::Module, e::Any)
+    @ Core ./boot.jl:489
+ [12] include_string(mapexpr::typeof(identity), mod::Module, code::String, filename::String)
+    @ Base ./loading.jl:2870
+ [13] include_string
+    @ ./loading.jl:2880 [inlined]
+ [14] exec_options(opts::Base.JLOptions)
+    @ Base ./client.jl:315
+ [15] _start()
+    @ Base ./client.jl:550
+in expression starting at /storage/scratch1/9/arosemberg3/DecisionRulesExa.jl/src/DecisionRulesExa.jl:1
+in expression starting at stdin:
+in expression starting at /storage/scratch1/9/arosemberg3/DecisionRulesExa.jl/test/test_subproblem_maddiff.jl:12

@@ -1,0 +1,62 @@
+---------------------------------------
+Begin Slurm Prolog: Jun-22-2026 19:40:46
+Job ID:    10287937
+User ID:   arosemberg3
+Account:   gts-phentenryck3-coda20
+Job name:  maddiff_sub_test
+Partition: cpu-medium
+QOS:       inferno
+---------------------------------------
+==============================================
+MadDiff Subproblem Gradient Tests
+Job ID:   10287937
+Node:     atl1-1-01-004-3-1
+CPUs:     4
+Start:    Mon Jun 22 19:40:46 EDT 2026
+==============================================
+
+--- Resolving dependencies (klamike forks) ---
+Attempt 1...
+Pkg.instantiate failed (attempt 1), retrying in 10s...
+Attempt 2...
+Pkg.instantiate failed (attempt 2), retrying in 10s...
+Attempt 3...
+Pkg.instantiate failed (attempt 3), retrying in 10s...
+
+--- Package status ---
+  Installing known registries into `/tmp/ar_julia_depot`
+       Added `General` registry to /tmp/ar_julia_depot/registries
+Project DecisionRulesExa v0.1.0
+Status `/storage/scratch1/9/arosemberg3/DecisionRulesExa.jl/Project.toml`
+→ [052768ef] CUDA v6.2.0
+→ [d360d2e6] ChainRulesCore v1.26.1
+→ [1037b233] ExaModels v0.11.1 `https://github.com/klamike/ExaModels.jl#mk/param_ad`
+→ [587475ba] Flux v0.16.10
+  [0873d656] MadDiff `https://github.com/MadNLP/MadDiff.jl.git#main`
+→ [2621e9c9] MadNLP v0.10.1 `https://github.com/klamike/MadNLP.jl.git#mk/moi_param`
+→ [d72a61cc] MadNLPGPU v0.10.1 `https://github.com/klamike/MadNLP.jl.git:lib/MadNLPGPU#mk/moi_param`
+→ [a4795742] NLPModels v0.21.12
+  [1ff82034] ParametricNLPModels `https://github.com/klamike/ParametricNLPModels.jl.git#main`
+→ [e88e6eb3] Zygote v0.7.11
+  [37e2e46d] LinearAlgebra v1.12.0
+  [9a3f8284] Random v1.11.0
+Info Packages marked with → are not downloaded, use `instantiate` to download
+Warning The project dependencies or compat requirements have changed since the manifest was last resolved. It is recommended to `Pkg.resolve()` or consider `Pkg.update()` if necessary.
+
+--- Running MadDiff subproblem gradient tests ---
+
+==============================================
+Job completed: Mon Jun 22 19:43:33 EDT 2026
+==============================================
+---------------------------------------
+Begin Slurm Epilog: Jun-22-2026 19:43:33
+Job ID:        10287937
+User ID:       arosemberg3
+Account:       gts-phentenryck3-coda20
+Job name:      maddiff_sub_test
+Resources:     cpu=4,mem=64G,node=1
+Rsrc Used:     cput=00:11:12,vmem=0,walltime=00:02:48,mem=2281500K,energy_used=0
+Partition:     cpu-medium
+QOS:           inferno
+Nodes:         atl1-1-01-004-3-1
+---------------------------------------

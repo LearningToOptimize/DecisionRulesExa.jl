@@ -1,0 +1,135 @@
+Precompiling packages...
+   1241.6 ms  ✓ OpenSSL_jll
+   1185.9 ms  ✓ Logging
+   1429.5 ms  ✓ UUIDs
+   1599.3 ms  ✓ Unicode
+   1583.5 ms  ✓ Zlib_jll
+   1662.4 ms  ✓ NetworkOptions
+   1711.6 ms  ✓ MozillaCACerts_jll
+   1784.8 ms  ✓ nghttp2_jll
+   1731.3 ms  ✓ Base64
+   1851.0 ms  ✓ CompilerSupportLibraries_jll
+    983.4 ms  ✓ LibSSH2_jll
+   1173.1 ms  ✓ Printf
+   1122.9 ms  ✓ p7zip_jll
+    842.1 ms  ✓ LibGit2_jll
+    985.3 ms  ✓ LibCURL_jll
+   3648.1 ms  ✓ ArgTools
+   1348.7 ms  ✓ LibCURL
+   1180.9 ms  ✓ Tar
+   4559.5 ms  ✓ Dates
+    638.8 ms  ✓ TOML
+   5244.3 ms  ✓ LibGit2
+   5116.7 ms  ✓ Downloads
+  13993.0 ms  ✓ StyledStrings
+   2887.8 ms  ✓ JuliaSyntaxHighlighting
+   6872.6 ms  ✓ Markdown
+  82171.9 ms  ✓ Pkg
+  26 dependencies successfully precompiled in 106 seconds
+  Installing known registries into `/tmp/ar_julia_depot`
+       Added `General` registry to /tmp/ar_julia_depot/registries
+┌ Warning: The project dependencies or compat requirements have changed since the manifest was last resolved.
+│ It is recommended to `Pkg.resolve()` or consider `Pkg.update()` if necessary.
+└ @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1308
+ERROR: `MadDiff` is a direct dependency, but does not appear in the manifest. If you intend `MadDiff` to be a direct dependency, run `Pkg.resolve()` to populate the manifest. Otherwise, remove `MadDiff` with `Pkg.rm("MadDiff")`. Finally, run `Pkg.instantiate()` again.
+Stacktrace:
+ [1] pkgerror(::String, ::Vararg{String})
+   @ Pkg.Types /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Types.jl:68
+ [2] instantiate(ctx::Pkg.Types.Context; manifest::Nothing, update_registry::Bool, verbose::Bool, platform::Base.BinaryPlatforms.Platform, allow_build::Bool, allow_autoprecomp::Bool, workspace::Bool, julia_version_strict::Bool, kwargs::@Kwargs{})
+   @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1315
+ [3] instantiate
+   @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1271 [inlined]
+ [4] instantiate(; kwargs::@Kwargs{})
+   @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1270
+ [5] top-level scope
+   @ none:1
+ [6] eval(m::Module, e::Any)
+   @ Core ./boot.jl:489
+ [7] exec_options(opts::Base.JLOptions)
+   @ Base ./client.jl:283
+ [8] _start()
+   @ Base ./client.jl:550
+┌ Warning: The project dependencies or compat requirements have changed since the manifest was last resolved.
+│ It is recommended to `Pkg.resolve()` or consider `Pkg.update()` if necessary.
+└ @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1308
+ERROR: `MadDiff` is a direct dependency, but does not appear in the manifest. If you intend `MadDiff` to be a direct dependency, run `Pkg.resolve()` to populate the manifest. Otherwise, remove `MadDiff` with `Pkg.rm("MadDiff")`. Finally, run `Pkg.instantiate()` again.
+Stacktrace:
+ [1] pkgerror(::String, ::Vararg{String})
+   @ Pkg.Types /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Types.jl:68
+ [2] instantiate(ctx::Pkg.Types.Context; manifest::Nothing, update_registry::Bool, verbose::Bool, platform::Base.BinaryPlatforms.Platform, allow_build::Bool, allow_autoprecomp::Bool, workspace::Bool, julia_version_strict::Bool, kwargs::@Kwargs{})
+   @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1315
+ [3] instantiate
+   @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1271 [inlined]
+ [4] instantiate(; kwargs::@Kwargs{})
+   @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1270
+ [5] top-level scope
+   @ none:1
+ [6] eval(m::Module, e::Any)
+   @ Core ./boot.jl:489
+ [7] exec_options(opts::Base.JLOptions)
+   @ Base ./client.jl:283
+ [8] _start()
+   @ Base ./client.jl:550
+┌ Warning: The project dependencies or compat requirements have changed since the manifest was last resolved.
+│ It is recommended to `Pkg.resolve()` or consider `Pkg.update()` if necessary.
+└ @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1308
+ERROR: `MadDiff` is a direct dependency, but does not appear in the manifest. If you intend `MadDiff` to be a direct dependency, run `Pkg.resolve()` to populate the manifest. Otherwise, remove `MadDiff` with `Pkg.rm("MadDiff")`. Finally, run `Pkg.instantiate()` again.
+Stacktrace:
+ [1] pkgerror(::String, ::Vararg{String})
+   @ Pkg.Types /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/Types.jl:68
+ [2] instantiate(ctx::Pkg.Types.Context; manifest::Nothing, update_registry::Bool, verbose::Bool, platform::Base.BinaryPlatforms.Platform, allow_build::Bool, allow_autoprecomp::Bool, workspace::Bool, julia_version_strict::Bool, kwargs::@Kwargs{})
+   @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1315
+ [3] instantiate
+   @ /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1271 [inlined]
+ [4] instantiate(; kwargs::@Kwargs{})
+   @ Pkg.API /storage/pace-apps/manual/packages/julia/1.12.5/share/julia/stdlib/v1.12/Pkg/src/API.jl:1270
+ [5] top-level scope
+   @ none:1
+ [6] eval(m::Module, e::Any)
+   @ Core ./boot.jl:489
+ [7] exec_options(opts::Base.JLOptions)
+   @ Base ./client.jl:283
+ [8] _start()
+   @ Base ./client.jl:550
+Precompiling packages...
+    847.1 ms  ✓ Serialization
+   3078.5 ms  ✓ InteractiveUtils
+   5722.1 ms  ✓ Test
+  3 dependencies successfully precompiled in 9 seconds. 5 already precompiled.
+ERROR: LoadError: failed to find source of parent package: "ChainRulesCore"
+Stacktrace:
+  [1] error(s::String)
+    @ Base ./error.jl:44
+  [2] explicit_manifest_uuid_path(project_file::String, pkg::Base.PkgId)
+    @ Base ./loading.jl:1097
+  [3] manifest_uuid_path(env::String, pkg::Base.PkgId)
+    @ Base ./loading.jl:781
+  [4] locate_package_env(pkg::Base.PkgId, stopenv::Nothing)
+    @ Base ./loading.jl:462
+  [5] locate_package(pkg::Base.PkgId, stopenv::Nothing)
+    @ Base ./loading.jl:514
+  [6] locate_package
+    @ ./loading.jl:514 [inlined]
+  [7] _precompilepkgs(pkgs::Vector{Base.PkgId}, internal_call::Bool, strict::Bool, warn_loaded::Bool, timing::Bool, _from_loading::Bool, configs::Vector{Pair{Cmd, Base.CacheFlags}}, _io::IOContext{IO}, fancyprint::Bool, manifest::Bool, ignore_loaded::Bool)
+    @ Base.Precompilation ./precompilation.jl:968
+  [8] precompilepkgs(pkgs::Vector{Base.PkgId}; internal_call::Bool, strict::Bool, warn_loaded::Bool, timing::Bool, _from_loading::Bool, configs::Pair{Cmd, Base.CacheFlags}, io::IOStream, fancyprint::Bool, manifest::Bool, ignore_loaded::Bool)
+    @ Base.Precompilation ./precompilation.jl:474
+  [9] __require_prelocked(pkg::Base.PkgId, env::String)
+    @ Base ./loading.jl:2657
+ [10] _require_prelocked(uuidkey::Base.PkgId, env::String)
+    @ Base ./loading.jl:2493
+ [11] macro expansion
+    @ ./loading.jl:2421 [inlined]
+ [12] macro expansion
+    @ ./lock.jl:376 [inlined]
+ [13] __require(into::Module, mod::Symbol)
+    @ Base ./loading.jl:2386
+ [14] require(into::Module, mod::Symbol)
+    @ Base ./loading.jl:2362
+ [15] include(mod::Module, _path::String)
+    @ Base ./Base.jl:306
+ [16] exec_options(opts::Base.JLOptions)
+    @ Base ./client.jl:317
+ [17] _start()
+    @ Base ./client.jl:550
+in expression starting at /storage/scratch1/9/arosemberg3/DecisionRulesExa.jl/test/test_subproblem_maddiff.jl:12

@@ -5,24 +5,30 @@ version = "0.1.0"
 
 [deps]
 ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
-CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 ExaModels = "1037b233-b668-4ce9-9b63-f9f681f55dd2"
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+MadDiff = "0873d656-25a4-4889-b982-f3e325818f6d"
 MadNLP = "2621e9c9-9eb4-46b1-8089-e8c72242dfb6"
-MadNLPGPU = "d72a61cc-809d-412f-99be-fd81f4b8a598"
 NLPModels = "a4795742-8479-5a88-8948-cc11e1c8c1a6"
+ParametricNLPModels = "1ff82034-6bb8-44a0-b51b-5c1bd563924f"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 
+[sources]
+MadDiff = {rev = "main", url = "https://github.com/MadNLP/MadDiff.jl.git"}
+MadNLP = {rev = "mk/moi_param", url = "https://github.com/klamike/MadNLP.jl.git"}
+ExaModels = {rev = "mk/param_ad", url = "https://github.com/klamike/ExaModels.jl"}
+ParametricNLPModels = {rev = "main", url = "https://github.com/klamike/ParametricNLPModels.jl.git"}
+
 [compat]
-CUDA = "6"
 ChainRulesCore = "1.26"
-ExaModels = "0.11"
+ExaModels = "0.9, 0.10, 0.11"
 Flux = "0.16"
-MadNLP = "0.10"
-MadNLPGPU = "0.10"
+MadDiff = "0.1"
+MadNLP = "0.8, 0.9, 0.10"
 NLPModels = "0.21"
+ParametricNLPModels = "0.1"
 Zygote = "0.7"
 julia = "1.10, 1.11, 1.12"
 
