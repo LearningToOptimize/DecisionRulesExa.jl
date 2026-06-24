@@ -1,6 +1,7 @@
 using Test
 using DecisionRulesExa
 using Flux
+using MadNLP
 using Random
 using Zygote
 
@@ -24,7 +25,7 @@ using Zygote
     set_uncertainty!(prob, w)
     set_targets!(prob, xhat)
 
-    res = solve!(prob; tol = 1e-6, max_iter = 200)
+    res = DecisionRulesExa.solve!(prob; tol = 1e-6, max_iter = 200)
 
     n_x = T * nx
     n_u = (T - 1) * nx
@@ -182,4 +183,161 @@ end
 
     @test materialize_tangent(g_cv).layers[1].weight ≈
           materialize_tangent(g_dual).layers[1].weight
+end
+
+@testset "EmbeddedDeterministicEquivalentProblem (CPU)" begin
+    T = 5
+    nx = 1
+    nw = 1
+
+    Random.seed!(42)
+    policy = StateConditionedPolicy(nw, nx, nx, [8]; activation = tanh)
+
+    prob = build_embedded_deterministic_equivalent(
+        policy;
+        horizon = T,
+        nx = nx,
+        nu = nx,
+        nw = nw,
+        backend = nothing,
+        float_type = Float64,
+        slack_penalty = 10.0,
+        u_bounds = (-2.0, 2.0),
+    )
+
+    @test prob isa EmbeddedDeterministicEquivalentProblem
+    @test prob.horizon == T
+    @test prob.nx == nx
+
+    x0 = [1.0]
+    w  = randn(T * nw)
+
+    set_x0!(prob, x0)
+    set_uncertainty!(prob, w)
+
+    n_x = T * nx
+    n_u = (T - 1) * nx
+    n_var = n_x + n_u + n_x
+    n_con_initial = nx
+    n_con_dynamics = (T - 1) * nx
+    n_con_oracle = n_x
+    n_con = n_con_initial + n_con_dynamics + n_con_oracle
+
+    res = MadNLP.madnlp(prob.model; tol = 1e-6, max_iter = 500, print_level = MadNLP.ERROR)
+    @test DecisionRulesExa.solve_succeeded(res)
+    @test length(res.solution) == n_var
+    @test length(res.multipliers) == n_con
+
+    λ = target_multipliers(prob, res)
+    @test length(λ) == n_x
+    @test all(isfinite, λ)
+
+    x_sol, u_sol, δ_sol = solution_components(prob, res)
+    @test length(x_sol) == n_x
+    @test length(u_sol) == n_u
+    @test length(δ_sol) == n_x
+
+    # Verify oracle constraint satisfaction: x_t + δ_t ≈ π_θ(w_t, x_{t-1})
+    Flux.reset!(policy)
+    for t in 1:T
+        x_prev = (t == 1) ? Float32.(x0) : Float32.([x_sol[(t-2)*nx+1:(t-1)*nx]...])
+        w_t = Float32.([w[(t-1)*nw+1:t*nw]...])
+        nn_out = policy(vcat(w_t, x_prev))
+        for i in 1:nx
+            xi = x_sol[(t-1)*nx+i]
+            di = δ_sol[(t-1)*nx+i]
+            @test xi + di ≈ Float64(nn_out[i]) atol = 1e-4
+        end
+    end
+end
+
+@testset "Embedded NN gradient (envelope theorem)" begin
+    T = 4
+    nx = 1
+    nw = 1
+
+    Random.seed!(7)
+    policy = StateConditionedPolicy(nw, nx, nx, [8]; activation = tanh)
+
+    prob = build_embedded_deterministic_equivalent(
+        policy;
+        horizon = T,
+        nx = nx,
+        nu = nx,
+        nw = nw,
+        backend = nothing,
+        float_type = Float64,
+        slack_penalty = 10.0,
+        u_bounds = (-2.0, 2.0),
+    )
+
+    x0 = [0.5]
+    w  = randn(T * nw)
+
+    set_x0!(prob, x0)
+    set_uncertainty!(prob, w)
+
+    res = MadNLP.madnlp(prob.model; tol = 1e-6, max_iter = 500, print_level = MadNLP.ERROR)
+    @test DecisionRulesExa.solve_succeeded(res)
+
+    λ = target_multipliers(prob, res)
+    x_sol = res.solution[1 : T * nx]
+
+    # Zygote gradient: ∇_θ Σ_t ⟨λ_t, π_θ(w_t, x*_{t-1})⟩
+    gs = Zygote.gradient(policy) do m
+        total = 0.0f0
+        Flux.reset!(m)
+        for t in 1:T
+            wt = Float32.([w[(t-1)*nw+1:t*nw]...])
+            x_prev = (t == 1) ?
+                Float32.(x0) :
+                Float32.([x_sol[(t-2)*nx+1:(t-1)*nx]...])
+            xt = m(vcat(wt, x_prev))
+            for i in 1:nx
+                total = total + Float32(λ[(t-1)*nx+i]) * xt[i]
+            end
+        end
+        total
+    end
+
+    g = materialize_tangent(gs[1])
+    @test g !== nothing
+    @test DecisionRulesExa._all_finite_gradient(g)
+end
+
+@testset "train_tsddr_embedded smoke test" begin
+    T = 4
+    nx = 1
+    nw = 1
+
+    Random.seed!(99)
+    policy = StateConditionedPolicy(nw, nx, nx, [8]; activation = tanh)
+
+    prob = build_embedded_deterministic_equivalent(
+        policy;
+        horizon = T,
+        nx = nx,
+        backend = nothing,
+        slack_penalty = 10.0,
+        u_bounds = (-2.0, 2.0),
+    )
+
+    x0 = Float32[1.0]
+    losses = Float64[]
+
+    train_tsddr_embedded(
+        policy, x0, prob,
+        () -> randn(T * nw);
+        num_batches = 5,
+        num_train_per_batch = 2,
+        madnlp_kwargs = (tol = 1e-6, max_iter = 300, print_level = MadNLP.ERROR),
+        warmstart = true,
+        record_loss = (iter, m, loss, tag) -> begin
+            push!(losses, loss)
+            return false
+        end,
+    )
+
+    @test length(losses) == 5
+    @test all(isfinite, losses)
 end

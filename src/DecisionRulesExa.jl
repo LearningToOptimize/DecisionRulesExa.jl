@@ -12,6 +12,7 @@ using ChainRulesCore
 
 include("utils.jl")
 include("deterministic_equivalent.jl")
+include("embedded_deterministic_equivalent.jl")
 include("policy.jl")
 include("critic_control_variate.jl")
 include("training.jl")
@@ -40,6 +41,10 @@ export
     MLPPolicy,
     StateConditionedPolicy,
 
+    # Embedded-NN deterministic equivalent
+    EmbeddedDeterministicEquivalentProblem,
+    build_embedded_deterministic_equivalent,
+
     # Training
     solve_succeeded,
     materialize_tangent,
@@ -60,6 +65,7 @@ export
     critic_samples_from_evaluation,
     simulate_tsddr,
     train_tsddr,
+    train_tsddr_embedded,
 
     # Stage-wise rollout evaluation
     rollout_tsddr,

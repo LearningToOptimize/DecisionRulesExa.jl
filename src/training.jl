@@ -66,17 +66,28 @@ mutable struct _SolverState
     last_good_y        # dual snapshot, or nothing
     last_good_zl_vals
     last_good_zu_vals
+    has_fixed_vars::Bool
 end
 
 function _make_solver(nlp, madnlp_kwargs)
     solver = MadNLP.MadNLPSolver(nlp; madnlp_kwargs...)
-    return _SolverState(solver, nothing, nothing, nothing, nothing)
+    nvar_solver = length(solver.x.x)
+    nvar_nlp    = length(NLPModels.get_x0(nlp))
+    has_fixed   = nvar_solver != nvar_nlp
+    return _SolverState(solver, nothing, nothing, nothing, nothing, has_fixed)
 end
 
 function _solve!(state::_SolverState, nlp; warmstart::Bool, madnlp_kwargs)
     solver = state.solver
 
-    # Primal warm-start: seed NLPModel's x0 from last-good primal.
+    # MadNLP solver reuse with MakeParameter (fixed variables) causes INFEASIBLE
+    # on subsequent solves even with INITIAL status — stale KKT factorization state.
+    # Fix: create a fresh solver each time when fixed variables exist.
+    if state.has_fixed_vars
+        return MadNLP.madnlp(nlp; madnlp_kwargs...)
+    end
+
+    # Normal path (no fixed variables): full warm-start support.
     if warmstart && state.last_good_x !== nothing
         copyto!(NLPModels.get_x0(nlp), state.last_good_x)
     end
@@ -666,6 +677,126 @@ function train_tsddr(
         for t in worker_tasks
             wait(t)
         end
+    end
+
+    return model
+end
+
+# ── train_tsddr_embedded ─────────────────────────────────────────────────────
+
+"""
+    train_tsddr_embedded(model, initial_state, embedded_de,
+                         uncertainty_sampler; kwargs...) -> model
+
+TS-DDR training with the policy embedded inside the NLP via VectorNonlinearOracle.
+
+Unlike `train_tsddr`, this version:
+- Does NOT roll out the policy externally to generate targets
+- Solves the coupled NLP where oracle constraints evaluate π_θ inline
+- Extracts closed-loop duals λ and realized states x* from the solution
+- Computes ∇_θ Q = Σ_t λ_t · ∇_θ π_θ(w_t, x*_{t-1}) using realized states
+
+Arguments:
+- `model`              : Flux policy (same object captured by the oracle closures)
+- `initial_state`      : initial state vector
+- `embedded_de`        : `EmbeddedDeterministicEquivalentProblem`
+- `uncertainty_sampler` : `() -> w_flat` — flat vector of length `T * nw_per_stage`
+
+Keyword arguments:
+- `num_batches`            : total gradient steps (default 100)
+- `num_train_per_batch`    : scenarios averaged per step (default 1)
+- `optimizer`              : Flux.Optimisers optimizer
+- `adjust_hyperparameters` : `(iter, opt_state, n) -> n`
+- `record_loss`            : `(iter, model, loss, tag) -> Bool`; return `true` to stop
+- `madnlp_kwargs`          : NamedTuple forwarded to MadNLP
+- `warmstart`              : warm-start MadNLP between solves (default `true`)
+"""
+function train_tsddr_embedded(
+    model,
+    initial_state::AbstractVector,
+    embedded_de,
+    uncertainty_sampler;
+    num_batches::Int         = 100,
+    num_train_per_batch::Int = 1,
+    optimizer                = Flux.Optimisers.OptimiserChain(
+                                   Flux.Optimisers.ClipGrad(1.0f0),
+                                   Flux.Adam(1f-3),
+                               ),
+    adjust_hyperparameters   = (iter, opt_state, n) -> n,
+    record_loss              = (iter, model, loss, tag) -> begin
+                                   println("$tag  iter=$iter  loss=$(round(loss; digits=4))")
+                                   return false
+                               end,
+    madnlp_kwargs            = NamedTuple(),
+    warmstart::Bool          = true,
+    get_realized_states      = nothing,
+)
+    T  = embedded_de.horizon
+    F  = eltype(initial_state)
+    nx = embedded_de.nx
+
+    _get_states = get_realized_states === nothing ?
+        (prob, res) -> Array(res.solution[1 : prob.horizon * prob.nx]) :
+        get_realized_states
+
+    state = _make_solver(embedded_de.model, madnlp_kwargs)
+    opt_state = Flux.setup(optimizer, model)
+
+    for iter in 1:num_batches
+        num_train_per_batch = adjust_hyperparameters(iter, opt_state, num_train_per_batch)
+
+        valid   = Vector{Tuple{Vector{F}, Vector{F}, Vector{F}}}()  # (w, λ, x_realized)
+        obj_sum = 0.0
+
+        for s in 1:num_train_per_batch
+            w_flat = uncertainty_sampler()
+
+            set_x0!(embedded_de, initial_state)
+            set_uncertainty!(embedded_de, w_flat)
+
+            result = _solve!(state, embedded_de.model;
+                warmstart = warmstart, madnlp_kwargs = madnlp_kwargs)
+
+            solve_succeeded(result) || continue
+            isfinite(result.objective) || continue
+
+            λ = result.multipliers[embedded_de.target_con_range]
+            all(isfinite, λ) || continue
+
+            x_sol = _get_states(embedded_de, result)
+
+            push!(valid, (F.(w_flat), F.(Array(λ)), F.(Array(x_sol))))
+            obj_sum += result.objective
+        end
+
+        n_ok     = length(valid)
+        mean_obj = n_ok > 0 ? obj_sum / n_ok : NaN
+
+        if n_ok > 0
+            gs = Zygote.gradient(model) do m
+                total = zero(F)
+                for (w_flat_s, λf, x_realized) in valid
+                    nw = length(w_flat_s) ÷ T
+                    Flux.reset!(m)
+                    for t in 1:T
+                        wt = F.(w_flat_s[(t-1)*nw+1 : t*nw])
+                        x_prev = (t == 1) ?
+                            F.(initial_state) :
+                            F.(x_realized[(t-2)*nx+1 : (t-1)*nx])
+                        xt = m(vcat(wt, x_prev))
+                        total = total + sum(λf[(t-1)*nx+1 : t*nx] .* xt)
+                    end
+                end
+                total / F(n_ok)
+            end
+
+            grad = materialize_tangent(gs[1])
+            if grad !== nothing && _all_finite_gradient(grad)
+                Flux.update!(opt_state, model, grad)
+            end
+        end
+
+        record_loss(iter, model, mean_obj, "metrics/training_loss") && break
     end
 
     return model
