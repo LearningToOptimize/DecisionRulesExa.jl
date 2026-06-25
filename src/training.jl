@@ -267,6 +267,8 @@ function _critic_sample_from_rollout(
         policy_state = target.policy_state,
         solver_state = solver_state,
         reuse_solver = target.reuse_solver,
+        state_bounds = target.state_bounds,
+        project_state = target.project_state,
     )
     result === nothing && return nothing
 
@@ -668,6 +670,7 @@ function train_tsddr(
             grad = materialize_tangent(gs[1])
             if grad !== nothing && _all_finite_gradient(grad)
                 Flux.update!(opt_state, model, grad)
+                invalidate_policy_cache!(embedded_de)
             end
         end
 

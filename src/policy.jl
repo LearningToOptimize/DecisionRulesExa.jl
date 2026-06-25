@@ -61,32 +61,74 @@ Call `Flux.reset!(policy)` before each episode.
 LSTM requires ≥2D input.  The forward pass reshapes the 1D `w_t` slice to
 `(n_uncertainty, 1)` before encoding and squeezes back with `vec`.
 """
-struct StateConditionedPolicy{E,C}
+struct StateConditionedPolicy{E,C,L,U}
     encoder::E
     combiner::C
     n_uncertainty::Int
     n_state::Int
+    output_lower::L
+    output_scale::U
 end
 
-Flux.@layer StateConditionedPolicy
+Flux.@layer StateConditionedPolicy trainable=(encoder, combiner)
 
 function (m::StateConditionedPolicy)(input)
     w = reshape(input[1:m.n_uncertainty], :, 1)   # (n_unc, 1) for LSTM
     s = input[m.n_uncertainty+1:end]
     h = vec(m.encoder(w))                          # (hidden,)
-    return m.combiner(vcat(h, s))
+    y = m.combiner(vcat(h, s))
+    if m.output_lower === nothing
+        return y
+    end
+    lower = _adapt_policy_bound(m.output_lower, y)
+    scale = _adapt_policy_bound(m.output_scale, y)
+    return lower .+ scale .* y
 end
 
 Flux.reset!(m::StateConditionedPolicy) = Flux.reset!(m.encoder)
 
+function _adapt_policy_bound(x::AbstractVector, ref::AbstractVector)
+    typeof(x) === typeof(ref) && return x
+    y = similar(ref, length(x))
+    copyto!(y, convert.(eltype(ref), x))
+    return y
+end
+
+"""
+    load_stateconditioned_policy!(policy, state)
+
+Load a `Flux.state` checkpoint into a `StateConditionedPolicy`.
+
+Checkpoints saved before `output_bounds` existed contain only the trainable
+encoder and combiner state.  In that case, restore those trainable components
+and keep the current policy's case-defined output bounds.
+"""
+function load_stateconditioned_policy!(policy::StateConditionedPolicy, state)
+    try
+        Flux.loadmodel!(policy, state)
+        return policy
+    catch err
+        hasproperty(state, :encoder) && hasproperty(state, :combiner) || rethrow(err)
+        @warn "Full StateConditionedPolicy checkpoint load failed; loading encoder/combiner only and keeping current output bounds" exception=(err, catch_backtrace())
+        Flux.loadmodel!(policy.encoder, getproperty(state, :encoder))
+        Flux.loadmodel!(policy.combiner, getproperty(state, :combiner))
+        return policy
+    end
+end
+
 """
     StateConditionedPolicy(n_uncertainty, n_state, n_out, layers;
-                           activation=tanh, encoder_type=Flux.LSTM)
+                           activation=tanh, encoder_type=Flux.LSTM,
+                           output_bounds=nothing)
 
 Construct a `StateConditionedPolicy`.
 
 - `layers` : hidden sizes for the LSTM encoder, e.g. `[64, 64]`
 - `n_out`  : output dimension (= nx = state dimension)
+- `output_bounds` : optional `(lower, upper)` vectors.  The combiner output is
+  interpreted as a normalized value and mapped as `lower + (upper-lower)*y`.
+  With `activation=sigmoid`, this gives bounded targets with useful gradients.
+  Fixed dimensions (`lower == upper`) are constant and receive zero gradient.
 """
 function StateConditionedPolicy(
     n_uncertainty::Int,
@@ -95,11 +137,130 @@ function StateConditionedPolicy(
     layers::AbstractVector{Int};
     activation  = tanh,
     encoder_type = Flux.LSTM,
+    output_bounds = nothing,
 )
     enc_sizes  = vcat(n_uncertainty, layers)
     enc_layers = [encoder_type(enc_sizes[i] => enc_sizes[i+1])
                   for i in 1:length(layers)]
     encoder  = Flux.Chain(enc_layers...)
     combiner = Flux.Dense(layers[end] + n_state => n_out, activation)
-    return StateConditionedPolicy(encoder, combiner, n_uncertainty, n_state)
+    if output_bounds === nothing
+        return StateConditionedPolicy(encoder, combiner, n_uncertainty, n_state, nothing, nothing)
+    end
+    lower, upper = output_bounds
+    length(lower) == n_out || throw(ArgumentError("output lower bound length must be n_out=$n_out"))
+    length(upper) == n_out || throw(ArgumentError("output upper bound length must be n_out=$n_out"))
+    scale = upper .- lower
+    any(<(zero(eltype(scale))), scale) &&
+        throw(ArgumentError("output upper bounds must be >= lower bounds"))
+    return StateConditionedPolicy(
+        encoder, combiner, n_uncertainty, n_state,
+        collect(lower), collect(scale),
+    )
+end
+
+# ── Bounded state-target helpers ──────────────────────────────────────────────
+
+"""
+    ConstantStatePolicy(output_template, n_uncertainty, n_state)
+
+Policy for cases where no target dimension is trainable. It always returns the
+case-defined target vector and has no trainable parameters.
+"""
+struct ConstantStatePolicy{O}
+    output_template::O
+    n_uncertainty::Int
+    n_state::Int
+end
+
+Flux.@layer ConstantStatePolicy trainable=()
+
+(m::ConstantStatePolicy)(input) = _adapt_policy_bound(m.output_template, input)
+Flux.reset!(::ConstantStatePolicy) = nothing
+
+"""
+    FixedOutputPolicy(policy, output_template, output_indices)
+
+Wrap a policy that predicts only active target dimensions and expand its output
+to the full state-target vector by filling inactive dimensions from
+`output_template`.
+"""
+struct FixedOutputPolicy{P,O,I}
+    policy::P
+    output_template::O
+    output_indices::I
+end
+
+Flux.@layer FixedOutputPolicy trainable=(policy,)
+
+function (m::FixedOutputPolicy)(input)
+    y = m.policy(input)
+    out = _adapt_policy_bound(m.output_template, y)
+    out[m.output_indices] .= y
+    return out
+end
+
+Flux.reset!(m::FixedOutputPolicy) = Flux.reset!(m.policy)
+
+load_stateconditioned_policy!(policy::FixedOutputPolicy, state) =
+    load_stateconditioned_policy!(policy.policy, state)
+
+"""
+    bounded_state_policy(n_uncertainty, lower, upper, layers; kwargs...)
+
+Build a state-conditioned policy whose full output is guaranteed to lie in
+`[lower, upper]`, while avoiding trainable outputs for inactive dimensions.
+
+By default, a dimension is active when `upper > lower`. Fixed dimensions are
+returned as constants, so pure pass-through or no-storage state components do
+not create meaningless target parameters. Pass `active_mask` to override this
+selection for case-specific target relevance.
+"""
+function bounded_state_policy(
+    n_uncertainty::Int,
+    lower::AbstractVector,
+    upper::AbstractVector,
+    layers::AbstractVector{Int};
+    activation = sigmoid,
+    encoder_type = Flux.LSTM,
+    active_mask = nothing,
+    fixed_values = lower,
+)
+    length(lower) == length(upper) ||
+        throw(ArgumentError("lower and upper bound vectors must have the same length"))
+    n_state = length(lower)
+    length(fixed_values) == n_state ||
+        throw(ArgumentError("fixed_values length must match state dimension $n_state"))
+
+    scale = upper .- lower
+    any(<(zero(eltype(scale))), scale) &&
+        throw(ArgumentError("upper bounds must be >= lower bounds"))
+
+    active = if active_mask === nothing
+        collect(scale .> zero(eltype(scale)))
+    else
+        length(active_mask) == n_state ||
+            throw(ArgumentError("active_mask length must match state dimension $n_state"))
+        collect(Bool.(active_mask))
+    end
+
+    if all(active)
+        return StateConditionedPolicy(
+            n_uncertainty, n_state, n_state, layers;
+            activation = activation,
+            encoder_type = encoder_type,
+            output_bounds = (lower, upper),
+        )
+    elseif !any(active)
+        return ConstantStatePolicy(collect(fixed_values), n_uncertainty, n_state)
+    end
+
+    idx = findall(active)
+    active_policy = StateConditionedPolicy(
+        n_uncertainty, n_state, length(idx), layers;
+        activation = activation,
+        encoder_type = encoder_type,
+        output_bounds = (lower[idx], upper[idx]),
+    )
+    return FixedOutputPolicy(active_policy, collect(fixed_values), collect(idx))
 end

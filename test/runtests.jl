@@ -111,6 +111,24 @@ end
     @test isfinite(critic_loss(hybrid, [sample]))
 end
 
+@testset "Bounded state policy helper" begin
+    Random.seed!(21)
+    lower = Float32[0, 1, -2]
+    upper = Float32[10, 1, 2]
+    policy = bounded_state_policy(2, lower, upper, [4]; activation = sigmoid)
+
+    y = policy(Float32[0.2, -0.1, 3, 1, -1])
+    @test length(y) == 3
+    @test lower[1] <= y[1] <= upper[1]
+    @test y[2] == lower[2]
+    @test lower[3] <= y[3] <= upper[3]
+    @test length(policy.policy.combiner.bias) == 2
+
+    constant_policy = bounded_state_policy(1, Float32[3, -4], Float32[3, -4], [4])
+    @test constant_policy(Float32[0, 99, 100]) == Float32[3, -4]
+    @test isempty(Flux.trainables(constant_policy))
+end
+
 @testset "Critic and actor update separation" begin
     Random.seed!(11)
     critic = Chain(Dense(2 => 1, bias = false))

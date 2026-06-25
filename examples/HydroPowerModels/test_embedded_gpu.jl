@@ -43,7 +43,7 @@ x0_init_cpu = F.([clamp(hydro_data.initial_volumes[r],
                          hydro_data.units[r].max_vol)
                   for r in 1:nHyd])
 
-policy  = Flux.gpu(policy)
+policy  = CUDA.cu(policy)
 x0_init = CUDA.cu(x0_init_cpu)
 @info "Policy and x0 moved to GPU"
 

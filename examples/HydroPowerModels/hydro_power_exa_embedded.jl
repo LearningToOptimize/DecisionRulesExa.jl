@@ -11,7 +11,7 @@
 
 using Flux
 using Zygote
-import DecisionRulesExa: set_x0!, set_uncertainty!, set_targets!
+import DecisionRulesExa: set_x0!, set_uncertainty!, set_targets!, invalidate_policy_cache!
 
 # ── Problem struct ──────────────────────────────────────────────────────────────
 
@@ -42,6 +42,7 @@ struct EmbeddedHydroExaDEProblem{P, VT <: AbstractVector{Float64}}
     _nvar::Int
     _inflow_buf::VT
     _x0_buf::VT
+    _h_cache_dirty::Ref{Bool}
 end
 
 # ── Interface (duck-typing for train_tsddr_embedded) ────────────────────────────
@@ -58,6 +59,7 @@ function set_inflows!(prob::EmbeddedHydroExaDEProblem, w::AbstractVector)
     length(w) == expected || error("w must have length T*nHyd=$expected")
     ExaModels.set_parameter!(prob.core, prob.p_inflow, w)
     copyto!(prob._inflow_buf, Float64.(w))
+    prob._h_cache_dirty[] = true
     return prob
 end
 
@@ -67,6 +69,11 @@ end
 
 function set_targets!(::EmbeddedHydroExaDEProblem, ::AbstractVector)
     return nothing
+end
+
+function invalidate_policy_cache!(prob::EmbeddedHydroExaDEProblem)
+    prob._h_cache_dirty[] = true
+    return prob
 end
 
 function set_demand!(prob::EmbeddedHydroExaDEProblem, demand_matrix::AbstractMatrix)
@@ -142,6 +149,11 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
     _inflow(t)  = (t-1)*nHyd+1 : t*nHyd
     _crow(t)    = (t-1)*nHyd+1 : t*nHyd
 
+    encoder  = policy.encoder
+    combiner = policy.combiner
+    n_unc    = policy.n_uncertainty
+    n_h      = size(combiner.weight, 2) - policy.n_state
+
     jac_r = Int[]
     jac_c = Int[]
     for t in 1:T, r in 1:nHyd
@@ -158,7 +170,7 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
     nnzj = length(jac_r)
 
     const_jac_cpu = zeros(Float64, nnzj)
-    nn_jac_ranges = Dict{Tuple{Int,Int}, UnitRange{Int}}()
+    nn_jac_ranges_flat = Vector{UnitRange{Int}}(undef, T * nHyd)
     k = 0
     for t in 1:T, r in 1:nHyd
         const_jac_cpu[k+1] = -1.0
@@ -166,75 +178,154 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
         const_jac_cpu[k+3] =  1.0
         k += 3
         if t > 1
-            nn_jac_ranges[(t,r)] = (k+1):(k+nHyd)
+            nn_jac_ranges_flat[(t-1)*nHyd + r] = (k+1):(k+nHyd)
             k += nHyd
         end
     end
     const_jac_dev = similar(inflow_buf, Float64, nnzj)
     copyto!(const_jac_dev, const_jac_cpu)
 
-    eye_cpu = [let e = zeros(Float32, nHyd); e[r] = 1.0f0; e end for r in 1:nHyd]
-    eye_basis = [copyto!(similar(x0_buf, Float32, nHyd), e) for e in eye_cpu]
+    W_state = @view combiner.weight[:, n_h+1:end]
+    act     = combiner.σ
+    has_output_bounds = getfield(policy, :output_lower) !== nothing
+    output_lower_f32 = similar(x0_buf, Float32, nHyd)
+    output_scale_f32 = similar(x0_buf, Float32, nHyd)
+    if has_output_bounds
+        copyto!(output_lower_f32, Float32.(Array(getfield(policy, :output_lower))))
+        copyto!(output_scale_f32, Float32.(Array(getfield(policy, :output_scale))))
+    else
+        fill!(output_lower_f32, 0f0)
+        fill!(output_scale_f32, 1f0)
+    end
+
+    function _act_deriv!(σ_prime, output)
+        if act === NNlib.sigmoid || act === NNlib.sigmoid_fast
+            σ_prime .= output .* (one(eltype(output)) .- output)
+        elseif act === Base.tanh || act === NNlib.tanh_fast
+            σ_prime .= one(eltype(output)) .- output .* output
+        elseif act === identity
+            fill!(σ_prime, one(eltype(σ_prime)))
+        else
+            σ_prime .= output .* (one(eltype(output)) .- output)
+        end
+        return σ_prime
+    end
+
+    # Pre-allocated buffers — all on the same device as x0_buf
+    x0_f32      = similar(x0_buf, Float32, nHyd)
+    x_prev_f32  = similar(x0_buf, Float32, nHyd)
+    infl_f32    = similar(x0_buf, Float32, nHyd)
+    _comb_in    = similar(x0_buf, Float32, n_h + nHyd)
+    z_buf       = similar(x0_buf, Float32, nHyd)
+    nn_out_f32  = similar(x0_buf, Float32, nHyd)
+    σ_prime_buf = similar(x0_buf, Float32, nHyd)
+    λ_f32_buf   = similar(x0_buf, Float32, nHyd)
+    d_xprev_buf = similar(x0_buf, Float32, nHyd)
+    J_buf       = similar(x0_buf, Float64, nHyd, nHyd)
+    h_cache     = similar(x0_buf, Float32, n_h, T)
+    h_cache_dirty = Ref(true)
+
+    function _combiner_fwd!(nn_out, h, x_prev)
+        _comb_in[1:n_h]     .= h
+        _comb_in[n_h+1:end] .= x_prev
+        mul!(z_buf, combiner.weight, _comb_in)
+        z_buf .+= combiner.bias
+        nn_out .= act.(z_buf)
+        nn_out .= output_lower_f32 .+ output_scale_f32 .* nn_out
+        return nn_out
+    end
+
+    function _combiner_jac!(J_buf, σ_prime_buf, h, x_prev)
+        _comb_in[1:n_h]     .= h
+        _comb_in[n_h+1:end] .= x_prev
+        mul!(z_buf, combiner.weight, _comb_in)
+        z_buf .+= combiner.bias
+        nn_out_f32 .= act.(z_buf)
+        _act_deriv!(σ_prime_buf, nn_out_f32)
+        σ_prime_buf .*= output_scale_f32
+        J_buf .= reshape(σ_prime_buf, :, 1) .* W_state
+        return nothing
+    end
+
+    function _populate_h_cache!()
+        Flux.reset!(encoder)
+        for t in 1:T
+            infl_f32 .= view(inflow_buf, _inflow(t))
+            h = vec(encoder(reshape(infl_f32, :, 1)))
+            view(h_cache, :, t) .= h
+        end
+        h_cache_dirty[] = false
+        return nothing
+    end
+
+    function _ensure_h_cache!()
+        h_cache_dirty[] && _populate_h_cache!()
+        return nothing
+    end
 
     function oracle_f!(c, xv)
-        Flux.reset!(policy)
+        _ensure_h_cache!()
+        x0_f32 .= view(x0_buf, 1:nHyd)
         for t in 1:T
-            x_prev  = t == 1 ? Float32.(x0_buf) : Float32.(xv[_res(t)])
-            infl_t  = Float32.(inflow_buf[_inflow(t)])
-            nn_out  = policy(vcat(infl_t, x_prev))
-            c[_crow(t)] .= Float64.(nn_out) .- xv[_res(t+1)] .- xv[_dp(t)] .+ xv[_dn(t)]
+            if t == 1
+                x_prev_f32 .= x0_f32
+            else
+                x_prev_f32 .= view(xv, _res(t))
+            end
+            h = view(h_cache, :, t)
+            _combiner_fwd!(nn_out_f32, h, x_prev_f32)
+
+            c_t  = view(c, _crow(t))
+            r_v  = view(xv, _res(t+1))
+            dp_v = view(xv, _dp(t))
+            dn_v = view(xv, _dn(t))
+            c_t .= nn_out_f32 .- r_v .- dp_v .+ dn_v
         end
         return nothing
     end
 
     function oracle_jac!(vals, xv)
+        _ensure_h_cache!()
         copyto!(vals, const_jac_dev)
-        Flux.reset!(policy)
-
-        x_prev_1 = Float32.(x0_buf)
-        infl_1   = Float32.(inflow_buf[_inflow(1)])
-        policy(vcat(infl_1, x_prev_1))
-
         for t in 2:T
-            x_prev = Float32.(xv[_res(t)])
-            infl_t = Float32.(inflow_buf[_inflow(t)])
-            _, back = Zygote.pullback(xp -> policy(vcat(infl_t, xp)), x_prev)
+            x_prev_f32 .= view(xv, _res(t))
+            h = view(h_cache, :, t)
+            _combiner_jac!(J_buf, σ_prime_buf, h, x_prev_f32)
             for r in 1:nHyd
-                jac_row = back(eye_basis[r])[1]
-                if jac_row !== nothing
-                    vals[nn_jac_ranges[(t,r)]] .= Float64.(jac_row)
-                end
+                vals[nn_jac_ranges_flat[(t-1)*nHyd + r]] .= view(J_buf, r, :)
             end
         end
         return nothing
     end
 
     function oracle_vjp!(Jtv, xv, λ)
+        _ensure_h_cache!()
         fill!(Jtv, 0.0)
-        Flux.reset!(policy)
         for t in 1:T
-            x_prev = t == 1 ? Float32.(x0_buf) : Float32.(xv[_res(t)])
-            infl_t = Float32.(inflow_buf[_inflow(t)])
-            λ_t    = Float32.(λ[_crow(t)])
-
-            Jtv[_res(t+1)] .-= Float64.(λ_t)
-            Jtv[_dp(t)]    .-= Float64.(λ_t)
-            Jtv[_dn(t)]    .+= Float64.(λ_t)
-
+            λ_f64 = view(λ, _crow(t))
+            view(Jtv, _res(t+1)) .-= λ_f64
+            view(Jtv, _dp(t))    .-= λ_f64
+            view(Jtv, _dn(t))    .+= λ_f64
             if t > 1
-                _, back = Zygote.pullback(xp -> policy(vcat(infl_t, xp)), x_prev)
-                d_xprev = back(λ_t)[1]
-                if d_xprev !== nothing
-                    Jtv[_res(t)] .+= Float64.(d_xprev)
-                end
-            else
-                policy(vcat(infl_t, x_prev))
+                h = view(h_cache, :, t)
+                x_prev_f32 .= view(xv, _res(t))
+                _comb_in[1:n_h]     .= h
+                _comb_in[n_h+1:end] .= x_prev_f32
+                mul!(z_buf, combiner.weight, _comb_in)
+                z_buf .+= combiner.bias
+                nn_out_f32 .= act.(z_buf)
+                _act_deriv!(σ_prime_buf, nn_out_f32)
+                σ_prime_buf .*= output_scale_f32
+                λ_f32_buf .= λ_f64
+                σ_prime_buf .*= λ_f32_buf
+                mul!(d_xprev_buf, W_state', σ_prime_buf)
+                view(Jtv, _res(t)) .+= d_xprev_buf
             end
         end
         return nothing
     end
 
-    return ExaModels.VectorNonlinearOracle(
+    oracle = ExaModels.VectorNonlinearOracle(
         nvar     = nvar_total,
         ncon     = T * nHyd,
         nnzj     = nnzj,
@@ -246,6 +337,7 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
         jac!     = oracle_jac!,
         vjp!     = oracle_vjp!,
     )
+    return oracle, h_cache_dirty
 end
 
 # ── DC builder ──────────────────────────────────────────────────────────────────
@@ -485,7 +577,7 @@ function _build_embedded_dc_hydro_de(
         zeros(Float64, nHyd) :
         KernelAbstractions.zeros(backend, Float64, nHyd)
 
-    oracle = _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
+    oracle, h_cache_dirty = _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
                                   nvar_total, inflow_buf, x0_buf)
     ExaModels.constraint(core, oracle)
     target_con_range = (n_con + 1):(n_con + T * nHyd)
@@ -501,7 +593,7 @@ function _build_embedded_dc_hydro_de(
         nBus, nGen, nBranch, T,
         :dc, target_con_range,
         res_start, dp_start, dn_start, nvar_total,
-        inflow_buf, x0_buf,
+        inflow_buf, x0_buf, h_cache_dirty,
     )
 end
 
@@ -833,7 +925,7 @@ function _build_embedded_ac_hydro_de(
         zeros(Float64, nHyd) :
         KernelAbstractions.zeros(backend, Float64, nHyd)
 
-    oracle = _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
+    oracle, h_cache_dirty = _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
                                   nvar_total, inflow_buf, x0_buf)
     ExaModels.constraint(core, oracle)
     target_con_range = (n_con + 1):(n_con + T * nHyd)
@@ -849,7 +941,7 @@ function _build_embedded_ac_hydro_de(
         nBus, nGen, nBranch, T,
         :ac_polar, target_con_range,
         res_start, dp_start, dn_start, nvar_total,
-        inflow_buf, x0_buf,
+        inflow_buf, x0_buf, h_cache_dirty,
     )
 end
 

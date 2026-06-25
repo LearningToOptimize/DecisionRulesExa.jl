@@ -16,6 +16,38 @@ end
 _to_vec(x) = vec(x)
 _to_vec(x::SubArray) = collect(x)
 
+function _state_bound_vector(bound, ref::AbstractVector)
+    bound === nothing && return nothing
+    if bound isa AbstractVector || bound isa SubArray
+        length(bound) == length(ref) ||
+            throw(ArgumentError("state bound length must match state length=$(length(ref)), got $(length(bound))"))
+        return _adapt_array(eltype(ref).(_to_vec(bound)), ref)
+    end
+    bound isa Real ||
+        throw(ArgumentError("state bounds must be vectors, scalars, or nothing"))
+    out = similar(ref, length(ref))
+    fill!(out, eltype(ref)(bound))
+    return out
+end
+
+function _project_state_to_bounds(state::AbstractVector, state_bounds)
+    state_bounds === nothing && return state
+    length(state_bounds) == 2 ||
+        throw(ArgumentError("state_bounds must be a pair/tuple (lower, upper)"))
+    lower = _state_bound_vector(state_bounds[1], state)
+    upper = _state_bound_vector(state_bounds[2], state)
+    projected = state
+    lower !== nothing && (projected = max.(projected, lower))
+    upper !== nothing && (projected = min.(projected, upper))
+    return projected
+end
+
+function _project_realized_state(state::AbstractVector, state_bounds, project_state)
+    projected = _project_state_to_bounds(state, state_bounds)
+    project_state === nothing && return projected
+    return eltype(state).(_to_vec(project_state(projected)))
+end
+
 """
     rollout_tsddr(model, initial_state, stage_problem, w_flat; kwargs...)
 
@@ -32,6 +64,14 @@ Required callbacks:
 Optional callbacks:
 - `objective_no_target_penalty(stage_problem, result)` returns the stage objective
   with target-slack penalty removed.  The default is `result.objective`.
+- `project_state(state)` returns a feasibility-repaired realized state before it
+  is fed to the next stage. Use this for non-box state sets.
+
+Optional state feasibility bounds:
+- `state_bounds = (lower, upper)` clamps every realized state before the next
+  stage. `lower` and `upper` may be vectors, scalars, or `nothing` for one-sided
+  bounds. This is intended to remove solver-tolerance drift at stage interfaces;
+  it is not a substitute for a recourse-feasible model.
 
 `policy_state = :realized` is the closed-loop deployment semantics.  `:target`
 keeps the policy recurrence on its own previous target, matching the target
@@ -53,6 +93,8 @@ function rollout_tsddr(
     policy_state::Symbol = :realized,
     solver_state = nothing,
     reuse_solver::Bool = false,
+    state_bounds = nothing,
+    project_state = nothing,
 )
     horizon >= 1 || throw(ArgumentError("horizon must be >= 1"))
     n_uncertainty >= 1 || throw(ArgumentError("n_uncertainty must be >= 1"))
@@ -118,7 +160,8 @@ function rollout_tsddr(
 
         objective += result.objective
         objective_no_penalty += no_penalty
-        realized_prev = F.(_to_vec(realized_state(stage_problem, result)))
+        raw_realized = F.(_to_vec(realized_state(stage_problem, result)))
+        realized_prev = _project_realized_state(raw_realized, state_bounds, project_state)
         target_prev = F.(_to_vec(target))
         state_trajectory[stage + 1] = copy(realized_prev)
     end
@@ -148,6 +191,8 @@ mutable struct RolloutEvaluation <: Function
     policy_state::Symbol
     solver_state
     reuse_solver::Bool
+    state_bounds
+    project_state
     stage_problem_pool::Vector   # pool of stage problems for parallel evaluation
     active_scenarios::Int        # how many scenarios to evaluate (≤ length(scenarios))
     last_objective::Float64
@@ -171,6 +216,8 @@ function RolloutEvaluation(
     stride::Int = 1,
     policy_state::Symbol = :realized,
     reuse_solver::Bool = false,
+    state_bounds = nothing,
+    project_state = nothing,
     stage_problem_pool::Vector = [],
     active_scenarios::Int = length(scenarios),
 )
@@ -194,6 +241,8 @@ function RolloutEvaluation(
         policy_state,
         reuse_solver ? _make_solver(stage_problem.model, madnlp_kwargs) : nothing,
         reuse_solver,
+        state_bounds,
+        project_state,
         collect(stage_problem_pool),
         active_scenarios,
         NaN,
@@ -234,6 +283,8 @@ function (evaluation::RolloutEvaluation)(iter, model)
                 policy_state = evaluation.policy_state,
                 solver_state = evaluation.solver_state,
                 reuse_solver = evaluation.reuse_solver,
+                state_bounds = evaluation.state_bounds,
+                project_state = evaluation.project_state,
             )
             result === nothing && continue
             total += result.objective
@@ -266,6 +317,8 @@ function (evaluation::RolloutEvaluation)(iter, model)
                     warmstart = evaluation.warmstart,
                     policy_state = evaluation.policy_state,
                     reuse_solver = false,
+                    state_bounds = evaluation.state_bounds,
+                    project_state = evaluation.project_state,
                 )
                 push!(tasks, t)
             end

@@ -72,6 +72,17 @@ function set_targets!(::EmbeddedDeterministicEquivalentProblem, ::AbstractVector
 end
 
 """
+    invalidate_policy_cache!(embedded_de)
+
+Hook for embedded problems whose nonlinear oracle caches policy-dependent
+intermediates across solver calls.  Generic embedded problems evaluate the
+policy directly in each callback and do not need invalidation.
+"""
+function invalidate_policy_cache!(embedded_de)
+    return embedded_de
+end
+
+"""
     build_embedded_deterministic_equivalent(policy; kwargs...)
 
 Build a deterministic-equivalent NLP with the Flux `policy` embedded via

@@ -146,6 +146,8 @@ x0_init = Float32.([clamp(hydro_data.initial_volumes[r],
                            hydro_data.units[r].min_vol,
                            hydro_data.units[r].max_vol)
                     for r in 1:nHyd])
+target_lower = Float32.([h.min_vol for h in hydro_data.units])
+target_upper = Float32.([h.max_vol for h in hydro_data.units])
 
 # ── Critic/control variate ───────────────────────────────────────────────────
 
@@ -196,20 +198,22 @@ solve_succeeded(result0) || @warn "Smoke test did not fully converge; proceeding
 
 # ── Policy ────────────────────────────────────────────────────────────────────
 
-policy = StateConditionedPolicy(nHyd, nHyd, nHyd, LAYERS;
-                                activation   = ACTIVATION,
-                                encoder_type = Flux.LSTM)
+policy_active_mask = isnothing(PRE_TRAINED) ? nothing : trues(nHyd)
+policy = bounded_state_policy(nHyd, target_lower, target_upper, LAYERS;
+                              activation   = ACTIVATION,
+                              encoder_type = Flux.LSTM,
+                              active_mask  = policy_active_mask)
 
 if !isnothing(PRE_TRAINED)
     @info "Loading pre-trained model from $(PRE_TRAINED)..."
-    Flux.loadmodel!(policy, JLD2.load(PRE_TRAINED, "model_state"))
+    load_stateconditioned_policy!(policy, JLD2.load(PRE_TRAINED, "model_state"))
 end
 
 if USE_GPU
-    policy  = Flux.gpu(policy)
+    policy  = CUDA.cu(policy)
     x0_init = CUDA.cu(x0_init)
     control_variate = ScalarCriticControlVariate(
-        Flux.gpu(control_variate.critic);
+        CUDA.cu(control_variate.critic);
         featurizer = control_variate.featurizer,
         value_loss_weight = control_variate.value_loss_weight,
         gradient_loss_weight = control_variate.gradient_loss_weight,
@@ -295,6 +299,11 @@ end
 hydro_realized_state(stage_prob, result) =
     hydro_solution(stage_prob, result).reservoir[:, end]
 
+const _min_vols = Float64.([h.min_vol for h in hydro_data.units])
+const _max_vols = Float64.([h.max_vol for h in hydro_data.units])
+const _min_vols_dev = USE_GPU ? CUDA.cu(_min_vols) : _min_vols
+const _max_vols_dev = USE_GPU ? CUDA.cu(_max_vols) : _max_vols
+
 function hydro_objective_no_target_penalty(stage_prob, result)
     sol = hydro_solution(stage_prob, result)
     return result.objective - (resolved_pen / 2) * sum(abs2, sol.delta)
@@ -317,6 +326,7 @@ rollout_evaluation = RolloutEvaluation(
     policy_state = :target,
     stage_problem_pool = rollout_pool,
     active_scenarios = 4,
+    state_bounds = (_min_vols_dev, _max_vols_dev),
 )
 realized_rollout_evaluation = RolloutEvaluation(
     rollout_prob,
@@ -333,6 +343,7 @@ realized_rollout_evaluation = RolloutEvaluation(
     policy_state = :realized,
     stage_problem_pool = rollout_pool,
     active_scenarios = 4,
+    state_bounds = (_min_vols_dev, _max_vols_dev),
 )
 
 critic_training_target = RolloutCriticTarget(
@@ -346,6 +357,7 @@ critic_training_target = RolloutCriticTarget(
     warmstart = true,
     policy_state = CRITIC_POLICY_STATE,
     objective_value = CRITIC_ROLLOUT_OBJECTIVE,
+    state_bounds = (_min_vols_dev, _max_vols_dev),
 )
 
 Random.seed!(8788)

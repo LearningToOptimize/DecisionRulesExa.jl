@@ -40,10 +40,15 @@ export
     # Policies
     MLPPolicy,
     StateConditionedPolicy,
+    ConstantStatePolicy,
+    FixedOutputPolicy,
+    bounded_state_policy,
+    load_stateconditioned_policy!,
 
     # Embedded-NN deterministic equivalent
     EmbeddedDeterministicEquivalentProblem,
     build_embedded_deterministic_equivalent,
+    invalidate_policy_cache!,
 
     # Training
     solve_succeeded,

@@ -34,7 +34,7 @@ same target-penalty contribution that appears in the dual actor signal. Set
 `objective_value = :objective_no_target_penalty` to train on the rollout
 objective with target-slack penalties removed.
 """
-struct RolloutCriticTarget{S,R,O,M} <: AbstractCriticTrainingTarget
+struct RolloutCriticTarget{S,R,O,M,B,P} <: AbstractCriticTrainingTarget
     stage_problem
     horizon::Int
     n_uncertainty::Int
@@ -46,6 +46,8 @@ struct RolloutCriticTarget{S,R,O,M} <: AbstractCriticTrainingTarget
     policy_state::Symbol
     reuse_solver::Bool
     objective_value::Symbol
+    state_bounds::B
+    project_state::P
 end
 
 function RolloutCriticTarget(
@@ -60,6 +62,8 @@ function RolloutCriticTarget(
     policy_state::Symbol = :target,
     reuse_solver::Bool = false,
     objective_value::Symbol = :objective,
+    state_bounds = nothing,
+    project_state = nothing,
 )
     policy_state in (:target, :realized) ||
         error("policy_state must be :target or :realized")
@@ -77,6 +81,8 @@ function RolloutCriticTarget(
         policy_state,
         reuse_solver,
         objective_value,
+        state_bounds,
+        project_state,
     )
 end
 

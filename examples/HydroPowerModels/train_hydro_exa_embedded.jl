@@ -35,7 +35,7 @@ const HYDRO_FILE  = joinpath(CASE_DIR, "hydro.json")
 const INFLOW_FILE = joinpath(CASE_DIR, "inflows.csv")
 const DEMAND_FILE = joinpath(CASE_DIR, "demand.csv")
 
-const LAYERS      = [128, 128]
+const LAYERS      = let s = get(ENV, "DR_LAYERS", "128,128"); [parse(Int, x) for x in split(s, ",")] end
 const ACTIVATION  = sigmoid
 const NUM_STAGES  = parse(Int, get(ENV, "DR_NUM_STAGES", "126"))
 const NUM_EPOCHS  = parse(Int, get(ENV, "DR_NUM_EPOCHS", "80"))
@@ -52,25 +52,44 @@ const load_scaler    = 0.6
 const PRETRAIN_ITERS       = parse(Int, get(ENV, "DR_PRETRAIN_ITERS", "0"))
 const PRETRAIN_PENALTY_MULT = parse(Float64, get(ENV, "DR_PRETRAIN_PENALTY_MULT", "0.1"))
 
+const DISCOUNT_GAMMA = parse(Float64, get(ENV, "DR_DISCOUNT_GAMMA", "1.0"))
+
 const _PENALTY_MODE = get(ENV, "DR_PENALTY_SCHEDULE", "annealed")
+const _N_TOTAL = NUM_EPOCHS * NUM_BATCHES
 const PENALTY_SCHEDULE = if _PENALTY_MODE == "annealed"
     [
-        (1,   div(NUM_EPOCHS * NUM_BATCHES, 4), 0.1),
-        (div(NUM_EPOCHS * NUM_BATCHES, 4) + 1, div(NUM_EPOCHS * NUM_BATCHES, 4) * 2, 1.0),
-        (div(NUM_EPOCHS * NUM_BATCHES, 4) * 2 + 1, div(NUM_EPOCHS * NUM_BATCHES, 4) * 3, 10.0),
-        (div(NUM_EPOCHS * NUM_BATCHES, 4) * 3 + 1, NUM_EPOCHS * NUM_BATCHES, 30.0),
+        (1,   div(_N_TOTAL, 4), 0.1),
+        (div(_N_TOTAL, 4) + 1, div(_N_TOTAL, 2), 1.0),
+        (div(_N_TOTAL, 2) + 1, 3 * div(_N_TOTAL, 4), 10.0),
+        (3 * div(_N_TOTAL, 4) + 1, _N_TOTAL, 30.0),
+    ]
+elseif _PENALTY_MODE == "annealed_discount"
+    _min_safe = max(2.0, ceil(0.5 / DISCOUNT_GAMMA^(NUM_STAGES - 1)))
+    [
+        (1,   div(_N_TOTAL, 4), _min_safe),
+        (div(_N_TOTAL, 4) + 1, div(_N_TOTAL, 2), _min_safe * 2.5),
+        (div(_N_TOTAL, 2) + 1, 3 * div(_N_TOTAL, 4), _min_safe * 5.0),
+        (3 * div(_N_TOTAL, 4) + 1, _N_TOTAL, _min_safe * 10.0),
     ]
 else
-    [(1, NUM_EPOCHS * NUM_BATCHES, 1.0)]
+    [(1, _N_TOTAL, 1.0)]
 end
 
 const USE_GPU = parse(Bool, get(ENV, "DR_USE_GPU", "true"))
 const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = 9000)
 
-const _SCHED_TAG   = _PENALTY_MODE == "annealed" ? "-anneal" : "-const"
+const _DISC_TAG    = DISCOUNT_GAMMA < 1.0 ? "-disc$(replace(string(DISCOUNT_GAMMA), "." => ""))" : ""
+const _SCHED_TAG   = if _PENALTY_MODE == "annealed"
+    "-anneal"
+elseif _PENALTY_MODE == "annealed_discount"
+    "-anndisc"
+else
+    "-const"
+end
 const _PRETRAIN_TAG = PRETRAIN_ITERS > 0 ? "-pre$(PRETRAIN_ITERS)" : ""
 const _GPU_TAG     = USE_GPU ? "-gpu" : ""
-const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-embedded$(_GPU_TAG)$(_SCHED_TAG)$(_PRETRAIN_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
+const _LAYER_TAG   = LAYERS == [128, 128] ? "" : "-L$(join(LAYERS, "_"))"
+const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-embedded$(_GPU_TAG)$(_SCHED_TAG)$(_DISC_TAG)$(_LAYER_TAG)$(_PRETRAIN_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
 const MODEL_DIR = joinpath(CASE_DIR, FORM_LABEL, "models")
 mkpath(MODEL_DIR)
 const MODEL_PATH = joinpath(MODEL_DIR, RUN_NAME * ".jld2")
@@ -107,13 +126,21 @@ x0_init = Float32.([clamp(hydro_data.initial_volumes[r],
                            hydro_data.units[r].min_vol,
                            hydro_data.units[r].max_vol)
                     for r in 1:nHyd])
+target_lower = Float32.([h.min_vol for h in hydro_data.units])
+target_upper = Float32.([h.max_vol for h in hydro_data.units])
+
+const _discount_weights = Float64[DISCOUNT_GAMMA^(t-1) for t in 1:T for _ in 1:nHyd]
+if DISCOUNT_GAMMA < 1.0
+    @info "Discount γ=$(DISCOUNT_GAMMA): stage 1 weight=1.0, stage $T weight=$(round(DISCOUNT_GAMMA^(T-1); sigdigits=4))"
+end
 
 # ── Policy ────────────────────────────────────────────────────────────────────
 
 Random.seed!(42)
-policy = StateConditionedPolicy(nHyd, nHyd, nHyd, LAYERS;
-                                activation   = ACTIVATION,
-                                encoder_type = Flux.LSTM)
+policy = bounded_state_policy(nHyd, target_lower, target_upper, LAYERS;
+                              activation   = ACTIVATION,
+                              encoder_type = Flux.LSTM,
+                              active_mask  = trues(nHyd))
 
 # ── Optional pretrain with regular TSDDR ──────────────────────────────────────
 
@@ -162,7 +189,7 @@ end
 # ── Move policy + x0 to GPU (BEFORE embedded DE build so oracle captures GPU policy) ──
 
 if USE_GPU
-    policy  = Flux.gpu(policy)
+    policy  = CUDA.cu(policy)
     x0_init = CUDA.cu(x0_init)
     @info "Policy and x0 moved to GPU"
 end
@@ -215,6 +242,7 @@ lg = WandbLogger(
         "eval_every"      => EVAL_EVERY,
         "lr"              => LR,
         "penalty_schedule" => string(PENALTY_SCHEDULE),
+        "discount_gamma"  => DISCOUNT_GAMMA,
         "pretrain_iters"  => PRETRAIN_ITERS,
         "pretrain_penalty_mult" => PRETRAIN_PENALTY_MULT,
     ),
@@ -248,6 +276,11 @@ function set_hydro_rollout_stage!(stage_prob, state_in, wt, target, stage)
     return stage_prob
 end
 
+const _min_vols = Float64.([h.min_vol for h in hydro_data.units])
+const _max_vols = Float64.([h.max_vol for h in hydro_data.units])
+const _min_vols_dev = USE_GPU ? CUDA.cu(_min_vols) : _min_vols
+const _max_vols_dev = USE_GPU ? CUDA.cu(_max_vols) : _max_vols
+
 hydro_realized_state(stage_prob, result) =
     hydro_solution(stage_prob, result).reservoir[:, end]
 
@@ -274,6 +307,7 @@ rollout_evaluation = RolloutEvaluation(
     policy_state = :target,
     stage_problem_pool = rollout_pool,
     active_scenarios = NUM_EVAL_SCENARIOS,
+    state_bounds = (_min_vols_dev, _max_vols_dev),
 )
 realized_rollout_evaluation = RolloutEvaluation(
     rollout_prob, x0_init, eval_scenarios;
@@ -287,6 +321,7 @@ realized_rollout_evaluation = RolloutEvaluation(
     policy_state = :realized,
     stage_problem_pool = rollout_pool,
     active_scenarios = NUM_EVAL_SCENARIOS,
+    state_bounds = (_min_vols_dev, _max_vols_dev),
 )
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -322,11 +357,11 @@ train_tsddr_embedded(
             current_penalty_mult[] = mult
             ρ_half_scaled = prob_emb.base_penalty_half * mult
             ρ_l1_scaled   = prob_emb.base_penalty_l1 * mult
-            penalty_vals    = fill(ρ_half_scaled, T * nHyd)
-            penalty_l1_vals = fill(ρ_l1_scaled,   T * nHyd)
+            penalty_vals    = ρ_half_scaled .* _discount_weights
+            penalty_l1_vals = ρ_l1_scaled   .* _discount_weights
             ExaModels.set_parameter!(prob_emb.core, prob_emb.p_penalty_half, penalty_vals)
             ExaModels.set_parameter!(prob_emb.core, prob_emb.p_penalty_l1,   penalty_l1_vals)
-            @info "Penalty multiplier → $mult  (ρ/2 = $(round(ρ_half_scaled; digits=2)), λ_l1 = $(round(ρ_l1_scaled; digits=2)))"
+            @info "Penalty multiplier → $mult  (ρ/2 = $(round(ρ_half_scaled; digits=2)), λ_l1 = $(round(ρ_l1_scaled; digits=2)), γ=$DISCOUNT_GAMMA)"
         end
         return n
     end,
