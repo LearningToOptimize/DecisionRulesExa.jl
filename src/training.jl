@@ -40,6 +40,11 @@ _all_finite_gradient(x::NamedTuple)    = all(_all_finite_gradient(v) for v in va
 _all_finite_gradient(x::Tuple)         = all(_all_finite_gradient(v) for v in x)
 _all_finite_gradient(x)                = true
 
+function _adapt_array(x::AbstractVector, ref::AbstractVector)
+    typeof(x) === typeof(ref) && return x
+    copyto!(similar(ref, eltype(x), length(x)), x)
+end
+
 # ── Solve-status check ────────────────────────────────────────────────────────
 
 """
@@ -155,14 +160,15 @@ function simulate_tsddr(
 
     w_flat = uncertainty_sampler()
     nw     = length(w_flat) ÷ T
+    w_dev  = _adapt_array(F.(w_flat), initial_state)
 
     Flux.reset!(model)
-    xhat_stages = Vector{Vector{F}}(undef, T)
+    xhat_stages = AbstractVector{F}[]
     prev = F.(initial_state)
     for t in 1:T
-        wt             = F.(w_flat[(t-1)*nw+1 : t*nw])
-        xhat_stages[t] = model(vcat(wt, prev))
-        prev           = xhat_stages[t]
+        wt   = w_dev[(t-1)*nw+1 : t*nw]
+        push!(xhat_stages, model(vcat(wt, prev)))
+        prev = xhat_stages[end]
     end
     xhat_flat = vcat(xhat_stages...)
 
@@ -176,24 +182,22 @@ function simulate_tsddr(
     isfinite(result.objective) || return nothing
 
     λ = result.multipliers[det_equivalent.target_con_range]
-    return (objective = result.objective, lambda = F.(Array(λ)))
+    return (objective = result.objective, lambda = F.(λ))
 end
 
 function _rollout_xhat_flat(model, initial_state, w_flat, T::Int, F)
     nw = length(w_flat) ÷ T
-    nx = length(initial_state)
     Flux.reset!(model)
-    buf = Zygote.Buffer(zeros(F, nx * T))
     prev = F.(initial_state)
-    for t in 1:T
-        wt = F.(w_flat[(t-1)*nw+1 : t*nw])
+    xhat = model(vcat(w_flat[1:nw], prev))
+    prev = xhat
+    for t in 2:T
+        wt = w_flat[(t-1)*nw+1 : t*nw]
         xt = model(vcat(wt, prev))
-        for i in 1:nx
-            buf[(t-1)*nx + i] = xt[i]
-        end
+        xhat = vcat(xhat, xt)
         prev = xt
     end
-    return copy(buf)
+    return xhat
 end
 
 _has_critic(::NoCriticControlVariate) = false
@@ -446,7 +450,7 @@ function train_tsddr(
                     if solve_succeeded(result) && isfinite(result.objective)
                         λ = result.multipliers[de.target_con_range]
                         if all(isfinite, λ)
-                            put!(out_ch, (s_idx, F.(w_flat), F.(Array(λ)), result.objective))
+                            put!(out_ch, (s_idx, F.(w_flat), _adapt_array(F.(λ), w_flat), result.objective))
                             continue
                         end
                     end
@@ -472,24 +476,25 @@ function train_tsddr(
 
         # ── Forward pass: rollout + solve (outside AD tape) ───────────────────
 
-        # Step 1: Roll out policy for all samples (CPU, sequential)
-        sample_data = Vector{Tuple{Vector{F}, Vector{F}}}(undef, num_train_per_batch)
+        # Step 1: Roll out policy for all samples
+        sample_data = Vector{Tuple{AbstractVector{F}, AbstractVector{F}}}(undef, num_train_per_batch)
         for s in 1:num_train_per_batch
             w_flat = uncertainty_sampler()
             nw     = length(w_flat) ÷ T
+            w_dev  = _adapt_array(F.(w_flat), initial_state)
             Flux.reset!(model)
-            xhat_stages = Vector{Vector{F}}(undef, T)
+            xhat_stages = AbstractVector{F}[]
             prev = F.(initial_state)
             for t in 1:T
-                wt             = F.(w_flat[(t-1)*nw+1 : t*nw])
-                xhat_stages[t] = model(vcat(wt, prev))
-                prev           = xhat_stages[t]
+                wt   = w_dev[(t-1)*nw+1 : t*nw]
+                push!(xhat_stages, model(vcat(wt, prev)))
+                prev = xhat_stages[end]
             end
-            sample_data[s] = (F.(w_flat), vcat(xhat_stages...))
+            sample_data[s] = (w_dev, vcat(xhat_stages...))
         end
 
         # Step 2: Solve — parallel across workers if pool provided
-        solve_ok  = Vector{Union{Nothing, Tuple{Vector{F}, Vector{F}, Float64}}}(nothing, num_train_per_batch)
+        solve_ok  = Vector{Union{Nothing, Tuple{AbstractVector{F}, AbstractVector{F}, Float64}}}(nothing, num_train_per_batch)
 
         if nworkers == 1
             (de, px, pt, pu) = _pool[1]
@@ -504,7 +509,7 @@ function train_tsddr(
                 isfinite(result.objective) || continue
                 λ = result.multipliers[de.target_con_range]
                 all(isfinite, λ) || continue
-                solve_ok[s] = (F.(w_flat), F.(Array(λ)), result.objective)
+                solve_ok[s] = (F.(w_flat), _adapt_array(F.(λ), initial_state), result.objective)
             end
         else
             for round_start in 1:nworkers:num_train_per_batch
@@ -525,7 +530,7 @@ function train_tsddr(
         end
 
         # Step 3: Collect valid results
-        valid   = Vector{Tuple{Vector{F}, Vector{F}}}()
+        valid   = Tuple{AbstractVector{F}, AbstractVector{F}}[]
         de_samples = CriticSample[]
         obj_sum = 0.0
         for (s, r) in enumerate(solve_ok)
@@ -596,7 +601,7 @@ function train_tsddr(
                     total / F(n_ok)
                 end
             else
-                solved_weights = Vector{Tuple{Vector{F}, Vector{F}}}()
+                solved_weights = Tuple{AbstractVector{F}, AbstractVector{F}}[]
                 for sample in de_samples
                     λf = F.(sample.target_multipliers)
                     if actor_gradient_mode === :control_variate
@@ -736,7 +741,7 @@ function train_tsddr_embedded(
     nx = embedded_de.nx
 
     _get_states = get_realized_states === nothing ?
-        (prob, res) -> Array(res.solution[1 : prob.horizon * prob.nx]) :
+        (prob, res) -> res.solution[1 : prob.horizon * prob.nx] :
         get_realized_states
 
     state = _make_solver(embedded_de.model, madnlp_kwargs)
@@ -745,7 +750,7 @@ function train_tsddr_embedded(
     for iter in 1:num_batches
         num_train_per_batch = adjust_hyperparameters(iter, opt_state, num_train_per_batch)
 
-        valid   = Vector{Tuple{Vector{F}, Vector{F}, Vector{F}}}()  # (w, λ, x_realized)
+        valid   = Tuple{AbstractVector{F}, AbstractVector{F}, AbstractVector{F}}[]
         obj_sum = 0.0
 
         for s in 1:num_train_per_batch
@@ -765,7 +770,10 @@ function train_tsddr_embedded(
 
             x_sol = _get_states(embedded_de, result)
 
-            push!(valid, (F.(w_flat), F.(Array(λ)), F.(Array(x_sol))))
+            λf    = _adapt_array(F.(λ), initial_state)
+            xf    = _adapt_array(F.(x_sol), initial_state)
+            w_dev = _adapt_array(F.(w_flat), initial_state)
+            push!(valid, (w_dev, λf, xf))
             obj_sum += result.objective
         end
 

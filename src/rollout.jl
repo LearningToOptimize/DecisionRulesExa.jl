@@ -13,7 +13,8 @@ function _target_violation_share(objective::Real, objective_no_target_penalty::R
     return penalty / objective
 end
 
-_cpu_vec(x) = vec(collect(Array(x)))
+_to_vec(x) = vec(x)
+_to_vec(x::SubArray) = collect(x)
 
 """
     rollout_tsddr(model, initial_state, stage_problem, w_flat; kwargs...)
@@ -62,12 +63,13 @@ function rollout_tsddr(
 
     F = eltype(initial_state)
     state = solver_state
+    w_flat = _adapt_array(F.(w_flat), initial_state)
 
     Flux.reset!(model)
-    realized_prev = F.(_cpu_vec(initial_state))
+    realized_prev = F.(_to_vec(initial_state))
     target_prev = copy(realized_prev)
-    state_trajectory = Vector{Vector{F}}(undef, horizon + 1)
-    target_trajectory = Vector{Vector{F}}(undef, horizon)
+    state_trajectory = Vector{AbstractVector{F}}(undef, horizon + 1)
+    target_trajectory = Vector{AbstractVector{F}}(undef, horizon)
     state_trajectory[1] = copy(realized_prev)
 
     objective = 0.0
@@ -76,17 +78,17 @@ function rollout_tsddr(
     for stage in 1:horizon
         lo = (stage - 1) * n_uncertainty + 1
         hi = stage * n_uncertainty
-        wt = F.(_cpu_vec(view(w_flat, lo:hi)))
+        wt = F.(_to_vec(view(w_flat, lo:hi)))
 
         policy_input_state = policy_state === :realized ? realized_prev : target_prev
         target = model(vcat(wt, policy_input_state))
-        target_trajectory[stage] = F.(_cpu_vec(target))
+        target_trajectory[stage] = F.(_to_vec(target))
 
         set_stage_parameters!(
             stage_problem,
             Float64.(realized_prev),
             Float64.(wt),
-            Float64.(_cpu_vec(target)),
+            Float64.(_to_vec(target)),
             stage,
         )
 
@@ -116,8 +118,8 @@ function rollout_tsddr(
 
         objective += result.objective
         objective_no_penalty += no_penalty
-        realized_prev = F.(_cpu_vec(realized_state(stage_problem, result)))
-        target_prev = F.(_cpu_vec(target))
+        realized_prev = F.(_to_vec(realized_state(stage_problem, result)))
+        target_prev = F.(_to_vec(target))
         state_trajectory[stage + 1] = copy(realized_prev)
     end
 

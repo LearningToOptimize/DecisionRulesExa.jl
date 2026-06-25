@@ -15,7 +15,8 @@ using Flux
 using Statistics, Random, Dates
 using Wandb, Logging
 using JLD2
-using MadNLP
+using MadNLP, MadNLPGPU
+using CUDA, CUDSS, KernelAbstractions
 
 const SCRIPT_DIR = dirname(@__FILE__)
 include(joinpath(SCRIPT_DIR, "hydro_power_data.jl"))
@@ -63,11 +64,13 @@ else
     [(1, NUM_EPOCHS * NUM_BATCHES, 1.0)]
 end
 
+const USE_GPU = parse(Bool, get(ENV, "DR_USE_GPU", "true"))
 const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = 9000)
 
 const _SCHED_TAG   = _PENALTY_MODE == "annealed" ? "-anneal" : "-const"
 const _PRETRAIN_TAG = PRETRAIN_ITERS > 0 ? "-pre$(PRETRAIN_ITERS)" : ""
-const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-embedded$(_SCHED_TAG)$(_PRETRAIN_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
+const _GPU_TAG     = USE_GPU ? "-gpu" : ""
+const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-embedded$(_GPU_TAG)$(_SCHED_TAG)$(_PRETRAIN_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
 const MODEL_DIR = joinpath(CASE_DIR, FORM_LABEL, "models")
 mkpath(MODEL_DIR)
 const MODEL_PATH = joinpath(MODEL_DIR, RUN_NAME * ".jld2")
@@ -97,6 +100,9 @@ resolved_pen = TARGET_PEN_ARG === :auto ?
                Float64(TARGET_PEN_ARG)
 @info "Auto target penalty: ρ=$(round(resolved_pen; digits=2))"
 
+backend = USE_GPU ? (@info "Using GPU backend"; CUDA.CUDABackend()) :
+                    (@info "Using CPU backend"; nothing)
+
 x0_init = Float32.([clamp(hydro_data.initial_volumes[r],
                            hydro_data.units[r].min_vol,
                            hydro_data.units[r].max_vol)
@@ -114,7 +120,7 @@ policy = StateConditionedPolicy(nHyd, nHyd, nHyd, LAYERS;
 if PRETRAIN_ITERS > 0
     @info "Building regular DE for pretrain ($(PRETRAIN_ITERS) iters)..."
     prob_reg = build_hydro_de(power_data, hydro_data, T;
-        backend        = nothing,
+        backend        = backend,
         float_type     = Float64,
         formulation    = FORMULATION,
         target_penalty = TARGET_PEN_ARG,
@@ -153,10 +159,19 @@ if PRETRAIN_ITERS > 0
     @info "Pretrain done."
 end
 
+# ── Move policy + x0 to GPU (BEFORE embedded DE build so oracle captures GPU policy) ──
+
+if USE_GPU
+    policy  = Flux.gpu(policy)
+    x0_init = CUDA.cu(x0_init)
+    @info "Policy and x0 moved to GPU"
+end
+
 # ── Build embedded DE ─────────────────────────────────────────────────────────
 
 @info "Building embedded $(T)-stage $(FORMULATION) hydro DE..."
 prob_emb = build_embedded_hydro_de(policy, power_data, hydro_data, T;
+    backend        = backend,
     formulation    = FORMULATION,
     target_penalty = TARGET_PEN_ARG,
     deficit_cost   = DEFICIT_COST,
@@ -210,7 +225,7 @@ lg = WandbLogger(
 stage_demand = demand_mat === nothing ? nothing : demand_mat[1:1, :]
 function _build_rollout_de()
     build_hydro_de(power_data, hydro_data, 1;
-        backend        = nothing,
+        backend        = backend,
         float_type     = Float64,
         formulation    = FORMULATION,
         target_penalty = TARGET_PEN_ARG,
@@ -234,11 +249,11 @@ function set_hydro_rollout_stage!(stage_prob, state_in, wt, target, stage)
 end
 
 hydro_realized_state(stage_prob, result) =
-    Array(hydro_solution(stage_prob, result).reservoir[:, end])
+    hydro_solution(stage_prob, result).reservoir[:, end]
 
 function hydro_objective_no_target_penalty(stage_prob, result)
     sol = hydro_solution(stage_prob, result)
-    delta = Array(sol.delta)
+    delta = sol.delta
     penalty_l2_cost = (resolved_pen / 2) * sum(abs2, delta)
     penalty_l1_cost = resolved_pen_l1 * sum(abs, delta)
     return result.objective - penalty_l2_cost - penalty_l1_cost

@@ -160,6 +160,12 @@ if !isnothing(PRE_TRAINED)
     Flux.loadmodel!(policy, JLD2.load(PRE_TRAINED, "model_state"))
 end
 
+if USE_GPU
+    policy  = Flux.gpu(policy)
+    x0_init = CUDA.cu(x0_init)
+    @info "Policy and x0 moved to GPU"
+end
+
 # ── W&B logging ───────────────────────────────────────────────────────────────
 
 lg = WandbLogger(
@@ -201,7 +207,7 @@ epoch_losses = Float64[]
 stage_demand = demand_mat === nothing ? nothing : demand_mat[1:1, :]
 function _build_rollout_de()
     build_hydro_de(power_data, hydro_data, 1;
-        backend        = nothing,
+        backend        = backend,
         float_type     = Float64,
         formulation    = FORMULATION,
         target_penalty = TARGET_PEN_ARG,
@@ -213,7 +219,7 @@ end
 rollout_prob = _build_rollout_de()
 n_rollout_pool = max(NUM_WORKERS, NUM_EVAL_SCENARIOS)
 rollout_pool = [_build_rollout_de() for _ in 1:n_rollout_pool]
-@info "Rollout pool ready: $(n_rollout_pool) CPU stage-problem copies"
+@info "Rollout pool ready: $(n_rollout_pool) stage-problem copies"
 
 function set_hydro_rollout_stage!(stage_prob, state_in, wt, target, stage)
     ExaModels.set_parameter!(stage_prob.core, stage_prob.p_x0, state_in)
@@ -226,11 +232,11 @@ function set_hydro_rollout_stage!(stage_prob, state_in, wt, target, stage)
 end
 
 hydro_realized_state(stage_prob, result) =
-    Array(hydro_solution(stage_prob, result).reservoir[:, end])
+    hydro_solution(stage_prob, result).reservoir[:, end]
 
 function hydro_objective_no_target_penalty(stage_prob, result)
     sol = hydro_solution(stage_prob, result)
-    delta = Array(sol.delta)
+    delta = sol.delta
     penalty_l2_cost = (resolved_pen / 2) * sum(abs2, delta)
     penalty_l1_cost = resolved_pen_l1 * sum(abs, delta)
     return result.objective - penalty_l2_cost - penalty_l1_cost

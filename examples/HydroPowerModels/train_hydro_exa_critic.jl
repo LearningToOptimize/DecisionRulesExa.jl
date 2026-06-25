@@ -205,6 +205,18 @@ if !isnothing(PRE_TRAINED)
     Flux.loadmodel!(policy, JLD2.load(PRE_TRAINED, "model_state"))
 end
 
+if USE_GPU
+    policy  = Flux.gpu(policy)
+    x0_init = CUDA.cu(x0_init)
+    control_variate = ScalarCriticControlVariate(
+        Flux.gpu(control_variate.critic);
+        featurizer = control_variate.featurizer,
+        value_loss_weight = control_variate.value_loss_weight,
+        gradient_loss_weight = control_variate.gradient_loss_weight,
+    )
+    @info "Policy, critic, and x0 moved to GPU"
+end
+
 # ── W&B logging ───────────────────────────────────────────────────────────────
 
 lg = WandbLogger(
@@ -257,7 +269,7 @@ epoch_losses = Float64[]
 stage_demand = demand_mat === nothing ? nothing : demand_mat[1:1, :]
 function _build_rollout_de()
     build_hydro_de(power_data, hydro_data, 1;
-        backend        = nothing,
+        backend        = backend,
         float_type     = Float64,
         formulation    = FORMULATION,
         target_penalty = TARGET_PEN_ARG,
@@ -281,11 +293,11 @@ function set_hydro_rollout_stage!(stage_prob, state_in, wt, target, stage)
 end
 
 hydro_realized_state(stage_prob, result) =
-    Array(hydro_solution(stage_prob, result).reservoir[:, end])
+    hydro_solution(stage_prob, result).reservoir[:, end]
 
 function hydro_objective_no_target_penalty(stage_prob, result)
     sol = hydro_solution(stage_prob, result)
-    return result.objective - (resolved_pen / 2) * sum(abs2, Array(sol.delta))
+    return result.objective - (resolved_pen / 2) * sum(abs2, sol.delta)
 end
 
 Random.seed!(8789)

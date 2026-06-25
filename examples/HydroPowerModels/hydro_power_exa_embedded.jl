@@ -15,7 +15,7 @@ import DecisionRulesExa: set_x0!, set_uncertainty!, set_targets!
 
 # ── Problem struct ──────────────────────────────────────────────────────────────
 
-struct EmbeddedHydroExaDEProblem{P}
+struct EmbeddedHydroExaDEProblem{P, VT <: AbstractVector{Float64}}
     core
     model
     p_demand
@@ -40,8 +40,8 @@ struct EmbeddedHydroExaDEProblem{P}
     _dp_start::Int
     _dn_start::Int
     _nvar::Int
-    _inflow_buf::Vector{Float64}
-    _x0_buf::Vector{Float64}
+    _inflow_buf::VT
+    _x0_buf::VT
 end
 
 # ── Interface (duck-typing for train_tsddr_embedded) ────────────────────────────
@@ -82,7 +82,7 @@ function embedded_hydro_realized_states(prob::EmbeddedHydroExaDEProblem, result)
     T  = prob.horizon
     nH = prob.nHyd
     sol = result.solution
-    return Array(sol[prob._res_start + nH : prob._res_start + (T + 1) * nH - 1])
+    return sol[prob._res_start + nH : prob._res_start + (T + 1) * nH - 1]
 end
 
 function hydro_solution(prob::EmbeddedHydroExaDEProblem, result)
@@ -136,63 +136,73 @@ end
 function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
                               nvar_total, inflow_buf, x0_buf)
 
+    _res(s)     = res_start + (s-1)*nHyd : res_start + s*nHyd - 1
+    _dp(t)      = dp_start  + (t-1)*nHyd : dp_start  + t*nHyd - 1
+    _dn(t)      = dn_start  + (t-1)*nHyd : dn_start  + t*nHyd - 1
+    _inflow(t)  = (t-1)*nHyd+1 : t*nHyd
+    _crow(t)    = (t-1)*nHyd+1 : t*nHyd
+
+    jac_r = Int[]
+    jac_c = Int[]
+    for t in 1:T, r in 1:nHyd
+        row = (t-1)*nHyd + r
+        push!(jac_r, row); push!(jac_c, res_start + t*nHyd + r - 1)
+        push!(jac_r, row); push!(jac_c, dp_start + (t-1)*nHyd + r - 1)
+        push!(jac_r, row); push!(jac_c, dn_start + (t-1)*nHyd + r - 1)
+        if t > 1
+            for j in 1:nHyd
+                push!(jac_r, row); push!(jac_c, res_start + (t-1)*nHyd + j - 1)
+            end
+        end
+    end
+    nnzj = length(jac_r)
+
+    const_jac_cpu = zeros(Float64, nnzj)
+    nn_jac_ranges = Dict{Tuple{Int,Int}, UnitRange{Int}}()
+    k = 0
+    for t in 1:T, r in 1:nHyd
+        const_jac_cpu[k+1] = -1.0
+        const_jac_cpu[k+2] = -1.0
+        const_jac_cpu[k+3] =  1.0
+        k += 3
+        if t > 1
+            nn_jac_ranges[(t,r)] = (k+1):(k+nHyd)
+            k += nHyd
+        end
+    end
+    const_jac_dev = similar(inflow_buf, Float64, nnzj)
+    copyto!(const_jac_dev, const_jac_cpu)
+
+    eye_cpu = [let e = zeros(Float32, nHyd); e[r] = 1.0f0; e end for r in 1:nHyd]
+    eye_basis = [copyto!(similar(x0_buf, Float32, nHyd), e) for e in eye_cpu]
+
     function oracle_f!(c, xv)
         Flux.reset!(policy)
         for t in 1:T
-            x_prev = if t == 1
-                Float32.(x0_buf)
-            else
-                Float32[xv[res_start + (t-1)*nHyd + j - 1] for j in 1:nHyd]
-            end
-            inflow_t = Float32[inflow_buf[(t-1)*nHyd + j] for j in 1:nHyd]
-            nn_out = policy(vcat(inflow_t, x_prev))
-            for r in 1:nHyd
-                row = (t-1)*nHyd + r
-                c[row] = Float64(nn_out[r]) -
-                         xv[res_start + t*nHyd + r - 1] -
-                         xv[dp_start + (t-1)*nHyd + r - 1] +
-                         xv[dn_start + (t-1)*nHyd + r - 1]
-            end
+            x_prev  = t == 1 ? Float32.(x0_buf) : Float32.(xv[_res(t)])
+            infl_t  = Float32.(inflow_buf[_inflow(t)])
+            nn_out  = policy(vcat(infl_t, x_prev))
+            c[_crow(t)] .= Float64.(nn_out) .- xv[_res(t+1)] .- xv[_dp(t)] .+ xv[_dn(t)]
         end
         return nothing
     end
 
     function oracle_jac!(vals, xv)
+        copyto!(vals, const_jac_dev)
         Flux.reset!(policy)
-        k = 0
-        for t in 1:T
-            x_prev = if t == 1
-                Float32.(x0_buf)
-            else
-                Float32[xv[res_start + (t-1)*nHyd + j - 1] for j in 1:nHyd]
-            end
-            inflow_t = Float32[inflow_buf[(t-1)*nHyd + j] for j in 1:nHyd]
 
-            nn_jac_xprev = if t > 1
-                _, back = Zygote.pullback(xp -> policy(vcat(inflow_t, xp)), x_prev)
-                J = zeros(Float32, nHyd, nHyd)
-                for row in 1:nHyd
-                    e = zeros(Float32, nHyd)
-                    e[row] = 1.0f0
-                    col_grad = back(e)[1]
-                    if col_grad !== nothing
-                        J[row, :] .= col_grad
-                    end
-                end
-                J
-            else
-                policy(vcat(inflow_t, x_prev))
-                nothing
-            end
+        x_prev_1 = Float32.(x0_buf)
+        infl_1   = Float32.(inflow_buf[_inflow(1)])
+        policy(vcat(infl_1, x_prev_1))
 
+        for t in 2:T
+            x_prev = Float32.(xv[_res(t)])
+            infl_t = Float32.(inflow_buf[_inflow(t)])
+            _, back = Zygote.pullback(xp -> policy(vcat(infl_t, xp)), x_prev)
             for r in 1:nHyd
-                k += 1; vals[k] = -1.0   # ∂g/∂reservoir[t+1,r]
-                k += 1; vals[k] = -1.0   # ∂g/∂delta_pos[t,r]
-                k += 1; vals[k] =  1.0   # ∂g/∂delta_neg[t,r]
-                if t > 1
-                    for j in 1:nHyd
-                        k += 1; vals[k] = Float64(nn_jac_xprev[r, j])
-                    end
+                jac_row = back(eye_basis[r])[1]
+                if jac_row !== nothing
+                    vals[nn_jac_ranges[(t,r)]] .= Float64.(jac_row)
                 end
             end
         end
@@ -203,56 +213,31 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
         fill!(Jtv, 0.0)
         Flux.reset!(policy)
         for t in 1:T
-            x_prev = if t == 1
-                Float32.(x0_buf)
-            else
-                Float32[xv[res_start + (t-1)*nHyd + j - 1] for j in 1:nHyd]
-            end
-            inflow_t = Float32[inflow_buf[(t-1)*nHyd + j] for j in 1:nHyd]
+            x_prev = t == 1 ? Float32.(x0_buf) : Float32.(xv[_res(t)])
+            infl_t = Float32.(inflow_buf[_inflow(t)])
+            λ_t    = Float32.(λ[_crow(t)])
 
-            for r in 1:nHyd
-                λ_r = λ[(t-1)*nHyd + r]
-                Jtv[res_start + t*nHyd + r - 1]       -= λ_r
-                Jtv[dp_start + (t-1)*nHyd + r - 1]    -= λ_r
-                Jtv[dn_start + (t-1)*nHyd + r - 1]    += λ_r
-            end
+            Jtv[_res(t+1)] .-= Float64.(λ_t)
+            Jtv[_dp(t)]    .-= Float64.(λ_t)
+            Jtv[_dn(t)]    .+= Float64.(λ_t)
 
-            λ_t = Float32[λ[(t-1)*nHyd + r] for r in 1:nHyd]
             if t > 1
-                _, back = Zygote.pullback(xp -> policy(vcat(inflow_t, xp)), x_prev)
+                _, back = Zygote.pullback(xp -> policy(vcat(infl_t, xp)), x_prev)
                 d_xprev = back(λ_t)[1]
                 if d_xprev !== nothing
-                    for j in 1:nHyd
-                        Jtv[res_start + (t-1)*nHyd + j - 1] += Float64(d_xprev[j])
-                    end
+                    Jtv[_res(t)] .+= Float64.(d_xprev)
                 end
             else
-                policy(vcat(inflow_t, x_prev))
+                policy(vcat(infl_t, x_prev))
             end
         end
         return nothing
     end
 
-    jac_r = Int[]
-    jac_c = Int[]
-    for t in 1:T
-        for r in 1:nHyd
-            row = (t-1)*nHyd + r
-            push!(jac_r, row); push!(jac_c, res_start + t*nHyd + r - 1)
-            push!(jac_r, row); push!(jac_c, dp_start + (t-1)*nHyd + r - 1)
-            push!(jac_r, row); push!(jac_c, dn_start + (t-1)*nHyd + r - 1)
-            if t > 1
-                for j in 1:nHyd
-                    push!(jac_r, row); push!(jac_c, res_start + (t-1)*nHyd + j - 1)
-                end
-            end
-        end
-    end
-
     return ExaModels.VectorNonlinearOracle(
         nvar     = nvar_total,
         ncon     = T * nHyd,
-        nnzj     = length(jac_r),
+        nnzj     = nnzj,
         jac_rows = jac_r,
         jac_cols = jac_c,
         lcon     = zeros(T * nHyd),
@@ -260,7 +245,6 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
         f!       = oracle_f!,
         jac!     = oracle_jac!,
         vjp!     = oracle_vjp!,
-        adapt    = Val(true),
     )
 end
 
@@ -494,8 +478,12 @@ function _build_embedded_dc_hydro_de(
     n_con += T * nHyd
 
     # ── Oracle (replaces target constraints) ──────────────────────────────────
-    inflow_buf = zeros(Float64, T * nHyd)
-    x0_buf     = zeros(Float64, nHyd)
+    inflow_buf = backend === nothing ?
+        zeros(Float64, T * nHyd) :
+        KernelAbstractions.zeros(backend, Float64, T * nHyd)
+    x0_buf = backend === nothing ?
+        zeros(Float64, nHyd) :
+        KernelAbstractions.zeros(backend, Float64, nHyd)
 
     oracle = _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
                                   nvar_total, inflow_buf, x0_buf)
@@ -838,8 +826,12 @@ function _build_embedded_ac_hydro_de(
     n_con += T * nHyd
 
     # ── Oracle ────────────────────────────────────────────────────────────────
-    inflow_buf = zeros(Float64, T * nHyd)
-    x0_buf     = zeros(Float64, nHyd)
+    inflow_buf = backend === nothing ?
+        zeros(Float64, T * nHyd) :
+        KernelAbstractions.zeros(backend, Float64, T * nHyd)
+    x0_buf = backend === nothing ?
+        zeros(Float64, nHyd) :
+        KernelAbstractions.zeros(backend, Float64, nHyd)
 
     oracle = _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
                                   nvar_total, inflow_buf, x0_buf)
