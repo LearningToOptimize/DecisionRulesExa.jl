@@ -40,6 +40,19 @@ _all_finite_gradient(x::NamedTuple)    = all(_all_finite_gradient(v) for v in va
 _all_finite_gradient(x::Tuple)         = all(_all_finite_gradient(v) for v in x)
 _all_finite_gradient(x)                = true
 
+_status_key(status) = replace(string(status), r"[^A-Za-z0-9_]" => "_")
+
+function _inc_status!(counts::Dict{String, Int}, status)
+    key = _status_key(status)
+    counts[key] = get(counts, key, 0) + 1
+    return counts
+end
+
+function _inc_count!(counts::Dict{String, Int}, key::String)
+    counts[key] = get(counts, key, 0) + 1
+    return counts
+end
+
 function _adapt_array(x::AbstractVector, ref::AbstractVector)
     typeof(x) === typeof(ref) && return x
     copyto!(similar(ref, eltype(x), length(x)), x)
@@ -127,6 +140,17 @@ function _solve!(state::_SolverState, nlp; warmstart::Bool, madnlp_kwargs)
         state.last_good_zu_vals = copy(solver.zu.values)
     end
     return res
+end
+
+function _solve_with_retry!(state::_SolverState, nlp; warmstart::Bool, madnlp_kwargs, retry_on_failure::Bool)
+    result = _solve!(state, nlp; warmstart = warmstart, madnlp_kwargs = madnlp_kwargs)
+    retried = false
+    if retry_on_failure && (!solve_succeeded(result) || !isfinite(result.objective))
+        retry_state = _make_solver(nlp, madnlp_kwargs)
+        result = _solve!(retry_state, nlp; warmstart = false, madnlp_kwargs = madnlp_kwargs)
+        retried = true
+    end
+    return result, retried
 end
 
 # ── simulate_tsddr ────────────────────────────────────────────────────────────
@@ -388,6 +412,7 @@ function train_tsddr(
                                end,
     madnlp_kwargs            = NamedTuple(),
     warmstart::Bool          = true,
+    retry_on_failure::Bool   = true,
     problem_pool             = nothing,
     control_variate::AbstractCriticControlVariate = NoCriticControlVariate(),
     actor_gradient_mode::Symbol = :control_variate,
@@ -402,6 +427,7 @@ function train_tsddr(
     num_cheap_critic_samples_per_batch::Int = 0,
     critic_optimizer         = Flux.Adam(1f-3),
     external_critic_samples  = nothing,
+    batch_diagnostics        = (iter, stats) -> nothing,
 )
     T    = det_equivalent.horizon
     F    = eltype(initial_state)
@@ -454,15 +480,28 @@ function train_tsddr(
                     ExaModels.set_parameter!(de.core, px, init_state)
                     ExaModels.set_parameter!(de.core, pu, w_flat)
                     ExaModels.set_parameter!(de.core, pt, Float64.(xhat_flat))
-                    result = _solve!(st, de.model; warmstart=warmstart, madnlp_kwargs=madnlp_kwargs)
-                    if solve_succeeded(result) && isfinite(result.objective)
+                    result, retried = _solve_with_retry!(
+                        st,
+                        de.model;
+                        warmstart = warmstart,
+                        madnlp_kwargs = madnlp_kwargs,
+                        retry_on_failure = retry_on_failure,
+                    )
+                    failure = nothing
+                    if !solve_succeeded(result)
+                        failure = "status_" * _status_key(result.status)
+                    elseif !isfinite(result.objective)
+                        failure = "nonfinite_objective"
+                    elseif solve_succeeded(result) && isfinite(result.objective)
                         λ = result.multipliers[de.target_con_range]
                         if all(isfinite, λ)
-                            put!(out_ch, (s_idx, F.(w_flat), _adapt_array(F.(λ), w_flat), result.objective))
+                            put!(out_ch, (s_idx, F.(w_flat), _adapt_array(F.(λ), w_flat),
+                                          result.objective, result.status, nothing, retried))
                             continue
                         end
+                        failure = "nonfinite_lambda"
                     end
-                    put!(out_ch, (s_idx, nothing, nothing, NaN))
+                    put!(out_ch, (s_idx, nothing, nothing, NaN, result.status, failure, retried))
                 end
             end
             push!(worker_tasks, t)
@@ -503,6 +542,9 @@ function train_tsddr(
 
         # Step 2: Solve — parallel across workers if pool provided
         solve_ok  = Vector{Union{Nothing, Tuple{AbstractVector{F}, AbstractVector{F}, Float64}}}(nothing, num_train_per_batch)
+        status_counts = Dict{String, Int}()
+        failure_counts = Dict{String, Int}()
+        retry_counts = Dict{String, Int}()
 
         if nworkers == 1
             (de, px, pt, pu) = _pool[1]
@@ -512,11 +554,28 @@ function train_tsddr(
                 ExaModels.set_parameter!(de.core, px, initial_state)
                 ExaModels.set_parameter!(de.core, pu, w_flat)
                 ExaModels.set_parameter!(de.core, pt, Float64.(xhat_flat))
-                result = _solve!(st, de.model; warmstart=warmstart, madnlp_kwargs=madnlp_kwargs)
-                solve_succeeded(result) || continue
-                isfinite(result.objective) || continue
+                result, retried = _solve_with_retry!(
+                    st,
+                    de.model;
+                    warmstart = warmstart,
+                    madnlp_kwargs = madnlp_kwargs,
+                    retry_on_failure = retry_on_failure,
+                )
+                retried && _inc_count!(retry_counts, solve_succeeded(result) && isfinite(result.objective) ? "retry_success" : "retry_failure")
+                _inc_status!(status_counts, result.status)
+                if !solve_succeeded(result)
+                    _inc_count!(failure_counts, "status_" * _status_key(result.status))
+                    continue
+                end
+                if !isfinite(result.objective)
+                    _inc_count!(failure_counts, "nonfinite_objective")
+                    continue
+                end
                 λ = result.multipliers[de.target_con_range]
-                all(isfinite, λ) || continue
+                if !all(isfinite, λ)
+                    _inc_count!(failure_counts, "nonfinite_lambda")
+                    continue
+                end
                 solve_ok[s] = (F.(w_flat), _adapt_array(F.(λ), initial_state), result.objective)
             end
         else
@@ -529,7 +588,19 @@ function train_tsddr(
                     put!(in_channels[wi], (s, initial_state, w_flat, xhat_flat))
                 end
                 for wi in 1:round_size
-                    (s_idx, w_out, λ_out, obj_out) = take!(out_channels[wi])
+                    msg = take!(out_channels[wi])
+                    if length(msg) == 7
+                        (s_idx, w_out, λ_out, obj_out, status_out, failure_out, retried_out) = msg
+                        _inc_status!(status_counts, status_out)
+                        failure_out !== nothing && _inc_count!(failure_counts, failure_out)
+                        retried_out && _inc_count!(retry_counts, w_out === nothing ? "retry_failure" : "retry_success")
+                    elseif length(msg) == 6
+                        (s_idx, w_out, λ_out, obj_out, status_out, failure_out) = msg
+                        _inc_status!(status_counts, status_out)
+                        failure_out !== nothing && _inc_count!(failure_counts, failure_out)
+                    else
+                        (s_idx, w_out, λ_out, obj_out) = msg
+                    end
                     if w_out !== nothing
                         solve_ok[s_idx] = (w_out, λ_out, obj_out)
                     end
@@ -552,6 +623,13 @@ function train_tsddr(
         end
         n_ok     = length(valid)
         mean_obj = n_ok > 0 ? obj_sum / n_ok : NaN
+        batch_diagnostics(iter, Dict{String, Any}(
+            "n_ok" => n_ok,
+            "n_total" => num_train_per_batch,
+            "status_counts" => copy(status_counts),
+            "failure_counts" => copy(failure_counts),
+            "retry_counts" => copy(retry_counts),
+        ))
 
         if has_critic && n_ok > 0 && critic_updates_per_batch > 0
             valid_samples = if resolved_critic_training_target isa RolloutCriticTarget
@@ -742,7 +820,9 @@ function train_tsddr_embedded(
                                end,
     madnlp_kwargs            = NamedTuple(),
     warmstart::Bool          = true,
+    retry_on_failure::Bool   = true,
     get_realized_states      = nothing,
+    batch_diagnostics        = (iter, stats) -> nothing,
 )
     T  = embedded_de.horizon
     F  = eltype(initial_state)
@@ -760,6 +840,9 @@ function train_tsddr_embedded(
 
         valid   = Tuple{AbstractVector{F}, AbstractVector{F}, AbstractVector{F}}[]
         obj_sum = 0.0
+        status_counts = Dict{String, Int}()
+        failure_counts = Dict{String, Int}()
+        retry_counts = Dict{String, Int}()
 
         for s in 1:num_train_per_batch
             w_flat = uncertainty_sampler()
@@ -767,14 +850,30 @@ function train_tsddr_embedded(
             set_x0!(embedded_de, initial_state)
             set_uncertainty!(embedded_de, w_flat)
 
-            result = _solve!(state, embedded_de.model;
-                warmstart = warmstart, madnlp_kwargs = madnlp_kwargs)
+            result, retried = _solve_with_retry!(
+                state,
+                embedded_de.model;
+                warmstart = warmstart,
+                madnlp_kwargs = madnlp_kwargs,
+                retry_on_failure = retry_on_failure,
+            )
+            retried && _inc_count!(retry_counts, solve_succeeded(result) && isfinite(result.objective) ? "retry_success" : "retry_failure")
 
-            solve_succeeded(result) || continue
-            isfinite(result.objective) || continue
+            _inc_status!(status_counts, result.status)
+            if !solve_succeeded(result)
+                _inc_count!(failure_counts, "status_" * _status_key(result.status))
+                continue
+            end
+            if !isfinite(result.objective)
+                _inc_count!(failure_counts, "nonfinite_objective")
+                continue
+            end
 
             λ = result.multipliers[embedded_de.target_con_range]
-            all(isfinite, λ) || continue
+            if !all(isfinite, λ)
+                _inc_count!(failure_counts, "nonfinite_lambda")
+                continue
+            end
 
             x_sol = _get_states(embedded_de, result)
 
@@ -787,6 +886,13 @@ function train_tsddr_embedded(
 
         n_ok     = length(valid)
         mean_obj = n_ok > 0 ? obj_sum / n_ok : NaN
+        batch_diagnostics(iter, Dict{String, Any}(
+            "n_ok" => n_ok,
+            "n_total" => num_train_per_batch,
+            "status_counts" => copy(status_counts),
+            "failure_counts" => copy(failure_counts),
+            "retry_counts" => copy(retry_counts),
+        ))
 
         if n_ok > 0
             gs = Zygote.gradient(model) do m

@@ -73,6 +73,44 @@ For a custom problem you need:
 
 The package provides `build_deterministic_equivalent` for generic problems and `build_linear_tracking_problem` as a ready-made demo. For domain-specific models (power systems, robotics), build the ExaModels NLP directly — see `examples/HydroPowerModels/` for a complete AC-OPF example.
 
+## Strict embedded target equality
+
+The usual TS-DDR deterministic equivalent uses slack-penalized target
+constraints,
+
+```text
+x_t - pi_theta(w_t, x_{t-1}) = delta_t,
+objective += rho * penalty(delta_t).
+```
+
+This is the right default for open-loop target trajectories and for cases where
+the policy can request states that are not reachable from the previous realized
+state. The target multipliers are then gradients of the penalized projection
+problem, so their quality depends on the penalty calibration.
+
+For embedded closed-loop policies, a stricter formulation is possible when the
+policy output is guaranteed to lie in a one-stage reachable state set:
+
+```text
+x_t = pi_theta(w_t, x_{t-1}),      pi_theta(w_t, x_{t-1}) in R(w_t, x_{t-1}).
+```
+
+In that case the deterministic equivalent does not need target slack variables
+or target penalties. The multiplier on the equality is the local envelope
+sensitivity of the true stage problem with respect to the policy-imposed next
+state, not the sensitivity of a penalized approximation. This is useful when:
+
+- the policy is embedded stage by stage and receives the realized previous
+  state;
+- users can define a differentiable or piecewise differentiable map into a
+  subset of the one-stage reachable set;
+- total recourse is guaranteed by the model for every state produced by that
+  map.
+
+Do not use strict equality for a generic open-loop target policy unless the
+target generator is proven reachable at every stage. For unreachable targets,
+the slack-penalty formulation is the robust fallback.
+
 ## Parallel GPU solves
 
 When training samples are independent, multiple NLP instances can be solved concurrently on the same GPU. Pass a `problem_pool` of independent ExaModels problem copies to `train_tsddr`:

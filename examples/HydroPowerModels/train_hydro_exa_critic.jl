@@ -39,7 +39,7 @@ const NUM_ROLLOUT_STAGES = parse(Int, get(ENV, "DR_NUM_ROLLOUT_STAGES", "96"))
 const NUM_EPOCHS  = 80
 const NUM_BATCHES = 100
 const MAX_EVAL_SCENARIOS = 32
-const EVAL_EVERY = 25
+const EVAL_EVERY = parse(Int, get(ENV, "DR_EVAL_EVERY", "50"))
 
 const EVAL_SCHEDULE = [
     (1,   div(NUM_EPOCHS * NUM_BATCHES, 2), 4),
@@ -92,7 +92,8 @@ const NUM_TRAIN_SCHEDULE = [
     (div(NUM_EPOCHS * NUM_BATCHES, 5) * 4 + 1, NUM_EPOCHS * NUM_BATCHES, 8 * NUM_WORKERS),
 ]
 
-const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = 9000)
+const MAX_ITER = parse(Int, get(ENV, "DR_MAX_ITER", "9000"))
+const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = MAX_ITER)
 
 const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-deteq-gpu-critic-cv-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
 const MODEL_DIR = joinpath(CASE_DIR, FORM_LABEL, "models")
@@ -343,24 +344,6 @@ rollout_evaluation = RolloutEvaluation(
     madnlp_kwargs = SOLVER_KWARGS,
     warmstart = false,
     stride = EVAL_EVERY,
-    policy_state = :target,
-    stage_problem_pool = rollout_pool,
-    retry_on_failure = true,
-    active_scenarios = 4,
-    state_bounds = (_min_vols_dev, _max_vols_dev),
-)
-realized_rollout_evaluation = RolloutEvaluation(
-    rollout_prob,
-    x0_init,
-    eval_scenarios;
-    horizon = T_ROLLOUT,
-    n_uncertainty = nHyd,
-    set_stage_parameters! = set_hydro_rollout_stage!,
-    realized_state = hydro_realized_state,
-    objective_no_target_penalty = hydro_objective_no_target_penalty,
-    madnlp_kwargs = SOLVER_KWARGS,
-    warmstart = false,
-    stride = EVAL_EVERY,
     policy_state = :realized,
     stage_problem_pool = rollout_pool,
     retry_on_failure = true,
@@ -438,7 +421,6 @@ train_tsddr(
         end
         n_eval = _schedule_value(EVAL_SCHEDULE, iter, MAX_EVAL_SCENARIOS)
         rollout_evaluation.active_scenarios = n_eval
-        realized_rollout_evaluation.active_scenarios = n_eval
         return _schedule_value(NUM_TRAIN_SCHEDULE, iter, n)
     end,
     record_loss          = (iter, m, loss, tag) -> begin
@@ -447,7 +429,6 @@ train_tsddr(
 
         if iter % EVAL_EVERY == 0
             rollout_evaluation(iter, m)
-            realized_rollout_evaluation(iter, m)
             append!(shared_critic_samples,
                     critic_samples_from_evaluation(
                         rollout_evaluation;
@@ -459,14 +440,8 @@ train_tsddr(
                 rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_target_violation_share"] =
                 rollout_evaluation.last_violation_share
-            metrics["metrics/rollout_realized_objective_no_target_penalty"] =
-                realized_rollout_evaluation.last_objective_no_target_penalty
-            metrics["metrics/rollout_realized_objective_no_deficit"] =
-                realized_rollout_evaluation.last_objective_no_target_penalty
-            metrics["metrics/rollout_realized_target_violation_share"] =
-                realized_rollout_evaluation.last_violation_share
             metrics["metrics/rollout_n_ok"] =
-                realized_rollout_evaluation.last_n_ok
+                rollout_evaluation.last_n_ok
         end
 
         if !isnan(current_penalty_mult[])

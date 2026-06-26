@@ -4,14 +4,135 @@
 # Target constraints from hydro_power_exa.jl are replaced by a
 # VectorNonlinearOracle that evaluates the Flux policy inline.
 #
-# Oracle constraint (matching regular DE sign convention):
+# Slack target constraint (matching regular DE sign convention):
 #     π_θ(inflow_t, reservoir_t) − reservoir_{t+1,r} − δ⁺_{t,r} + δ⁻_{t,r} = 0
+#
+# Strict target constraint:
+#     π_θ(inflow_t, reservoir_t) − reservoir_{t+1,r} = 0
 #
 # Depends on: hydro_power_data.jl, hydro_power_exa.jl (index helpers, data types)
 
 using Flux
 using Zygote
-import DecisionRulesExa: set_x0!, set_uncertainty!, set_targets!, invalidate_policy_cache!
+import DecisionRulesExa: set_x0!, set_uncertainty!, set_targets!, invalidate_policy_cache!,
+                         load_stateconditioned_policy!
+
+# ── Hydro-specific feasible target policy ─────────────────────────────────────
+
+"""
+    hydro_reachable_policy(hydro_data, layers; activation=sigmoid, encoder_type=Flux.LSTM,
+                           spill_max=nothing)
+
+Build a state-conditioned policy whose outputs are one-stage reachable
+reservoir targets for the hydro water-balance model. The neural network predicts
+a normalized vector `y_t`; the wrapper maps it to `[lower_t, upper_t]` computed
+from `(inflow_t, reservoir_t)`.
+
+The current HydroData model has no finite spill upper bound, so by default the
+lower bound is the storage minimum. Pass `spill_max` to use a finite
+`x + K*inflow - K*max_turn - spill_max` lower reachability bound.
+"""
+struct HydroReachablePolicy{E,C,V,S}
+    encoder::E
+    combiner::C
+    n_uncertainty::Int
+    n_state::Int
+    min_vol::V
+    max_vol::V
+    min_turn::V
+    max_turn::V
+    spill_max::S
+    K::Float64
+    output_lower::Nothing
+    output_scale::Nothing
+end
+
+Flux.@layer HydroReachablePolicy trainable=(encoder, combiner)
+
+function _hydro_adapt_bound(x::AbstractVector, ref::AbstractVector)
+    typeof(x) === typeof(ref) && return x
+    y = similar(ref, length(x))
+    copyto!(y, convert.(eltype(ref), x))
+    return y
+end
+
+function _hydro_reachable_bounds(policy::HydroReachablePolicy, inflow, x_prev, ref)
+    min_vol  = _hydro_adapt_bound(policy.min_vol, ref)
+    max_vol  = _hydro_adapt_bound(policy.max_vol, ref)
+    min_turn = _hydro_adapt_bound(policy.min_turn, ref)
+    max_turn = _hydro_adapt_bound(policy.max_turn, ref)
+    K = convert(eltype(ref), policy.K)
+
+    upper_raw = x_prev .+ K .* inflow .- K .* min_turn
+    upper = min.(max_vol, upper_raw)
+
+    lower = if policy.spill_max === nothing
+        min_vol
+    else
+        spill_max = _hydro_adapt_bound(policy.spill_max, ref)
+        lower_raw = x_prev .+ K .* inflow .- K .* max_turn .- spill_max
+        max.(min_vol, lower_raw)
+    end
+
+    upper = max.(upper, lower)
+    return lower, upper
+end
+Zygote.@nograd _hydro_reachable_bounds
+
+function (m::HydroReachablePolicy)(input)
+    inflow = input[1:m.n_uncertainty]
+    x_prev = input[m.n_uncertainty+1:end]
+    h = vec(m.encoder(reshape(inflow, :, 1)))
+    y = m.combiner(vcat(h, x_prev))
+    lower, upper = _hydro_reachable_bounds(m, inflow, x_prev, y)
+    return lower .+ (upper .- lower) .* y
+end
+
+Flux.reset!(m::HydroReachablePolicy) = Flux.reset!(m.encoder)
+
+function load_stateconditioned_policy!(policy::HydroReachablePolicy, state)
+    try
+        Flux.loadmodel!(policy, state)
+        return policy
+    catch err
+        hasproperty(state, :encoder) && hasproperty(state, :combiner) || rethrow(err)
+        @warn "Full HydroReachablePolicy checkpoint load failed; loading encoder/combiner only and keeping hydro reachability bounds" exception=(err, catch_backtrace())
+        Flux.loadmodel!(policy.encoder, getproperty(state, :encoder))
+        Flux.loadmodel!(policy.combiner, getproperty(state, :combiner))
+        return policy
+    end
+end
+
+function hydro_reachable_policy(
+    hydro_data::HydroData,
+    layers::AbstractVector{Int};
+    activation = sigmoid,
+    encoder_type = Flux.LSTM,
+    spill_max = nothing,
+)
+    (activation === sigmoid || activation === NNlib.sigmoid || activation === NNlib.sigmoid_fast) ||
+        throw(ArgumentError("hydro_reachable_policy requires a sigmoid-style activation so normalized targets stay in [0, 1]"))
+    nHyd = hydro_data.nHyd
+    enc_sizes  = vcat(nHyd, layers)
+    enc_layers = [encoder_type(enc_sizes[i] => enc_sizes[i+1])
+                  for i in 1:length(layers)]
+    encoder  = Flux.Chain(enc_layers...)
+    combiner = Flux.Dense(layers[end] + nHyd => nHyd, activation)
+    spill_vec = spill_max === nothing ? nothing : Float32.(collect(spill_max))
+    if spill_vec !== nothing && length(spill_vec) != nHyd
+        throw(ArgumentError("spill_max length must be nHyd=$nHyd"))
+    end
+    return HydroReachablePolicy(
+        encoder, combiner, nHyd, nHyd,
+        Float32.([h.min_vol for h in hydro_data.units]),
+        Float32.([h.max_vol for h in hydro_data.units]),
+        Float32.([h.min_turn for h in hydro_data.units]),
+        Float32.([h.max_turn for h in hydro_data.units]),
+        spill_vec,
+        Float64(hydro_data.K),
+        nothing, nothing,
+    )
+end
 
 # ── Problem struct ──────────────────────────────────────────────────────────────
 
@@ -43,6 +164,7 @@ struct EmbeddedHydroExaDEProblem{P, VT <: AbstractVector{Float64}}
     _inflow_buf::VT
     _x0_buf::VT
     _h_cache_dirty::Ref{Bool}
+    strict_targets::Bool
 end
 
 # ── Interface (duck-typing for train_tsddr_embedded) ────────────────────────────
@@ -109,8 +231,13 @@ function hydro_solution(prob::EmbeddedHydroExaDEProblem, result)
         res_sol   = reshape(sol[off .+ (1:(T+1)*nH)],    nH, T+1); off += (T+1)*nH
         out_sol   = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
         spill_sol = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
-        dp_sol    = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
-        dn_sol    = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
+        if prob.strict_targets
+            dp_sol = zeros(eltype(sol), nH, T)
+            dn_sol = zeros(eltype(sol), nH, T)
+        else
+            dp_sol = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
+            dn_sol = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
+        end
         delta_sol = dp_sol .- dn_sol
         return (va=va_sol, pg=pg_sol, pf=pf_sol, deficit=def_sol,
                 reservoir=res_sol, outflow=out_sol, spill=spill_sol, delta=delta_sol)
@@ -128,8 +255,13 @@ function hydro_solution(prob::EmbeddedHydroExaDEProblem, result)
         res_sol    = reshape(sol[off .+ (1:(T+1)*nH)],    nH, T+1); off += (T+1)*nH
         out_sol    = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
         spill_sol  = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
-        dp_sol     = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
-        dn_sol     = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
+        if prob.strict_targets
+            dp_sol = zeros(eltype(sol), nH, T)
+            dn_sol = zeros(eltype(sol), nH, T)
+        else
+            dp_sol = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
+            dn_sol = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
+        end
         delta_sol  = dp_sol .- dn_sol
         return (va=va_sol, vm=vm_sol, pg=pg_sol, qg=qg_sol,
                 p_fr=p_fr_sol, q_fr=q_fr_sol, p_to=p_to_sol, q_to=q_to_sol,
@@ -141,7 +273,8 @@ end
 # ── Oracle builder helper ───────────────────────────────────────────────────────
 
 function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
-                              nvar_total, inflow_buf, x0_buf)
+                              nvar_total, inflow_buf, x0_buf;
+                              strict_targets::Bool = false)
 
     _res(s)     = res_start + (s-1)*nHyd : res_start + s*nHyd - 1
     _dp(t)      = dp_start  + (t-1)*nHyd : dp_start  + t*nHyd - 1
@@ -151,16 +284,19 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
 
     encoder  = policy.encoder
     combiner = policy.combiner
-    n_unc    = policy.n_uncertainty
     n_h      = size(combiner.weight, 2) - policy.n_state
+    reachable_policy = policy isa HydroReachablePolicy
+    has_spill_cap = reachable_policy && policy.spill_max !== nothing
 
     jac_r = Int[]
     jac_c = Int[]
     for t in 1:T, r in 1:nHyd
         row = (t-1)*nHyd + r
         push!(jac_r, row); push!(jac_c, res_start + t*nHyd + r - 1)
-        push!(jac_r, row); push!(jac_c, dp_start + (t-1)*nHyd + r - 1)
-        push!(jac_r, row); push!(jac_c, dn_start + (t-1)*nHyd + r - 1)
+        if !strict_targets
+            push!(jac_r, row); push!(jac_c, dp_start + (t-1)*nHyd + r - 1)
+            push!(jac_r, row); push!(jac_c, dn_start + (t-1)*nHyd + r - 1)
+        end
         if t > 1
             for j in 1:nHyd
                 push!(jac_r, row); push!(jac_c, res_start + (t-1)*nHyd + j - 1)
@@ -174,9 +310,12 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
     k = 0
     for t in 1:T, r in 1:nHyd
         const_jac_cpu[k+1] = -1.0
-        const_jac_cpu[k+2] = -1.0
-        const_jac_cpu[k+3] =  1.0
-        k += 3
+        k += 1
+        if !strict_targets
+            const_jac_cpu[k+1] = -1.0
+            const_jac_cpu[k+2] =  1.0
+            k += 2
+        end
         if t > 1
             nn_jac_ranges_flat[(t-1)*nHyd + r] = (k+1):(k+nHyd)
             k += nHyd
@@ -196,6 +335,22 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
     else
         fill!(output_lower_f32, 0f0)
         fill!(output_scale_f32, 1f0)
+    end
+    min_vol_f32 = similar(x0_buf, Float32, nHyd)
+    max_vol_f32 = similar(x0_buf, Float32, nHyd)
+    min_turn_f32 = similar(x0_buf, Float32, nHyd)
+    max_turn_f32 = similar(x0_buf, Float32, nHyd)
+    spill_max_f32 = similar(x0_buf, Float32, nHyd)
+    if reachable_policy
+        copyto!(min_vol_f32, Float32.(Array(policy.min_vol)))
+        copyto!(max_vol_f32, Float32.(Array(policy.max_vol)))
+        copyto!(min_turn_f32, Float32.(Array(policy.min_turn)))
+        copyto!(max_turn_f32, Float32.(Array(policy.max_turn)))
+        if policy.spill_max !== nothing
+            copyto!(spill_max_f32, Float32.(Array(policy.spill_max)))
+        else
+            fill!(spill_max_f32, Float32(Inf))
+        end
     end
 
     function _act_deriv!(σ_prime, output)
@@ -231,20 +386,60 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
     _comb_in    = similar(x0_buf, Float32, n_h + nHyd)
     z_buf       = similar(x0_buf, Float32, nHyd)
     nn_out_f32  = similar(x0_buf, Float32, nHyd)
+    y_norm_f32  = similar(x0_buf, Float32, nHyd)
+    lower_f32   = similar(x0_buf, Float32, nHyd)
+    upper_f32   = similar(x0_buf, Float32, nHyd)
+    scale_f32   = similar(x0_buf, Float32, nHyd)
+    dlower_dx_f32 = similar(x0_buf, Float32, nHyd)
+    dupper_dx_f32 = similar(x0_buf, Float32, nHyd)
+    dbound_dx_f32 = similar(x0_buf, Float32, nHyd)
     σ_prime_buf = similar(x0_buf, Float32, nHyd)
     λ_f32_buf   = similar(x0_buf, Float32, nHyd)
     d_xprev_buf = similar(x0_buf, Float32, nHyd)
     J_buf       = similar(x0_buf, Float64, nHyd, nHyd)
+    dbound_dx_f64 = similar(x0_buf, Float64, nHyd)
+    diag_mask   = similar(x0_buf, Float64, nHyd, nHyd)
+    diag_mask_cpu = zeros(Float64, nHyd, nHyd)
+    for r in 1:nHyd
+        diag_mask_cpu[r, r] = 1.0
+    end
+    copyto!(diag_mask, diag_mask_cpu)
     h_cache     = similar(x0_buf, Float32, n_h, T)
     h_cache_dirty = Ref(true)
+
+    function _reachable_bounds!(inflow, x_prev)
+        K32 = Float32(policy.K)
+        upper_f32 .= x_prev .+ K32 .* inflow .- K32 .* min_turn_f32
+        dupper_dx_f32 .= ifelse.(upper_f32 .<= max_vol_f32, 1f0, 0f0)
+        upper_f32 .= min.(max_vol_f32, upper_f32)
+
+        if has_spill_cap
+            lower_f32 .= x_prev .+ K32 .* inflow .- K32 .* max_turn_f32 .- spill_max_f32
+            dlower_dx_f32 .= ifelse.(lower_f32 .>= min_vol_f32, 1f0, 0f0)
+            lower_f32 .= max.(min_vol_f32, lower_f32)
+        else
+            lower_f32 .= min_vol_f32
+            fill!(dlower_dx_f32, 0f0)
+        end
+
+        dupper_dx_f32 .= ifelse.(upper_f32 .< lower_f32, dlower_dx_f32, dupper_dx_f32)
+        upper_f32 .= max.(upper_f32, lower_f32)
+        scale_f32 .= upper_f32 .- lower_f32
+        return nothing
+    end
 
     function _combiner_fwd!(nn_out, h, x_prev)
         _comb_in[1:n_h]     .= h
         _comb_in[n_h+1:end] .= x_prev
         mul!(z_buf, combiner.weight, _comb_in)
         z_buf .+= combiner.bias
-        _activation!(nn_out, z_buf)
-        nn_out .= output_lower_f32 .+ output_scale_f32 .* nn_out
+        _activation!(y_norm_f32, z_buf)
+        if reachable_policy
+            _reachable_bounds!(infl_f32, x_prev)
+            nn_out .= lower_f32 .+ scale_f32 .* y_norm_f32
+        else
+            nn_out .= output_lower_f32 .+ output_scale_f32 .* y_norm_f32
+        end
         return nn_out
     end
 
@@ -253,10 +448,20 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
         _comb_in[n_h+1:end] .= x_prev
         mul!(z_buf, combiner.weight, _comb_in)
         z_buf .+= combiner.bias
-        _activation!(nn_out_f32, z_buf)
-        _act_deriv!(σ_prime_buf, nn_out_f32)
-        σ_prime_buf .*= output_scale_f32
+        _activation!(y_norm_f32, z_buf)
+        _act_deriv!(σ_prime_buf, y_norm_f32)
+        if reachable_policy
+            _reachable_bounds!(infl_f32, x_prev)
+            σ_prime_buf .*= scale_f32
+        else
+            σ_prime_buf .*= output_scale_f32
+        end
         J_buf .= reshape(σ_prime_buf, :, 1) .* W_state
+        if reachable_policy
+            dbound_dx_f32 .= dlower_dx_f32 .+ y_norm_f32 .* (dupper_dx_f32 .- dlower_dx_f32)
+            dbound_dx_f64 .= dbound_dx_f32
+            J_buf .+= reshape(dbound_dx_f64, :, 1) .* diag_mask
+        end
         return nothing
     end
 
@@ -280,6 +485,7 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
         _ensure_h_cache!()
         x0_f32 .= view(x0_buf, 1:nHyd)
         for t in 1:T
+            infl_f32 .= view(inflow_buf, _inflow(t))
             if t == 1
                 x_prev_f32 .= x0_f32
             else
@@ -290,9 +496,13 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
 
             c_t  = view(c, _crow(t))
             r_v  = view(xv, _res(t+1))
-            dp_v = view(xv, _dp(t))
-            dn_v = view(xv, _dn(t))
-            c_t .= nn_out_f32 .- r_v .- dp_v .+ dn_v
+            if strict_targets
+                c_t .= nn_out_f32 .- r_v
+            else
+                dp_v = view(xv, _dp(t))
+                dn_v = view(xv, _dn(t))
+                c_t .= nn_out_f32 .- r_v .- dp_v .+ dn_v
+            end
         end
         return nothing
     end
@@ -301,6 +511,7 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
         _ensure_h_cache!()
         copyto!(vals, const_jac_dev)
         for t in 2:T
+            infl_f32 .= view(inflow_buf, _inflow(t))
             x_prev_f32 .= view(xv, _res(t))
             h = view(h_cache, :, t)
             _combiner_jac!(J_buf, σ_prime_buf, h, x_prev_f32)
@@ -317,21 +528,35 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
         for t in 1:T
             λ_f64 = view(λ, _crow(t))
             view(Jtv, _res(t+1)) .-= λ_f64
-            view(Jtv, _dp(t))    .-= λ_f64
-            view(Jtv, _dn(t))    .+= λ_f64
+            if !strict_targets
+                view(Jtv, _dp(t)) .-= λ_f64
+                view(Jtv, _dn(t)) .+= λ_f64
+            end
             if t > 1
                 h = view(h_cache, :, t)
+                infl_f32 .= view(inflow_buf, _inflow(t))
                 x_prev_f32 .= view(xv, _res(t))
                 _comb_in[1:n_h]     .= h
                 _comb_in[n_h+1:end] .= x_prev_f32
                 mul!(z_buf, combiner.weight, _comb_in)
                 z_buf .+= combiner.bias
-                _activation!(nn_out_f32, z_buf)
-                _act_deriv!(σ_prime_buf, nn_out_f32)
-                σ_prime_buf .*= output_scale_f32
+                _activation!(y_norm_f32, z_buf)
+                _act_deriv!(σ_prime_buf, y_norm_f32)
+                if reachable_policy
+                    _reachable_bounds!(infl_f32, x_prev_f32)
+                    σ_prime_buf .*= scale_f32
+                    dbound_dx_f32 .= dlower_dx_f32 .+
+                                      y_norm_f32 .* (dupper_dx_f32 .- dlower_dx_f32)
+                else
+                    σ_prime_buf .*= output_scale_f32
+                    fill!(dbound_dx_f32, 0f0)
+                end
                 λ_f32_buf .= λ_f64
                 σ_prime_buf .*= λ_f32_buf
                 mul!(d_xprev_buf, W_state', σ_prime_buf)
+                if reachable_policy
+                    d_xprev_buf .+= dbound_dx_f32 .* λ_f32_buf
+                end
                 view(Jtv, _res(t)) .+= d_xprev_buf
             end
         end
@@ -367,6 +592,7 @@ function _build_embedded_dc_hydro_de(
     demand_matrix = nothing,
     deficit_cost::Union{Nothing,Real} = nothing,
     load_scaler::Real = 1.0,
+    strict_targets::Bool = false,
 )
     nBus    = power_data.nBus
     nGen    = power_data.nGen
@@ -420,13 +646,15 @@ function _build_embedded_dc_hydro_de(
     spill = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
     var_offset += T * nHyd
 
-    dp_start = var_offset + 1
-    delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
-    var_offset += T * nHyd
+    dp_start = strict_targets ? 0 : var_offset + 1
+    delta_pos = strict_targets ? nothing :
+        ExaModels.variable(core, T * nHyd; lvar = float_type(0))
+    var_offset += strict_targets ? 0 : T * nHyd
 
-    dn_start = var_offset + 1
-    delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
-    var_offset += T * nHyd
+    dn_start = strict_targets ? 0 : var_offset + 1
+    delta_neg = strict_targets ? nothing :
+        ExaModels.variable(core, T * nHyd; lvar = float_type(0))
+    var_offset += strict_targets ? 0 : T * nHyd
 
     nvar_total = var_offset
 
@@ -460,12 +688,14 @@ function _build_embedded_dc_hydro_de(
     )
 
     delta_items = [(idx = _ri(nHyd, t, r),) for t in 1:T for r in 1:nHyd]
-    ExaModels.objective(core,
-        p_penalty_half[item.idx] * (delta_pos[item.idx] - delta_neg[item.idx])^2
-        for item in delta_items
-    )
+    if !strict_targets
+        ExaModels.objective(core,
+            p_penalty_half[item.idx] * (delta_pos[item.idx] - delta_neg[item.idx])^2
+            for item in delta_items
+        )
+    end
 
-    if use_l1
+    if !strict_targets && use_l1
         ExaModels.objective(core,
             p_penalty_l1[item.idx] * (delta_pos[item.idx] + delta_neg[item.idx])
             for item in delta_items
@@ -591,7 +821,8 @@ function _build_embedded_dc_hydro_de(
         KernelAbstractions.zeros(backend, Float64, nHyd)
 
     oracle, h_cache_dirty = _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
-                                  nvar_total, inflow_buf, x0_buf)
+                                  nvar_total, inflow_buf, x0_buf;
+                                  strict_targets = strict_targets)
     ExaModels.constraint(core, oracle)
     target_con_range = (n_con + 1):(n_con + T * nHyd)
 
@@ -607,6 +838,7 @@ function _build_embedded_dc_hydro_de(
         :dc, target_con_range,
         res_start, dp_start, dn_start, nvar_total,
         inflow_buf, x0_buf, h_cache_dirty,
+        strict_targets,
     )
 end
 
@@ -625,6 +857,7 @@ function _build_embedded_ac_hydro_de(
     reactive_demand_matrix = nothing,
     deficit_cost::Union{Nothing,Real} = nothing,
     load_scaler::Real = 1.0,
+    strict_targets::Bool = false,
 )
     nBus    = power_data.nBus
     nGen    = power_data.nGen
@@ -695,13 +928,15 @@ function _build_embedded_ac_hydro_de(
     spill = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
     var_offset += T * nHyd
 
-    dp_start = var_offset + 1
-    delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
-    var_offset += T * nHyd
+    dp_start = strict_targets ? 0 : var_offset + 1
+    delta_pos = strict_targets ? nothing :
+        ExaModels.variable(core, T * nHyd; lvar = float_type(0))
+    var_offset += strict_targets ? 0 : T * nHyd
 
-    dn_start = var_offset + 1
-    delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
-    var_offset += T * nHyd
+    dn_start = strict_targets ? 0 : var_offset + 1
+    delta_neg = strict_targets ? nothing :
+        ExaModels.variable(core, T * nHyd; lvar = float_type(0))
+    var_offset += strict_targets ? 0 : T * nHyd
 
     nvar_total = var_offset
 
@@ -743,11 +978,13 @@ function _build_embedded_ac_hydro_de(
     )
 
     delta_items = [(idx = _ri(nHyd, t, r),) for t in 1:T for r in 1:nHyd]
-    ExaModels.objective(core,
-        p_penalty_half[item.idx] * (delta_pos[item.idx] - delta_neg[item.idx])^2
-        for item in delta_items
-    )
-    if use_l1
+    if !strict_targets
+        ExaModels.objective(core,
+            p_penalty_half[item.idx] * (delta_pos[item.idx] - delta_neg[item.idx])^2
+            for item in delta_items
+        )
+    end
+    if !strict_targets && use_l1
         ExaModels.objective(core,
             p_penalty_l1[item.idx] * (delta_pos[item.idx] + delta_neg[item.idx])
             for item in delta_items
@@ -939,7 +1176,8 @@ function _build_embedded_ac_hydro_de(
         KernelAbstractions.zeros(backend, Float64, nHyd)
 
     oracle, h_cache_dirty = _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
-                                  nvar_total, inflow_buf, x0_buf)
+                                  nvar_total, inflow_buf, x0_buf;
+                                  strict_targets = strict_targets)
     ExaModels.constraint(core, oracle)
     target_con_range = (n_con + 1):(n_con + T * nHyd)
 
@@ -955,6 +1193,7 @@ function _build_embedded_ac_hydro_de(
         :ac_polar, target_con_range,
         res_start, dp_start, dn_start, nvar_total,
         inflow_buf, x0_buf, h_cache_dirty,
+        strict_targets,
     )
 end
 

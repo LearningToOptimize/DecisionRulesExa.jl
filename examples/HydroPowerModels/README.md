@@ -144,6 +144,85 @@ increasing target leakage and worsens the no-target objective gap.
 | 126 | 8 | 0.97 | 375477.644 | -861.990 | 2.86e-4 | 4.47e-3 |
 | 126 | 8 | 0.95 | 375175.342 | -1164.292 | 4.89e-4 | 1.55e-2 |
 
+### Strict embedded hydro targets
+
+The embedded hydro builder also supports a strict target mode:
+
+```julia
+policy = hydro_reachable_policy(hydro_data, LAYERS;
+                                activation = sigmoid,
+                                encoder_type = Flux.LSTM)
+
+prob = build_embedded_hydro_de(policy, power_data, hydro_data, T;
+    formulation = :ac_polar,
+    strict_targets = true,
+)
+```
+
+The training script exposes the same path with:
+
+```bash
+export DR_STRICT_EMBEDDED_TARGETS=true
+julia --project -t auto train_hydro_exa_embedded.jl
+```
+
+In strict mode the embedded oracle enforces
+
+```text
+reservoir[t+1, r] = pi_theta(inflow[t], reservoir[t])[r]
+```
+
+directly. No `delta_pos`, `delta_neg`, L2 target penalty, or L1 target penalty
+is created for the target equality. This is intended for closed-loop embedded
+training only: the policy is evaluated with the realized previous reservoir
+state, so it can produce a physically reachable next reservoir by construction.
+
+For the current hydro water balance,
+
+```text
+x[t+1, r] = x[t, r] - K*outflow[t, r] - spill[t, r]
+            + K*inflow[t, r] + upstream_contributions[t, r],
+```
+
+the helper maps the network's normalized output `y in [0, 1]` into a conservative
+one-stage reachable interval:
+
+```text
+upper_r = min(max_vol_r, x_r + K*inflow_r - K*min_turn_r)
+
+lower_r = min_vol_r
+```
+
+The lower bound is `min_vol` because this data model has nonnegative spill with
+no finite upper bound. If a user supplies finite spill caps through
+`spill_max`, the helper instead uses:
+
+```text
+lower_r = max(min_vol_r,
+              x_r + K*inflow_r - K*max_turn_r - spill_max_r)
+```
+
+and still emits:
+
+```text
+target_r = lower_r + (upper_r - lower_r) * y_r.
+```
+
+This is a smooth affine map in the network output, so incoming gradients are not
+destroyed by post-hoc clipping. During the actor update, the reachability bounds
+are treated as constants because they depend on realized state, inflow, and case
+limits rather than trainable weights; the incoming adjoint still reaches the
+network as `(upper_r - lower_r) * adjoint_r`. The bound derivatives with respect
+to the previous reservoir state are included in the embedded oracle Jacobian and
+VJP for the NLP solve.
+
+The helper is deliberately conservative for cascaded reservoirs: it does not
+rely on optional upstream releases to make a target feasible. If a new hydro
+case has finite spill limits, nonlinear transition physics, travel times, or
+other coupled state-transition constraints, the strict option should only be
+used after providing a case-specific reachable-set map. Otherwise keep the
+slack-penalty builder and tune the target penalty.
+
 ### Training features
 
 - **Penalty scheduling**: default is constant multiplier `8.0` on top of the

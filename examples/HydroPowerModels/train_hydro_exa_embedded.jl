@@ -44,7 +44,7 @@ const NUM_EPOCHS  = parse(Int, get(ENV, "DR_NUM_EPOCHS", "80"))
 const NUM_BATCHES = 100
 const NUM_TRAIN_PER_BATCH = 1
 const NUM_EVAL_SCENARIOS  = 4
-const EVAL_EVERY  = 25
+const EVAL_EVERY  = parse(Int, get(ENV, "DR_EVAL_EVERY", "50"))
 const LR          = 1f-3
 
 const TARGET_PEN_ARG = :auto
@@ -54,6 +54,7 @@ const load_scaler    = 0.6
 
 const PRETRAIN_ITERS       = parse(Int, get(ENV, "DR_PRETRAIN_ITERS", "0"))
 const PRETRAIN_PENALTY_MULT = parse(Float64, get(ENV, "DR_PRETRAIN_PENALTY_MULT", "0.1"))
+const STRICT_EMBEDDED_TARGETS = parse(Bool, get(ENV, "DR_STRICT_EMBEDDED_TARGETS", "false"))
 
 const DISCOUNT_GAMMA = parse(Float64, get(ENV, "DR_DISCOUNT_GAMMA", "1.0"))
 const ROLLOUT_PARALLEL = parse(Bool, get(ENV, "DR_ROLLOUT_PARALLEL", "false"))
@@ -82,7 +83,8 @@ else
 end
 
 const USE_GPU = parse(Bool, get(ENV, "DR_USE_GPU", "true"))
-const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = 9000)
+const MAX_ITER = parse(Int, get(ENV, "DR_MAX_ITER", "9000"))
+const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = MAX_ITER)
 
 const _DISC_TAG    = DISCOUNT_GAMMA < 1.0 ? "-disc$(replace(string(DISCOUNT_GAMMA), "." => ""))" : ""
 const _SCHED_TAG   = if _PENALTY_MODE == "annealed"
@@ -95,7 +97,8 @@ end
 const _PRETRAIN_TAG = PRETRAIN_ITERS > 0 ? "-pre$(PRETRAIN_ITERS)" : ""
 const _GPU_TAG     = USE_GPU ? "-gpu" : ""
 const _LAYER_TAG   = LAYERS == [128, 128] ? "" : "-L$(join(LAYERS, "_"))"
-const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-embedded$(_GPU_TAG)$(_SCHED_TAG)$(_DISC_TAG)$(_LAYER_TAG)$(_PRETRAIN_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
+const _STRICT_TAG = STRICT_EMBEDDED_TARGETS ? "-strict" : ""
+const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-embedded$(_GPU_TAG)$(_SCHED_TAG)$(_DISC_TAG)$(_LAYER_TAG)$(_PRETRAIN_TAG)$(_STRICT_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
 const MODEL_DIR = joinpath(CASE_DIR, FORM_LABEL, "models")
 mkpath(MODEL_DIR)
 const MODEL_PATH = joinpath(MODEL_DIR, RUN_NAME * ".jld2")
@@ -145,10 +148,17 @@ end
 # ── Policy ────────────────────────────────────────────────────────────────────
 
 Random.seed!(42)
-policy = bounded_state_policy(nHyd, target_lower, target_upper, LAYERS;
-                              activation   = ACTIVATION,
-                              encoder_type = Flux.LSTM,
-                              active_mask  = trues(nHyd))
+policy = if STRICT_EMBEDDED_TARGETS
+    @info "Using strict embedded hydro policy with one-stage reachable target bounds"
+    hydro_reachable_policy(hydro_data, LAYERS;
+                           activation   = ACTIVATION,
+                           encoder_type = Flux.LSTM)
+else
+    bounded_state_policy(nHyd, target_lower, target_upper, LAYERS;
+                         activation   = ACTIVATION,
+                         encoder_type = Flux.LSTM,
+                         active_mask  = trues(nHyd))
+end
 
 # ── Optional pretrain with regular TSDDR ──────────────────────────────────────
 
@@ -212,8 +222,9 @@ prob_emb = build_embedded_hydro_de(policy, power_data, hydro_data, T;
     deficit_cost   = DEFICIT_COST,
     demand_matrix  = demand_mat,
     load_scaler    = load_scaler,
+    strict_targets = STRICT_EMBEDDED_TARGETS,
 )
-@info "  nvar=$(prob_emb._nvar)  oracle_cons=$(length(prob_emb.target_con_range))"
+@info "  nvar=$(prob_emb._nvar)  oracle_cons=$(length(prob_emb.target_con_range))  strict_targets=$(prob_emb.strict_targets)"
 
 resolved_pen_l1 = prob_emb.base_penalty_l1
 
@@ -255,6 +266,7 @@ lg = WandbLogger(
         "discount_gamma"  => DISCOUNT_GAMMA,
         "pretrain_iters"  => PRETRAIN_ITERS,
         "pretrain_penalty_mult" => PRETRAIN_PENALTY_MULT,
+        "strict_embedded_targets" => STRICT_EMBEDDED_TARGETS,
     ),
 )
 
@@ -315,21 +327,6 @@ rollout_evaluation = RolloutEvaluation(
     madnlp_kwargs = SOLVER_KWARGS,
     warmstart = false,
     stride = EVAL_EVERY,
-    policy_state = :target,
-    stage_problem_pool = rollout_pool,
-    retry_on_failure = true,
-    active_scenarios = NUM_EVAL_SCENARIOS,
-    state_bounds = (_min_vols_dev, _max_vols_dev),
-)
-realized_rollout_evaluation = RolloutEvaluation(
-    rollout_prob, x0_init, eval_scenarios;
-    horizon = T_ROLLOUT, n_uncertainty = nHyd,
-    set_stage_parameters! = set_hydro_rollout_stage!,
-    realized_state = hydro_realized_state,
-    objective_no_target_penalty = hydro_objective_no_target_penalty,
-    madnlp_kwargs = SOLVER_KWARGS,
-    warmstart = false,
-    stride = EVAL_EVERY,
     policy_state = :realized,
     stage_problem_pool = rollout_pool,
     retry_on_failure = true,
@@ -352,6 +349,25 @@ function _schedule_value(schedule, iter, default)
 end
 
 current_penalty_mult = Ref(NaN)
+last_batch_stats = Ref(Dict{String, Any}())
+
+function _merge_batch_stats!(metrics, stats)
+    isempty(stats) && return metrics
+    metrics["metrics/train_n_ok"] = get(stats, "n_ok", 0)
+    metrics["metrics/train_n_total"] = get(stats, "n_total", 0)
+    metrics["metrics/train_success_share"] =
+        get(stats, "n_total", 0) == 0 ? NaN : get(stats, "n_ok", 0) / get(stats, "n_total", 0)
+    for (k, v) in get(stats, "status_counts", Dict{String, Int}())
+        metrics["metrics/train_status/$k"] = v
+    end
+    for (k, v) in get(stats, "failure_counts", Dict{String, Int}())
+        metrics["metrics/train_failure/$k"] = v
+    end
+    for (k, v) in get(stats, "retry_counts", Dict{String, Int}())
+        metrics["metrics/train_retry/$k"] = v
+    end
+    return metrics
+end
 
 @info "Starting embedded training: $(NUM_EPOCHS) epochs × $(NUM_BATCHES) batches"
 
@@ -364,37 +380,47 @@ train_tsddr_embedded(
     madnlp_kwargs       = SOLVER_KWARGS,
     warmstart           = true,
     get_realized_states = embedded_hydro_realized_states,
+    batch_diagnostics = (iter, stats) -> begin
+        last_batch_stats[] = stats
+        n_ok = get(stats, "n_ok", 0)
+        n_total = get(stats, "n_total", 0)
+        if n_ok < n_total
+            @warn "Embedded training solve failures at iter $iter" n_ok n_total status_counts=get(stats, "status_counts", nothing) failure_counts=get(stats, "failure_counts", nothing) retry_counts=get(stats, "retry_counts", nothing)
+        elseif iter % 10 == 0
+            @info "Embedded training solve status at iter $iter" n_ok n_total status_counts=get(stats, "status_counts", nothing) retry_counts=get(stats, "retry_counts", nothing)
+        end
+    end,
     adjust_hyperparameters = (iter, opt_state, n) -> begin
         mult = _schedule_value(PENALTY_SCHEDULE, iter, last(PENALTY_SCHEDULE)[3])
         if mult != current_penalty_mult[]
             current_penalty_mult[] = mult
-            ρ_half_scaled = prob_emb.base_penalty_half * mult
-            ρ_l1_scaled   = prob_emb.base_penalty_l1 * mult
-            penalty_vals    = ρ_half_scaled .* _discount_weights
-            penalty_l1_vals = ρ_l1_scaled   .* _discount_weights
-            ExaModels.set_parameter!(prob_emb.core, prob_emb.p_penalty_half, penalty_vals)
-            ExaModels.set_parameter!(prob_emb.core, prob_emb.p_penalty_l1,   penalty_l1_vals)
-            @info "Penalty multiplier → $mult  (ρ/2 = $(round(ρ_half_scaled; digits=2)), λ_l1 = $(round(ρ_l1_scaled; digits=2)), γ=$DISCOUNT_GAMMA)"
+            if STRICT_EMBEDDED_TARGETS
+                @info "Strict target equality active; target slack penalties are not used"
+            else
+                ρ_half_scaled = prob_emb.base_penalty_half * mult
+                ρ_l1_scaled   = prob_emb.base_penalty_l1 * mult
+                penalty_vals    = ρ_half_scaled .* _discount_weights
+                penalty_l1_vals = ρ_l1_scaled   .* _discount_weights
+                ExaModels.set_parameter!(prob_emb.core, prob_emb.p_penalty_half, penalty_vals)
+                ExaModels.set_parameter!(prob_emb.core, prob_emb.p_penalty_l1,   penalty_l1_vals)
+                @info "Penalty multiplier → $mult  (ρ/2 = $(round(ρ_half_scaled; digits=2)), λ_l1 = $(round(ρ_l1_scaled; digits=2)), γ=$DISCOUNT_GAMMA)"
+            end
         end
         return n
     end,
     record_loss = (iter, m, loss, tag) -> begin
         metrics = Dict{String, Any}(tag => loss, "batch" => iter)
+        _merge_batch_stats!(metrics, last_batch_stats[])
         isfinite(loss) && push!(epoch_losses, loss)
 
         if iter % EVAL_EVERY == 0
             rollout_evaluation(iter, m)
-            realized_rollout_evaluation(iter, m)
             metrics["metrics/rollout_objective_no_target_penalty"] =
                 rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_target_violation_share"] =
                 rollout_evaluation.last_violation_share
-            metrics["metrics/rollout_realized_objective_no_target_penalty"] =
-                realized_rollout_evaluation.last_objective_no_target_penalty
-            metrics["metrics/rollout_realized_target_violation_share"] =
-                realized_rollout_evaluation.last_violation_share
             metrics["metrics/rollout_n_ok"] =
-                realized_rollout_evaluation.last_n_ok
+                rollout_evaluation.last_n_ok
         end
 
         if !isnan(current_penalty_mult[])

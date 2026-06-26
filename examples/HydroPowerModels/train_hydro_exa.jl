@@ -40,9 +40,9 @@ const NUM_EPOCHS  = parse(Int, get(ENV, "DR_NUM_EPOCHS", "80"))
 const NUM_BATCHES = 100
 const NUM_TRAIN_PER_BATCH = 1
 const NUM_EVAL_SCENARIOS  = 4
-const EVAL_EVERY  = 25
+const EVAL_EVERY  = parse(Int, get(ENV, "DR_EVAL_EVERY", "50"))
 const LR          = 1f-3
-const GRAD_CLIP   = parse(Float32, get(ENV, "DR_GRAD_CLIP", "10"))
+const GRAD_CLIP   = parse(Float32, get(ENV, "DR_GRAD_CLIP", "0"))
 
 const TARGET_PEN_ARG = :auto
 const HYDRO_TARGET_PENALTY_MULT = parse(Float64, get(ENV, "DR_TARGET_PENALTY_MULT", "8.0"))
@@ -82,7 +82,8 @@ end
 const NUM_TRAIN_SCHEDULE = nothing  # e.g. [(1,500,1),(501,2000,4),(2001,4000,8)]
 const EVAL_SCHEDULE      = nothing  # e.g. [(1,2000,4),(2001,4000,32)]
 
-const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = 9000)
+const MAX_ITER = parse(Int, get(ENV, "DR_MAX_ITER", "9000"))
+const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = MAX_ITER)
 
 const _CLIP_TAG  = GRAD_CLIP > 0 ? "-clip$(Int(GRAD_CLIP))" : ""
 const _DISC_TAG  = DISCOUNT_GAMMA < 1.0 ? "-disc$(replace(string(DISCOUNT_GAMMA), "." => ""))" : ""
@@ -305,24 +306,6 @@ rollout_evaluation = RolloutEvaluation(
     active_scenarios = NUM_EVAL_SCENARIOS,
     state_bounds = (_min_vols_dev, _max_vols_dev),
 )
-realized_rollout_evaluation = RolloutEvaluation(
-    rollout_prob,
-    x0_init,
-    eval_scenarios;
-    horizon = T_ROLLOUT,
-    n_uncertainty = nHyd,
-    set_stage_parameters! = set_hydro_rollout_stage!,
-    realized_state = hydro_realized_state,
-    objective_no_target_penalty = hydro_objective_no_target_penalty,
-    madnlp_kwargs = SOLVER_KWARGS,
-    warmstart = false,
-    stride = EVAL_EVERY,
-    policy_state = :realized,
-    stage_problem_pool = rollout_pool,
-    retry_on_failure = true,
-    active_scenarios = NUM_EVAL_SCENARIOS,
-    state_bounds = (_min_vols_dev, _max_vols_dev),
-)
 
 Random.seed!(8788)
 
@@ -334,6 +317,25 @@ function _schedule_value(schedule, iter, default)
 end
 
 current_penalty_mult = Ref(NaN)
+last_batch_stats = Ref(Dict{String, Any}())
+
+function _merge_batch_stats!(metrics, stats)
+    isempty(stats) && return metrics
+    metrics["metrics/train_n_ok"] = get(stats, "n_ok", 0)
+    metrics["metrics/train_n_total"] = get(stats, "n_total", 0)
+    metrics["metrics/train_success_share"] =
+        get(stats, "n_total", 0) == 0 ? NaN : get(stats, "n_ok", 0) / get(stats, "n_total", 0)
+    for (k, v) in get(stats, "status_counts", Dict{String, Int}())
+        metrics["metrics/train_status/$k"] = v
+    end
+    for (k, v) in get(stats, "failure_counts", Dict{String, Int}())
+        metrics["metrics/train_failure/$k"] = v
+    end
+    for (k, v) in get(stats, "retry_counts", Dict{String, Int}())
+        metrics["metrics/train_retry/$k"] = v
+    end
+    return metrics
+end
 
 train_tsddr(
     policy,
@@ -353,6 +355,16 @@ train_tsddr(
     madnlp_kwargs        = SOLVER_KWARGS,
     warmstart            = true,
     problem_pool         = problem_pool,
+    batch_diagnostics    = (iter, stats) -> begin
+        last_batch_stats[] = stats
+        n_ok = get(stats, "n_ok", 0)
+        n_total = get(stats, "n_total", 0)
+        if n_ok < n_total
+            @warn "Training solve failures at iter $iter" n_ok n_total status_counts=get(stats, "status_counts", nothing) failure_counts=get(stats, "failure_counts", nothing) retry_counts=get(stats, "retry_counts", nothing)
+        elseif iter % 10 == 0
+            @info "Training solve status at iter $iter" n_ok n_total status_counts=get(stats, "status_counts", nothing) retry_counts=get(stats, "retry_counts", nothing)
+        end
+    end,
     adjust_hyperparameters = (iter, opt_state, n) -> begin
         mult = _schedule_value(PENALTY_SCHEDULE, iter, last(PENALTY_SCHEDULE)[3])
         if mult != current_penalty_mult[]
@@ -370,31 +382,24 @@ train_tsddr(
         if !isnothing(EVAL_SCHEDULE)
             n_eval = _schedule_value(EVAL_SCHEDULE, iter, NUM_EVAL_SCENARIOS)
             rollout_evaluation.active_scenarios = n_eval
-            realized_rollout_evaluation.active_scenarios = n_eval
         end
         return isnothing(NUM_TRAIN_SCHEDULE) ? n : _schedule_value(NUM_TRAIN_SCHEDULE, iter, n)
     end,
     record_loss          = (iter, m, loss, tag) -> begin
         metrics = Dict{String, Any}(tag => loss, "batch" => iter)
+        _merge_batch_stats!(metrics, last_batch_stats[])
         isfinite(loss) && push!(epoch_losses, loss)
 
         if iter % EVAL_EVERY == 0
             rollout_evaluation(iter, m)
-            realized_rollout_evaluation(iter, m)
             metrics["metrics/rollout_objective_no_target_penalty"] =
                 rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_objective_no_deficit"] =
                 rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_target_violation_share"] =
                 rollout_evaluation.last_violation_share
-            metrics["metrics/rollout_realized_objective_no_target_penalty"] =
-                realized_rollout_evaluation.last_objective_no_target_penalty
-            metrics["metrics/rollout_realized_objective_no_deficit"] =
-                realized_rollout_evaluation.last_objective_no_target_penalty
-            metrics["metrics/rollout_realized_target_violation_share"] =
-                realized_rollout_evaluation.last_violation_share
             metrics["metrics/rollout_n_ok"] =
-                realized_rollout_evaluation.last_n_ok
+                rollout_evaluation.last_n_ok
         end
 
         if !isnan(current_penalty_mult[])
