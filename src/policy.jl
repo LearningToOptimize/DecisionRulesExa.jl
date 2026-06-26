@@ -179,25 +179,24 @@ Flux.@layer ConstantStatePolicy trainable=()
 Flux.reset!(::ConstantStatePolicy) = nothing
 
 """
-    FixedOutputPolicy(policy, output_template, output_indices)
+    FixedOutputPolicy(policy, output_template, output_expansion)
 
 Wrap a policy that predicts only active target dimensions and expand its output
-to the full state-target vector by filling inactive dimensions from
-`output_template`.
+to the full state-target vector. `output_template` stores constants for
+inactive dimensions and zeros for active dimensions; `output_expansion` maps
+active outputs into the full state vector without mutation.
 """
-struct FixedOutputPolicy{P,O,I}
+struct FixedOutputPolicy{P,O,E}
     policy::P
     output_template::O
-    output_indices::I
+    output_expansion::E
 end
 
 Flux.@layer FixedOutputPolicy trainable=(policy,)
 
 function (m::FixedOutputPolicy)(input)
     y = m.policy(input)
-    out = _adapt_policy_bound(m.output_template, y)
-    out[m.output_indices] .= y
-    return out
+    return m.output_template .+ m.output_expansion * y
 end
 
 Flux.reset!(m::FixedOutputPolicy) = Flux.reset!(m.policy)
@@ -262,5 +261,11 @@ function bounded_state_policy(
         encoder_type = encoder_type,
         output_bounds = (lower[idx], upper[idx]),
     )
-    return FixedOutputPolicy(active_policy, collect(fixed_values), collect(idx))
+    template = collect(fixed_values)
+    template[idx] .= zero(eltype(template))
+    expansion = zeros(eltype(template), n_state, length(idx))
+    for (j, i) in enumerate(idx)
+        expansion[i, j] = one(eltype(template))
+    end
+    return FixedOutputPolicy(active_policy, template, expansion)
 end

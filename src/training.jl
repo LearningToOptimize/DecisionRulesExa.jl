@@ -252,11 +252,15 @@ function _critic_sample_from_rollout(
 )
     # Keep both rollout objective variants available; target.objective_value
     # below selects which one is used as the critic value target.
+    rollout_len = target.horizon * target.n_uncertainty
+    length(w_flat) >= rollout_len ||
+        error("rollout critic uncertainty has length $(length(w_flat)); expected at least $rollout_len")
+    w_rollout = view(w_flat, 1:rollout_len)
     result = rollout_tsddr(
         model,
         initial_state,
         target.stage_problem,
-        w_flat;
+        w_rollout;
         horizon = target.horizon,
         n_uncertainty = target.n_uncertainty,
         set_stage_parameters! = target.set_stage_parameters!,
@@ -269,13 +273,15 @@ function _critic_sample_from_rollout(
         reuse_solver = target.reuse_solver,
         state_bounds = target.state_bounds,
         project_state = target.project_state,
+        retry_on_failure = target.retry_on_failure,
     )
     result === nothing && return nothing
 
     objective = target.objective_value === :objective ?
         result.objective : result.objective_no_target_penalty
     xhat_flat = F.(vcat(result.target_trajectory...))
-    return CriticSample(F.(initial_state), F.(w_flat), xhat_flat, objective, F.(lambda))
+    λ_rollout = view(lambda, 1:length(xhat_flat))
+    return CriticSample(F.(initial_state), F.(w_rollout), xhat_flat, objective, F.(λ_rollout))
 end
 
 function _rollout_critic_samples(
@@ -670,7 +676,6 @@ function train_tsddr(
             grad = materialize_tangent(gs[1])
             if grad !== nothing && _all_finite_gradient(grad)
                 Flux.update!(opt_state, model, grad)
-                invalidate_policy_cache!(embedded_de)
             end
         end
 

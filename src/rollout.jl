@@ -95,6 +95,7 @@ function rollout_tsddr(
     reuse_solver::Bool = false,
     state_bounds = nothing,
     project_state = nothing,
+    retry_on_failure::Bool = true,
 )
     horizon >= 1 || throw(ArgumentError("horizon must be >= 1"))
     n_uncertainty >= 1 || throw(ArgumentError("n_uncertainty must be >= 1"))
@@ -152,10 +153,32 @@ function rollout_tsddr(
             )
         end
 
+        if retry_on_failure && (!solve_succeeded(result) || !isfinite(result.objective))
+            retry_state = _make_solver(stage_problem.model, madnlp_kwargs)
+            result = _solve!(
+                retry_state,
+                stage_problem.model;
+                warmstart = false,
+                madnlp_kwargs = madnlp_kwargs,
+            )
+        end
+
         solve_succeeded(result) || return nothing
         isfinite(result.objective) || return nothing
 
         no_penalty = objective_no_target_penalty(stage_problem, result)
+        if retry_on_failure && !isfinite(no_penalty)
+            retry_state = _make_solver(stage_problem.model, madnlp_kwargs)
+            result = _solve!(
+                retry_state,
+                stage_problem.model;
+                warmstart = false,
+                madnlp_kwargs = madnlp_kwargs,
+            )
+            solve_succeeded(result) || return nothing
+            isfinite(result.objective) || return nothing
+            no_penalty = objective_no_target_penalty(stage_problem, result)
+        end
         isfinite(no_penalty) || return nothing
 
         objective += result.objective
@@ -193,6 +216,7 @@ mutable struct RolloutEvaluation <: Function
     reuse_solver::Bool
     state_bounds
     project_state
+    retry_on_failure::Bool
     stage_problem_pool::Vector   # pool of stage problems for parallel evaluation
     active_scenarios::Int        # how many scenarios to evaluate (≤ length(scenarios))
     last_objective::Float64
@@ -218,6 +242,7 @@ function RolloutEvaluation(
     reuse_solver::Bool = false,
     state_bounds = nothing,
     project_state = nothing,
+    retry_on_failure::Bool = true,
     stage_problem_pool::Vector = [],
     active_scenarios::Int = length(scenarios),
 )
@@ -243,6 +268,7 @@ function RolloutEvaluation(
         reuse_solver,
         state_bounds,
         project_state,
+        retry_on_failure,
         collect(stage_problem_pool),
         active_scenarios,
         NaN,
@@ -285,6 +311,7 @@ function (evaluation::RolloutEvaluation)(iter, model)
                 reuse_solver = evaluation.reuse_solver,
                 state_bounds = evaluation.state_bounds,
                 project_state = evaluation.project_state,
+                retry_on_failure = evaluation.retry_on_failure,
             )
             result === nothing && continue
             total += result.objective
@@ -319,6 +346,7 @@ function (evaluation::RolloutEvaluation)(iter, model)
                     reuse_solver = false,
                     state_bounds = evaluation.state_bounds,
                     project_state = evaluation.project_state,
+                    retry_on_failure = evaluation.retry_on_failure,
                 )
                 push!(tasks, t)
             end

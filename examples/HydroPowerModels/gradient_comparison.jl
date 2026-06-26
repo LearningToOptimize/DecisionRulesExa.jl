@@ -5,10 +5,10 @@
 #
 # Methods:
 #   1. FD ground truth: central differences on sequential rollout (no penalty)
-#   2. DE uniform: envelope theorem with ρ_t = ρ_auto ∀t
-#   3. DE early-low: ρ_t = ρ_auto · (t/T)
-#   4. DE early-high: ρ_t = ρ_auto · (1 + α·(T-t)/(T-1))
-#   5. DE discounted: ρ_t = ρ_auto · γ^(t-1)
+#   2. DE uniform: envelope theorem with ρ_t = m·ρ_auto ∀t
+#   3. DE early-low: ρ_t = m·ρ_auto · (t/T)
+#   4. DE early-high: ρ_t = m·ρ_auto · (1 + α·(T-t)/(T-1))
+#   5. DE discounted: ρ_t = m·ρ_auto · γ^(t-1)
 #   6. Embedded TSDDR: envelope theorem from embedded NLP
 #
 # All ExaModels methods on GPU. Timing data collected throughout.
@@ -51,6 +51,7 @@ const EARLY_HIGH_ALPHAS = [2.0, 5.0, 10.0]
 const DISCOUNT_GAMMAS   = [0.95, 0.99]
 
 const TARGET_PEN_ARG = :auto
+const HYDRO_TARGET_PENALTY_MULT = parse(Float64, get(ENV, "DR_TARGET_PENALTY_MULT", "8.0"))
 const SOLVER_KWARGS  = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = 9000)
 
 @info "Config: phase=$PHASE_LABEL  T=$T  N_DIRS=$N_DIRS  N_SCENARIOS=$N_SCENARIOS  offset=$SCENARIO_OFFSET  ε=$FD_EPS  surrogate_fd=$ENABLE_SURROGATE_FD"
@@ -108,6 +109,7 @@ prob_de = build_hydro_de(power_data, hydro_data, T;
 resolved_pen = prob_de.base_penalty_half * 2
 resolved_pen_l1 = prob_de.base_penalty_l1
 @info "  ρ_auto=$(round(resolved_pen; digits=2))  ρ_l1=$(round(resolved_pen_l1; digits=2))"
+@info "  Bolivia target-penalty multiplier=$(HYDRO_TARGET_PENALTY_MULT)"
 
 @info "Building T=$T embedded GPU DE..."
 t0 = time()
@@ -203,9 +205,9 @@ hydro_realized_state(stage_prob, result) =
 function hydro_objective_no_target_penalty(stage_prob, result)
     sol = hydro_solution(stage_prob, result)
     delta = sol.delta
-    ρ_half = resolved_pen / 2
+    ρ_half = (resolved_pen / 2) * HYDRO_TARGET_PENALTY_MULT
     penalty_l2_cost = ρ_half * sum(abs2, delta)
-    penalty_l1_cost = resolved_pen_l1 * sum(abs, delta)
+    penalty_l1_cost = (resolved_pen_l1 * HYDRO_TARGET_PENALTY_MULT) * sum(abs, delta)
     return result.objective - penalty_l2_cost - penalty_l1_cost
 end
 
@@ -297,20 +299,21 @@ end
 function make_penalty_configs(ρ_auto, ρ_l1_auto, T_loc, nH)
     configs = PenaltyConfig[]
 
-    ρ_half = ρ_auto / 2
-    push!(configs, PenaltyConfig("uniform",
+    ρ_half = (ρ_auto / 2) * HYDRO_TARGET_PENALTY_MULT
+    ρ_l1 = ρ_l1_auto * HYDRO_TARGET_PENALTY_MULT
+    push!(configs, PenaltyConfig("uniform_mult$(HYDRO_TARGET_PENALTY_MULT)",
         fill(ρ_half, T_loc * nH),
-        fill(ρ_l1_auto, T_loc * nH)))
+        fill(ρ_l1, T_loc * nH)))
 
     early_low_half = [ρ_half * (t / T_loc) for t in 1:T_loc for _ in 1:nH]
-    early_low_l1   = [ρ_l1_auto * (t / T_loc) for t in 1:T_loc for _ in 1:nH]
+    early_low_l1   = [ρ_l1 * (t / T_loc) for t in 1:T_loc for _ in 1:nH]
     push!(configs, PenaltyConfig("early_low",
         early_low_half, early_low_l1))
 
     for α in EARLY_HIGH_ALPHAS
         vals_half = [ρ_half * (1 + α * (T_loc - t) / max(T_loc - 1, 1))
                      for t in 1:T_loc for _ in 1:nH]
-        vals_l1   = [ρ_l1_auto * (1 + α * (T_loc - t) / max(T_loc - 1, 1))
+        vals_l1   = [ρ_l1 * (1 + α * (T_loc - t) / max(T_loc - 1, 1))
                      for t in 1:T_loc for _ in 1:nH]
         push!(configs, PenaltyConfig("early_high_α=$α",
             vals_half, vals_l1))
@@ -318,7 +321,7 @@ function make_penalty_configs(ρ_auto, ρ_l1_auto, T_loc, nH)
 
     for γ in DISCOUNT_GAMMAS
         vals_half = [ρ_half * γ^(t-1) for t in 1:T_loc for _ in 1:nH]
-        vals_l1   = [ρ_l1_auto * γ^(t-1) for t in 1:T_loc for _ in 1:nH]
+        vals_l1   = [ρ_l1 * γ^(t-1) for t in 1:T_loc for _ in 1:nH]
         push!(configs, PenaltyConfig("discounted_γ=$γ",
             vals_half, vals_l1))
     end
@@ -734,8 +737,8 @@ for (si, w_flat) in enumerate(scenarios)
             all_sign_agree_flip[si, ci_emb] = NaN
         else
             emb_projections = Float64[dot(g_flat_emb, d) for d in directions]
-            emb_penalty_half = fill(resolved_pen / 2, T * nHyd)
-            emb_penalty_l1 = fill(resolved_pen_l1, T * nHyd)
+            emb_penalty_half = fill((resolved_pen / 2) * HYDRO_TARGET_PENALTY_MULT, T * nHyd)
+            emb_penalty_l1 = fill(resolved_pen_l1 * HYDRO_TARGET_PENALTY_MULT, T * nHyd)
             viol = target_violation_stats(sol_emb.delta, sol_emb.target_matrix;
                 penalty_half = emb_penalty_half, penalty_l1 = emb_penalty_l1,
                 state_range = state_ranges, active_state_mask = active_state_mask)
@@ -883,7 +886,7 @@ result_file = joinpath(
         T, N_DIRS, N_SCENARIOS_ACTUAL, SCENARIO_OFFSET, slurm_job, slurm_task),
 )
 scenario_global_indices = collect((SCENARIO_OFFSET + 1):(SCENARIO_OFFSET + N_SCENARIOS_ACTUAL))
-@save result_file PHASE_LABEL POLICY_PATH T N_DIRS N_SCENARIOS SCENARIO_OFFSET N_SCENARIOS_ACTUAL FD_EPS ENABLE_SURROGATE_FD CASE_NAME FORMULATION DEFICIT_COST load_scaler EARLY_HIGH_ALPHAS DISCOUNT_GAMMAS TARGET_PEN_ARG method_names scenario_global_indices all_fd_times all_de_times all_cosines all_cosines_flip all_mag_ratios all_nrmse all_scale_log10_err all_sign_agree all_sign_agree_flip all_mean_viols all_max_viols all_early_viols all_mean_rel_leaks all_early_rel_leaks all_mean_range_rel_leaks all_early_range_rel_leaks all_penalty_costs all_stage_mean_viols all_surrogate_cosines all_surrogate_cosines_flip all_surrogate_nrmse all_surrogate_scale_log10_err all_surrogate_sign_agree all_surrogate_sign_agree_flip
+@save result_file PHASE_LABEL POLICY_PATH T N_DIRS N_SCENARIOS SCENARIO_OFFSET N_SCENARIOS_ACTUAL FD_EPS ENABLE_SURROGATE_FD CASE_NAME FORMULATION DEFICIT_COST load_scaler EARLY_HIGH_ALPHAS DISCOUNT_GAMMAS TARGET_PEN_ARG HYDRO_TARGET_PENALTY_MULT method_names scenario_global_indices all_fd_times all_de_times all_cosines all_cosines_flip all_mag_ratios all_nrmse all_scale_log10_err all_sign_agree all_sign_agree_flip all_mean_viols all_max_viols all_early_viols all_mean_rel_leaks all_early_rel_leaks all_mean_range_rel_leaks all_early_range_rel_leaks all_penalty_costs all_stage_mean_viols all_surrogate_cosines all_surrogate_cosines_flip all_surrogate_nrmse all_surrogate_scale_log10_err all_surrogate_sign_agree all_surrogate_sign_agree_flip
 @info "Saved structured results: $result_file"
 
 @info "\n" * "="^70

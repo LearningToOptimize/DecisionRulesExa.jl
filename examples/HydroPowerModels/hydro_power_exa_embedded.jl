@@ -211,6 +211,19 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
         return σ_prime
     end
 
+    function _activation!(dest, z)
+        if act === NNlib.sigmoid || act === NNlib.sigmoid_fast
+            dest .= inv.(one(eltype(dest)) .+ exp.(-z))
+        elseif act === Base.tanh || act === NNlib.tanh_fast
+            dest .= tanh.(z)
+        elseif act === identity
+            dest .= z
+        else
+            dest .= act.(z)
+        end
+        return dest
+    end
+
     # Pre-allocated buffers — all on the same device as x0_buf
     x0_f32      = similar(x0_buf, Float32, nHyd)
     x_prev_f32  = similar(x0_buf, Float32, nHyd)
@@ -230,7 +243,7 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
         _comb_in[n_h+1:end] .= x_prev
         mul!(z_buf, combiner.weight, _comb_in)
         z_buf .+= combiner.bias
-        nn_out .= act.(z_buf)
+        _activation!(nn_out, z_buf)
         nn_out .= output_lower_f32 .+ output_scale_f32 .* nn_out
         return nn_out
     end
@@ -240,7 +253,7 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
         _comb_in[n_h+1:end] .= x_prev
         mul!(z_buf, combiner.weight, _comb_in)
         z_buf .+= combiner.bias
-        nn_out_f32 .= act.(z_buf)
+        _activation!(nn_out_f32, z_buf)
         _act_deriv!(σ_prime_buf, nn_out_f32)
         σ_prime_buf .*= output_scale_f32
         J_buf .= reshape(σ_prime_buf, :, 1) .* W_state
@@ -313,7 +326,7 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
                 _comb_in[n_h+1:end] .= x_prev_f32
                 mul!(z_buf, combiner.weight, _comb_in)
                 z_buf .+= combiner.bias
-                nn_out_f32 .= act.(z_buf)
+                _activation!(nn_out_f32, z_buf)
                 _act_deriv!(σ_prime_buf, nn_out_f32)
                 σ_prime_buf .*= output_scale_f32
                 λ_f32_buf .= λ_f64

@@ -48,6 +48,7 @@ struct RolloutCriticTarget{S,R,O,M,B,P} <: AbstractCriticTrainingTarget
     objective_value::Symbol
     state_bounds::B
     project_state::P
+    retry_on_failure::Bool
 end
 
 function RolloutCriticTarget(
@@ -64,6 +65,7 @@ function RolloutCriticTarget(
     objective_value::Symbol = :objective,
     state_bounds = nothing,
     project_state = nothing,
+    retry_on_failure::Bool = true,
 )
     policy_state in (:target, :realized) ||
         error("policy_state must be :target or :realized")
@@ -83,6 +85,7 @@ function RolloutCriticTarget(
         objective_value,
         state_bounds,
         project_state,
+        retry_on_failure,
     )
 end
 

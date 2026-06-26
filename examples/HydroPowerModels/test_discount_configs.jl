@@ -19,6 +19,7 @@ const INFLOW_FILE = joinpath(CASE_DIR, "inflows.csv")
 const DEMAND_FILE = joinpath(CASE_DIR, "demand.csv")
 
 const T = 126
+const T_ROLLOUT = 96
 const LAYERS = [128, 128]
 const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = 9000)
 const DEFICIT_COST = 1e5
@@ -267,11 +268,11 @@ function test_rollout_evaluation(policy)
     end
 
     Random.seed!(999)
-    eval_scenarios = [sample_scenario(hydro_data, T) for _ in 1:2]
+    eval_scenarios = [sample_scenario(hydro_data, T_ROLLOUT) for _ in 1:2]
 
     rollout_eval = RolloutEvaluation(
         rollout_prob, x0_dev, eval_scenarios;
-        horizon = T, n_uncertainty = nHyd,
+        horizon = T_ROLLOUT, n_uncertainty = nHyd,
         set_stage_parameters! = set_stage!,
         realized_state = realized_state,
         objective_no_target_penalty = obj_no_pen,
@@ -283,15 +284,15 @@ function test_rollout_evaluation(policy)
         state_bounds = (_min_vols_dev, _max_vols_dev),
     )
 
-    @info "  Running rollout evaluation (2 scenarios, T=$T)..."
+    @info "  Running rollout evaluation (2 scenarios, T=$T_ROLLOUT)..."
     rollout_eval(1, policy)
     obj = rollout_eval.last_objective_no_target_penalty
     viol = rollout_eval.last_violation_share
     n_ok = rollout_eval.last_n_ok
     @info "  Obj (no penalty): $(round(obj; digits=2))"
     @info "  Target violation share: $(round(viol; sigdigits=3))"
-    @info "  Solves OK: $(n_ok) / $(2 * T)"
-    @assert n_ok > T "Too few successful solves — rollout is broken"
+    @info "  Solves OK: $(n_ok) / $(2 * T_ROLLOUT)"
+    @assert n_ok > T_ROLLOUT "Too few successful solves — rollout is broken"
     @info "  TEST 6 PASSED"
 end
 
@@ -299,7 +300,7 @@ end
 
 @info "═══════════════════════════════════════════════"
 @info "Testing discount penalty configs on GPU"
-@info "  T=$T  nHyd=$nHyd  γ=$γ  formulation=$FORMULATION"
+@info "  T_train=$T  T_rollout=$T_ROLLOUT  nHyd=$nHyd  γ=$γ  formulation=$FORMULATION"
 @info "═══════════════════════════════════════════════"
 
 test_discount_weights()

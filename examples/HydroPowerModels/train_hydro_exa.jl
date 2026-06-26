@@ -35,6 +35,7 @@ const DEMAND_FILE = joinpath(CASE_DIR, "demand.csv")
 const LAYERS      = let s = get(ENV, "DR_LAYERS", "128,128"); [parse(Int, x) for x in split(s, ",")] end
 const ACTIVATION  = sigmoid
 const NUM_STAGES  = parse(Int, get(ENV, "DR_NUM_STAGES", "126"))
+const NUM_ROLLOUT_STAGES = parse(Int, get(ENV, "DR_NUM_ROLLOUT_STAGES", "96"))
 const NUM_EPOCHS  = parse(Int, get(ENV, "DR_NUM_EPOCHS", "80"))
 const NUM_BATCHES = 100
 const NUM_TRAIN_PER_BATCH = 1
@@ -44,32 +45,36 @@ const LR          = 1f-3
 const GRAD_CLIP   = parse(Float32, get(ENV, "DR_GRAD_CLIP", "10"))
 
 const TARGET_PEN_ARG = :auto
+const HYDRO_TARGET_PENALTY_MULT = parse(Float64, get(ENV, "DR_TARGET_PENALTY_MULT", "8.0"))
 const DEFICIT_COST   = 1e5
 const USE_GPU        = true
 const load_scaler    = 0.6
 const NUM_WORKERS    = 1
 
 const DISCOUNT_GAMMA = parse(Float64, get(ENV, "DR_DISCOUNT_GAMMA", "1.0"))
+const ROLLOUT_PARALLEL = parse(Bool, get(ENV, "DR_ROLLOUT_PARALLEL", "false"))
 
-const _PENALTY_MODE = get(ENV, "DR_PENALTY_SCHEDULE", "annealed")
+const _PENALTY_MODE = get(ENV, "DR_PENALTY_SCHEDULE", "const")
 const _N_TOTAL = NUM_EPOCHS * NUM_BATCHES
+const _ANNEAL_1_END = max(1, div(_N_TOTAL, 100))
+const _ANNEAL_2_END = max(_ANNEAL_1_END + 1, div(_N_TOTAL, 40))
+const _ANNEAL_3_END = max(_ANNEAL_2_END + 1, div(_N_TOTAL, 10))
 const PENALTY_SCHEDULE = if _PENALTY_MODE == "annealed"
     [
-        (1,   div(_N_TOTAL, 4), 0.1),
-        (div(_N_TOTAL, 4) + 1, div(_N_TOTAL, 2), 1.0),
-        (div(_N_TOTAL, 2) + 1, 3 * div(_N_TOTAL, 4), 10.0),
-        (3 * div(_N_TOTAL, 4) + 1, _N_TOTAL, 30.0),
+        (1,  _ANNEAL_1_END, 0.1),
+        (_ANNEAL_1_END + 1, _ANNEAL_2_END, 1.0),
+        (_ANNEAL_2_END + 1, _ANNEAL_3_END, 4.0),
+        (_ANNEAL_3_END + 1, _N_TOTAL, HYDRO_TARGET_PENALTY_MULT),
     ]
 elseif _PENALTY_MODE == "annealed_discount"
-    _min_safe = max(2.0, ceil(0.5 / DISCOUNT_GAMMA^(NUM_STAGES - 1)))
     [
-        (1,   div(_N_TOTAL, 4), _min_safe),
-        (div(_N_TOTAL, 4) + 1, div(_N_TOTAL, 2), _min_safe * 2.5),
-        (div(_N_TOTAL, 2) + 1, 3 * div(_N_TOTAL, 4), _min_safe * 5.0),
-        (3 * div(_N_TOTAL, 4) + 1, _N_TOTAL, _min_safe * 10.0),
+        (1,  _ANNEAL_1_END, 0.1),
+        (_ANNEAL_1_END + 1, _ANNEAL_2_END, 1.0),
+        (_ANNEAL_2_END + 1, _ANNEAL_3_END, 4.0),
+        (_ANNEAL_3_END + 1, _N_TOTAL, HYDRO_TARGET_PENALTY_MULT),
     ]
 else
-    [(1, _N_TOTAL, 1.0)]
+    [(1, _N_TOTAL, HYDRO_TARGET_PENALTY_MULT)]
 end
 
 # Optional: ramp num_train_per_batch and eval scenarios over training.
@@ -89,7 +94,7 @@ else
     "-const"
 end
 const _LAYER_TAG = LAYERS == [128, 128] ? "" : "-L$(join(LAYERS, "_"))"
-const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-deteq-gpu$(_CLIP_TAG)$(_SCHED_TAG)$(_DISC_TAG)$(_LAYER_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
+const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-deteq-gpu$(_CLIP_TAG)$(_SCHED_TAG)$(_DISC_TAG)$(_LAYER_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
 const MODEL_DIR = joinpath(CASE_DIR, FORM_LABEL, "models")
 mkpath(MODEL_DIR)
 const MODEL_PATH = joinpath(MODEL_DIR, RUN_NAME * ".jld2")
@@ -104,9 +109,10 @@ power_data = load_power_data(PM_FILE)
 
 @info "Loading hydro data..."
 hydro_data = load_hydro_data(HYDRO_FILE, INFLOW_FILE, power_data;
-                              num_stages = NUM_STAGES * 10)
+                              num_stages = max(NUM_STAGES, NUM_ROLLOUT_STAGES) * 10)
 nHyd = hydro_data.nHyd
 T    = NUM_STAGES
+T_ROLLOUT = NUM_ROLLOUT_STAGES
 @info "  nHyd=$(nHyd)  nScenarios=$(hydro_data.nScenarios)"
 
 demand_mat = if isfile(DEMAND_FILE)
@@ -122,6 +128,7 @@ resolved_pen = TARGET_PEN_ARG === :auto ?
                auto_target_penalty(power_data, hydro_data) :
                Float64(TARGET_PEN_ARG)
 @info "Auto target penalty: ρ=$(round(resolved_pen; digits=2))"
+@info "Bolivia hydro target-penalty multiplier default: $(HYDRO_TARGET_PENALTY_MULT)"
 
 backend = USE_GPU ? (@info "Using GPU backend"; CUDA.CUDABackend()) :
                     (@info "Using CPU backend"; nothing)
@@ -177,7 +184,7 @@ end
 
 # ── Policy ────────────────────────────────────────────────────────────────────
 
-policy_active_mask = isnothing(PRE_TRAINED) ? nothing : trues(nHyd)
+policy_active_mask = trues(nHyd)
 policy = bounded_state_policy(nHyd, target_lower, target_upper, LAYERS;
                               activation   = ACTIVATION,
                               encoder_type = Flux.LSTM,
@@ -204,10 +211,12 @@ lg = WandbLogger(
         "case"            => CASE_NAME,
         "formulation"     => FORM_LABEL,
         "num_stages"      => T,
+        "num_rollout_stages" => T_ROLLOUT,
         "layers"          => LAYERS,
         "activation"      => string(ACTIVATION),
         "target_penalty"  => "auto=$(round(resolved_pen; digits=2))",
         "target_penalty_l1" => "auto=$(round(resolved_pen_l1; digits=2))",
+        "hydro_target_penalty_mult" => HYDRO_TARGET_PENALTY_MULT,
         "deficit_cost"    => DEFICIT_COST,
         "num_epochs"      => NUM_EPOCHS,
         "num_batches"     => NUM_BATCHES,
@@ -247,8 +256,8 @@ function _build_rollout_de()
 end
 rollout_prob = _build_rollout_de()
 n_rollout_pool = max(NUM_WORKERS, NUM_EVAL_SCENARIOS)
-rollout_pool = [_build_rollout_de() for _ in 1:n_rollout_pool]
-@info "Rollout pool ready: $(n_rollout_pool) stage-problem copies"
+rollout_pool = ROLLOUT_PARALLEL ? [_build_rollout_de() for _ in 1:n_rollout_pool] : []
+@info "Rollout evaluation: $(ROLLOUT_PARALLEL ? "parallel ($(n_rollout_pool) stage-problem copies)" : "sequential")"
 
 function set_hydro_rollout_stage!(stage_prob, state_in, wt, target, stage)
     ExaModels.set_parameter!(stage_prob.core, stage_prob.p_x0, state_in)
@@ -277,21 +286,22 @@ function hydro_objective_no_target_penalty(stage_prob, result)
 end
 
 Random.seed!(8789)
-eval_scenarios = [sample_scenario(hydro_data, T) for _ in 1:NUM_EVAL_SCENARIOS]
+eval_scenarios = [sample_scenario(hydro_data, T_ROLLOUT) for _ in 1:NUM_EVAL_SCENARIOS]
 rollout_evaluation = RolloutEvaluation(
     rollout_prob,
     x0_init,
     eval_scenarios;
-    horizon = T,
+    horizon = T_ROLLOUT,
     n_uncertainty = nHyd,
     set_stage_parameters! = set_hydro_rollout_stage!,
     realized_state = hydro_realized_state,
     objective_no_target_penalty = hydro_objective_no_target_penalty,
     madnlp_kwargs = SOLVER_KWARGS,
-    warmstart = true,
+    warmstart = false,
     stride = EVAL_EVERY,
     policy_state = :target,
     stage_problem_pool = rollout_pool,
+    retry_on_failure = true,
     active_scenarios = NUM_EVAL_SCENARIOS,
     state_bounds = (_min_vols_dev, _max_vols_dev),
 )
@@ -299,16 +309,17 @@ realized_rollout_evaluation = RolloutEvaluation(
     rollout_prob,
     x0_init,
     eval_scenarios;
-    horizon = T,
+    horizon = T_ROLLOUT,
     n_uncertainty = nHyd,
     set_stage_parameters! = set_hydro_rollout_stage!,
     realized_state = hydro_realized_state,
     objective_no_target_penalty = hydro_objective_no_target_penalty,
     madnlp_kwargs = SOLVER_KWARGS,
-    warmstart = true,
+    warmstart = false,
     stride = EVAL_EVERY,
     policy_state = :realized,
     stage_problem_pool = rollout_pool,
+    retry_on_failure = true,
     active_scenarios = NUM_EVAL_SCENARIOS,
     state_bounds = (_min_vols_dev, _max_vols_dev),
 )
