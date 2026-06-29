@@ -67,6 +67,7 @@ struct HydroExaDEProblem
     formulation::Symbol   # :dc or :ac_polar
     # range into result.multipliers for target constraints
     target_con_range::UnitRange{Int}
+    strict_targets::Bool
 end
 
 # ── AC branch coefficient helper ──────────────────────────────────────────────
@@ -182,7 +183,8 @@ function build_hydro_de(power_data::PowerData,
                          demand_matrix = nothing,
                          reactive_demand_matrix = nothing,
                          deficit_cost::Union{Nothing,Real} = nothing,
-                         load_scaler::Real = 1.0)
+                         load_scaler::Real = 1.0,
+                         strict_targets::Bool = false)
 
     formulation in (:dc, :ac_polar) ||
         error("formulation must be :dc or :ac_polar, got :$formulation")
@@ -194,7 +196,8 @@ function build_hydro_de(power_data::PowerData,
                                    target_penalty_l1=target_penalty_l1,
                                    demand_matrix=demand_matrix,
                                    deficit_cost=deficit_cost,
-                                   load_scaler=load_scaler)
+                                   load_scaler=load_scaler,
+                                   strict_targets=strict_targets)
     else
         return _build_ac_hydro_de(power_data, hydro_data, T;
                                    backend=backend, float_type=float_type,
@@ -203,7 +206,8 @@ function build_hydro_de(power_data::PowerData,
                                    demand_matrix=demand_matrix,
                                    reactive_demand_matrix=reactive_demand_matrix,
                                    deficit_cost=deficit_cost,
-                                   load_scaler=load_scaler)
+                                   load_scaler=load_scaler,
+                                   strict_targets=strict_targets)
     end
 end
 
@@ -218,7 +222,8 @@ function _build_dc_hydro_de(power_data::PowerData,
                               target_penalty_l1::Union{Real,Symbol,Nothing} = :auto,
                               demand_matrix = nothing,
                               deficit_cost::Union{Nothing,Real} = nothing,
-                              load_scaler::Real = 1.0)
+                              load_scaler::Real = 1.0,
+                              strict_targets::Bool = false)
 
     nBus    = power_data.nBus
     nGen    = power_data.nGen
@@ -271,8 +276,13 @@ function _build_dc_hydro_de(power_data::PowerData,
     spill = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
 
     # Target slack: δ = δ⁺ − δ⁻ with δ⁺,δ⁻ ≥ 0 (L1+L2 Lagrangian penalty)
-    delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
-    delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
+    if strict_targets
+        delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0), uvar = float_type(0))
+        delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0), uvar = float_type(0))
+    else
+        delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
+        delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
+    end
 
     # ── Parameters ────────────────────────────────────────────────────────────
 
@@ -306,19 +316,22 @@ function _build_dc_hydro_de(power_data::PowerData,
         for item in def_cost_items
     )
 
-    # L2 penalty: (ρ/2)·(δ⁺ − δ⁻)²
     delta_items = [(idx = _ri(nHyd, t, r),) for t in 1:T for r in 1:nHyd]
-    ExaModels.objective(core,
-        p_penalty_half[item.idx] * (delta_pos[item.idx] - delta_neg[item.idx])^2
-        for item in delta_items
-    )
 
-    # L1 penalty: λ·(δ⁺ + δ⁻)
-    if use_l1
+    if !strict_targets
+        # L2 penalty: (ρ/2)·(δ⁺ − δ⁻)²
         ExaModels.objective(core,
-            p_penalty_l1[item.idx] * (delta_pos[item.idx] + delta_neg[item.idx])
+            p_penalty_half[item.idx] * (delta_pos[item.idx] - delta_neg[item.idx])^2
             for item in delta_items
         )
+
+        # L1 penalty: λ·(δ⁺ + δ⁻)
+        if use_l1
+            ExaModels.objective(core,
+                p_penalty_l1[item.idx] * (delta_pos[item.idx] + delta_neg[item.idx])
+                for item in delta_items
+            )
+        end
     end
 
     # ── Constraints ───────────────────────────────────────────────────────────
@@ -466,7 +479,7 @@ function _build_dc_hydro_de(power_data::PowerData,
         p_penalty_half, Float64(ρ / 2),
         p_penalty_l1, Float64(ρ_l1),
         nHyd, nBus, nGen, nBranch, T,
-        :dc, target_con_range,
+        :dc, target_con_range, strict_targets,
     )
 end
 
@@ -482,7 +495,8 @@ function _build_ac_hydro_de(power_data::PowerData,
                               demand_matrix = nothing,
                               reactive_demand_matrix = nothing,
                               deficit_cost::Union{Nothing,Real} = nothing,
-                              load_scaler::Real = 1.0)
+                              load_scaler::Real = 1.0,
+                              strict_targets::Bool = false)
 
     nBus    = power_data.nBus
     nGen    = power_data.nGen
@@ -555,8 +569,13 @@ function _build_ac_hydro_de(power_data::PowerData,
     spill = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
 
     # Target slack: δ = δ⁺ − δ⁻ with δ⁺,δ⁻ ≥ 0 (L1+L2 Lagrangian penalty)
-    delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
-    delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
+    if strict_targets
+        delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0), uvar = float_type(0))
+        delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0), uvar = float_type(0))
+    else
+        delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
+        delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
+    end
 
     # ── Parameters ────────────────────────────────────────────────────────────
 
@@ -601,19 +620,22 @@ function _build_ac_hydro_de(power_data::PowerData,
         for item in def_cost_items
     )
 
-    # L2 penalty: (ρ/2)·(δ⁺ − δ⁻)²
     delta_items = [(idx = _ri(nHyd, t, r),) for t in 1:T for r in 1:nHyd]
-    ExaModels.objective(core,
-        p_penalty_half[item.idx] * (delta_pos[item.idx] - delta_neg[item.idx])^2
-        for item in delta_items
-    )
 
-    # L1 penalty: λ·(δ⁺ + δ⁻)
-    if use_l1
+    if !strict_targets
+        # L2 penalty: (ρ/2)·(δ⁺ − δ⁻)²
         ExaModels.objective(core,
-            p_penalty_l1[item.idx] * (delta_pos[item.idx] + delta_neg[item.idx])
+            p_penalty_half[item.idx] * (delta_pos[item.idx] - delta_neg[item.idx])^2
             for item in delta_items
         )
+
+        # L1 penalty: λ·(δ⁺ + δ⁻)
+        if use_l1
+            ExaModels.objective(core,
+                p_penalty_l1[item.idx] * (delta_pos[item.idx] + delta_neg[item.idx])
+                for item in delta_items
+            )
+        end
     end
 
     # ── Constraints ───────────────────────────────────────────────────────────
@@ -845,7 +867,7 @@ function _build_ac_hydro_de(power_data::PowerData,
         p_penalty_half, Float64(ρ / 2),
         p_penalty_l1, Float64(ρ_l1),
         nHyd, nBus, nGen, nBranch, T,
-        :ac_polar, target_con_range,
+        :ac_polar, target_con_range, strict_targets,
     )
 end
 

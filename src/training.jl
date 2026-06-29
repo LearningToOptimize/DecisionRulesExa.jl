@@ -187,12 +187,12 @@ function simulate_tsddr(
     w_dev  = _adapt_array(F.(w_flat), initial_state)
 
     Flux.reset!(model)
-    xhat_stages = AbstractVector{F}[]
-    prev = F.(initial_state)
+    xhat_stages = Vector{AbstractVector{F}}(undef, T)
+    prev = initial_state
     for t in 1:T
-        wt   = w_dev[(t-1)*nw+1 : t*nw]
-        push!(xhat_stages, model(vcat(wt, prev)))
-        prev = xhat_stages[end]
+        wt   = view(w_dev, (t-1)*nw+1 : t*nw)
+        xhat_stages[t] = model(vcat(wt, prev))
+        prev = xhat_stages[t]
     end
     xhat_flat = vcat(xhat_stages...)
 
@@ -213,15 +213,13 @@ function _rollout_xhat_flat(model, initial_state, w_flat, T::Int, F)
     nw = length(w_flat) ÷ T
     Flux.reset!(model)
     prev = F.(initial_state)
-    xhat = model(vcat(w_flat[1:nw], prev))
-    prev = xhat
-    for t in 2:T
-        wt = w_flat[(t-1)*nw+1 : t*nw]
-        xt = model(vcat(wt, prev))
-        xhat = vcat(xhat, xt)
-        prev = xt
+    stages = Vector{typeof(prev)}(undef, T)
+    for t in 1:T
+        wt = view(w_flat, (t-1)*nw+1 : t*nw)
+        stages[t] = model(vcat(wt, prev))
+        prev = stages[t]
     end
-    return xhat
+    return vcat(stages...)
 end
 
 _has_critic(::NoCriticControlVariate) = false
@@ -530,12 +528,12 @@ function train_tsddr(
             nw     = length(w_flat) ÷ T
             w_dev  = _adapt_array(F.(w_flat), initial_state)
             Flux.reset!(model)
-            xhat_stages = AbstractVector{F}[]
-            prev = F.(initial_state)
+            xhat_stages = Vector{AbstractVector{F}}(undef, T)
+            prev = initial_state
             for t in 1:T
-                wt   = w_dev[(t-1)*nw+1 : t*nw]
-                push!(xhat_stages, model(vcat(wt, prev)))
-                prev = xhat_stages[end]
+                wt   = view(w_dev, (t-1)*nw+1 : t*nw)
+                xhat_stages[t] = model(vcat(wt, prev))
+                prev = xhat_stages[t]
             end
             sample_data[s] = (w_dev, vcat(xhat_stages...))
         end
@@ -676,11 +674,11 @@ function train_tsddr(
                     for (w_flat_s, λf) in valid
                         nw = length(w_flat_s) ÷ T
                         Flux.reset!(m)
-                        prev_ad = F.(initial_state)
+                        prev_ad = initial_state
                         for t in 1:T
-                            wt      = F.(w_flat_s[(t-1)*nw+1 : t*nw])
+                            wt      = view(w_flat_s, (t-1)*nw+1 : t*nw)
                             xt      = m(vcat(wt, prev_ad))
-                            total   = total + sum(λf[(t-1)*nx+1 : t*nx] .* xt)
+                            total   = total + sum(view(λf, (t-1)*nx+1 : t*nx) .* xt)
                             prev_ad = xt
                         end
                     end
@@ -720,12 +718,12 @@ function train_tsddr(
                     for (w_flat_s, actor_weight) in solved_weights
                         nw = length(w_flat_s) ÷ T
                         Flux.reset!(m)
-                        prev_ad = F.(initial_state)
+                        prev_ad = initial_state
                         for t in 1:T
-                            wt      = F.(w_flat_s[(t-1)*nw+1 : t*nw])
+                            wt      = view(w_flat_s, (t-1)*nw+1 : t*nw)
                             xt      = m(vcat(wt, prev_ad))
                             residual_total =
-                                residual_total + sum(actor_weight[(t-1)*nx+1 : t*nx] .* xt)
+                                residual_total + sum(view(actor_weight, (t-1)*nx+1 : t*nx) .* xt)
                             prev_ad = xt
                         end
                     end
@@ -739,7 +737,7 @@ function train_tsddr(
                             xhat_ad = _rollout_xhat_flat(m, initial_state, w_flat_s, T, F)
                             critic_total = critic_total + critic_value(
                                 control_variate,
-                                F.(initial_state),
+                                initial_state,
                                 w_flat_s,
                                 xhat_ad,
                             )
@@ -901,12 +899,12 @@ function train_tsddr_embedded(
                     nw = length(w_flat_s) ÷ T
                     Flux.reset!(m)
                     for t in 1:T
-                        wt = F.(w_flat_s[(t-1)*nw+1 : t*nw])
+                        wt = view(w_flat_s, (t-1)*nw+1 : t*nw)
                         x_prev = (t == 1) ?
-                            F.(initial_state) :
-                            F.(x_realized[(t-2)*nx+1 : (t-1)*nx])
+                            initial_state :
+                            view(x_realized, (t-2)*nx+1 : (t-1)*nx)
                         xt = m(vcat(wt, x_prev))
-                        total = total + sum(λf[(t-1)*nx+1 : t*nx] .* xt)
+                        total = total + sum(view(λf, (t-1)*nx+1 : t*nx) .* xt)
                     end
                 end
                 total / F(n_ok)

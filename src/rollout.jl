@@ -105,6 +105,7 @@ function rollout_tsddr(
         throw(ArgumentError("policy_state must be :realized or :target, got :$policy_state"))
 
     F = eltype(initial_state)
+    nx = length(initial_state)
     state = solver_state
     w_flat = _adapt_array(F.(w_flat), initial_state)
 
@@ -115,23 +116,29 @@ function rollout_tsddr(
     target_trajectory = Vector{AbstractVector{F}}(undef, horizon)
     state_trajectory[1] = copy(realized_prev)
 
+    state_f64  = similar(initial_state, Float64, nx)
+    w_f64      = similar(initial_state, Float64, n_uncertainty)
+    target_f64 = similar(initial_state, Float64, nx)
+
     objective = 0.0
     objective_no_penalty = 0.0
 
     for stage in 1:horizon
-        lo = (stage - 1) * n_uncertainty + 1
-        hi = stage * n_uncertainty
-        wt = F.(_to_vec(view(w_flat, lo:hi)))
+        wt = view(w_flat, (stage-1)*n_uncertainty+1 : stage*n_uncertainty)
 
         policy_input_state = policy_state === :realized ? realized_prev : target_prev
         target = model(vcat(wt, policy_input_state))
-        target_trajectory[stage] = F.(_to_vec(target))
+        target_vec = _to_vec(target)
+        target_trajectory[stage] = F.(target_vec)
 
+        copyto!(state_f64, realized_prev)
+        copyto!(w_f64, wt)
+        copyto!(target_f64, target_vec)
         set_stage_parameters!(
             stage_problem,
-            Float64.(realized_prev),
-            Float64.(wt),
-            Float64.(_to_vec(target)),
+            state_f64,
+            w_f64,
+            target_f64,
             stage,
         )
 
@@ -185,7 +192,7 @@ function rollout_tsddr(
         objective_no_penalty += no_penalty
         raw_realized = F.(_to_vec(realized_state(stage_problem, result)))
         realized_prev = _project_realized_state(raw_realized, state_bounds, project_state)
-        target_prev = F.(_to_vec(target))
+        target_prev = target_trajectory[stage]
         state_trajectory[stage + 1] = copy(realized_prev)
     end
 

@@ -282,6 +282,7 @@ function _build_rollout_de()
         deficit_cost   = DEFICIT_COST,
         demand_matrix  = stage_demand,
         load_scaler    = load_scaler,
+        strict_targets = STRICT_EMBEDDED_TARGETS,
     )
 end
 
@@ -308,6 +309,9 @@ hydro_realized_state(stage_prob, result) =
     hydro_solution(stage_prob, result).reservoir[:, end]
 
 function hydro_objective_no_target_penalty(stage_prob, result)
+    if STRICT_EMBEDDED_TARGETS
+        return result.objective
+    end
     sol = hydro_solution(stage_prob, result)
     delta = sol.delta
     penalty_l2_cost = (resolved_pen / 2) * sum(abs2, delta)

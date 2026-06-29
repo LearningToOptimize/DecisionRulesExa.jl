@@ -14,6 +14,7 @@
 
 using Flux
 using Zygote
+using LinearAlgebra: I
 import DecisionRulesExa: set_x0!, set_uncertainty!, set_targets!, invalidate_policy_cache!,
                          load_stateconditioned_policy!
 
@@ -330,8 +331,8 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
     output_lower_f32 = similar(x0_buf, Float32, nHyd)
     output_scale_f32 = similar(x0_buf, Float32, nHyd)
     if has_output_bounds
-        copyto!(output_lower_f32, Float32.(Array(getfield(policy, :output_lower))))
-        copyto!(output_scale_f32, Float32.(Array(getfield(policy, :output_scale))))
+        output_lower_f32 .= getfield(policy, :output_lower)
+        output_scale_f32 .= getfield(policy, :output_scale)
     else
         fill!(output_lower_f32, 0f0)
         fill!(output_scale_f32, 1f0)
@@ -342,12 +343,12 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
     max_turn_f32 = similar(x0_buf, Float32, nHyd)
     spill_max_f32 = similar(x0_buf, Float32, nHyd)
     if reachable_policy
-        copyto!(min_vol_f32, Float32.(Array(policy.min_vol)))
-        copyto!(max_vol_f32, Float32.(Array(policy.max_vol)))
-        copyto!(min_turn_f32, Float32.(Array(policy.min_turn)))
-        copyto!(max_turn_f32, Float32.(Array(policy.max_turn)))
+        min_vol_f32 .= policy.min_vol
+        max_vol_f32 .= policy.max_vol
+        min_turn_f32 .= policy.min_turn
+        max_turn_f32 .= policy.max_turn
         if policy.spill_max !== nothing
-            copyto!(spill_max_f32, Float32.(Array(policy.spill_max)))
+            spill_max_f32 .= policy.spill_max
         else
             fill!(spill_max_f32, Float32(Inf))
         end
@@ -399,11 +400,7 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
     J_buf       = similar(x0_buf, Float64, nHyd, nHyd)
     dbound_dx_f64 = similar(x0_buf, Float64, nHyd)
     diag_mask   = similar(x0_buf, Float64, nHyd, nHyd)
-    diag_mask_cpu = zeros(Float64, nHyd, nHyd)
-    for r in 1:nHyd
-        diag_mask_cpu[r, r] = 1.0
-    end
-    copyto!(diag_mask, diag_mask_cpu)
+    copyto!(diag_mask, Matrix{Float64}(I, nHyd, nHyd))
     h_cache     = similar(x0_buf, Float32, n_h, T)
     h_cache_dirty = Ref(true)
 

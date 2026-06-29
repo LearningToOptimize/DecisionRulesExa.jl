@@ -249,7 +249,7 @@ function _build_rollout_de()
         backend        = backend,
         float_type     = Float64,
         formulation    = FORMULATION,
-        target_penalty = TARGET_PEN_ARG,
+        target_penalty = resolved_pen * HYDRO_TARGET_PENALTY_MULT,
         deficit_cost   = DEFICIT_COST,
         demand_matrix  = stage_demand,
         load_scaler    = load_scaler,
@@ -278,11 +278,14 @@ const _max_vols = Float64.([h.max_vol for h in hydro_data.units])
 const _min_vols_dev = USE_GPU ? CUDA.cu(_min_vols) : _min_vols
 const _max_vols_dev = USE_GPU ? CUDA.cu(_max_vols) : _max_vols
 
+const _rollout_pen = resolved_pen * HYDRO_TARGET_PENALTY_MULT
+const _rollout_pen_l1 = _rollout_pen
+
 function hydro_objective_no_target_penalty(stage_prob, result)
     sol = hydro_solution(stage_prob, result)
     delta = sol.delta
-    penalty_l2_cost = (resolved_pen / 2) * sum(abs2, delta)
-    penalty_l1_cost = resolved_pen_l1 * sum(abs, delta)
+    penalty_l2_cost = (_rollout_pen / 2) * sum(abs2, delta)
+    penalty_l1_cost = _rollout_pen_l1 * sum(abs, delta)
     return result.objective - penalty_l2_cost - penalty_l1_cost
 end
 

@@ -177,19 +177,45 @@ function build_embedded_deterministic_equivalent(
     x_start = 1
     δ_start = n_x + n_u + 1
 
+    # ── Pre-allocated oracle buffers ────────────────────────────────────
+    _x_prev  = zeros(Float32, nx)
+    _w_t     = zeros(Float32, nw)
+    _input   = zeros(Float32, nw + nx)
+    _J       = zeros(Float32, nx, nx)
+    _e       = zeros(Float32, nx)
+    _λ_t     = zeros(Float32, nx)
+
+    function _fill_x_prev!(t, xv)
+        for i in 1:nx
+            _x_prev[i] = (t == 1) ?
+                Float32(x0_buf[i]) :
+                Float32(xv[x_start + (t-2)*nx + i - 1])
+        end
+        return _x_prev
+    end
+
+    function _fill_w_t!(t)
+        for j in 1:nw
+            _w_t[j] = Float32(w_buf[(t-1)*nw + j])
+        end
+        return _w_t
+    end
+
+    function _fill_input!(t, xv)
+        _fill_w_t!(t)
+        _fill_x_prev!(t, xv)
+        copyto!(view(_input, 1:nw), _w_t)
+        copyto!(view(_input, nw+1:nw+nx), _x_prev)
+        return _input
+    end
+
     # ── Oracle callbacks ─────────────────────────────────────────────────
 
     function oracle_f!(c, xv)
         Flux.reset!(policy)
         for t in 1:T
-            x_prev = zeros(Float32, nx)
-            for i in 1:nx
-                x_prev[i] = (t == 1) ?
-                    Float32(x0_buf[i]) :
-                    Float32(xv[x_start + (t-2)*nx + i - 1])
-            end
-            w_t = Float32[w_buf[(t-1)*nw + j] for j in 1:nw]
-            nn_out = policy(vcat(w_t, x_prev))
+            _fill_input!(t, xv)
+            nn_out = policy(_input)
             for i in 1:nx
                 row = (t - 1) * nx + i
                 xi = x_start + (t-1)*nx + i - 1
@@ -204,40 +230,30 @@ function build_embedded_deterministic_equivalent(
         Flux.reset!(policy)
         k = 0
         for t in 1:T
-            x_prev = zeros(Float32, nx)
-            for i in 1:nx
-                x_prev[i] = (t == 1) ?
-                    Float32(x0_buf[i]) :
-                    Float32(xv[x_start + (t-2)*nx + i - 1])
-            end
-            w_t = Float32[w_buf[(t-1)*nw + j] for j in 1:nw]
+            _fill_x_prev!(t, xv)
+            _fill_w_t!(t)
 
-            # Jacobian of nn_out w.r.t. x_prev (nx × nx via Zygote)
             nn_jac_xprev = if t > 1
-                _, back = Zygote.pullback(xp -> policy(vcat(w_t, xp)), x_prev)
-                J = zeros(Float32, nx, nx)
+                _, back = Zygote.pullback(xp -> policy(vcat(_w_t, xp)), _x_prev)
+                fill!(_J, 0f0)
                 for row in 1:nx
-                    e = zeros(Float32, nx)
-                    e[row] = 1.0f0
-                    col_grad = back(e)[1]
+                    fill!(_e, 0f0)
+                    _e[row] = 1.0f0
+                    col_grad = back(_e)[1]
                     if col_grad !== nothing
-                        J[row, :] .= col_grad
+                        _J[row, :] .= col_grad
                     end
                 end
-                J
+                _J
             else
-                # Forward pass at t=1 to update LSTM hidden state
-                policy(vcat(w_t, x_prev))
+                policy(vcat(_w_t, _x_prev))
                 nothing
             end
 
             for i in 1:nx
-                # ∂g_{t,i}/∂x_{t,i} = -1
                 k += 1; vals[k] = -1.0
-                # ∂g_{t,i}/∂δ_{t,i} = -1
                 k += 1; vals[k] = -1.0
                 if t > 1
-                    # ∂g_{t,i}/∂x_{t-1,j} = +∂π_θ[i]/∂x_{t-1,j}  for each j
                     for j in 1:nx
                         k += 1; vals[k] = Float64(nn_jac_xprev[i, j])
                     end
@@ -251,17 +267,11 @@ function build_embedded_deterministic_equivalent(
         fill!(Jtv, 0.0)
         Flux.reset!(policy)
         for t in 1:T
-            x_prev = zeros(Float32, nx)
-            for i in 1:nx
-                x_prev[i] = (t == 1) ?
-                    Float32(x0_buf[i]) :
-                    Float32(xv[x_start + (t-2)*nx + i - 1])
-            end
-            w_t = Float32[w_buf[(t-1)*nw + j] for j in 1:nw]
-
-            λ_t = Float32[λ[(t-1)*nx + i] for i in 1:nx]
+            _fill_x_prev!(t, xv)
+            _fill_w_t!(t)
 
             for i in 1:nx
+                _λ_t[i] = Float32(λ[(t-1)*nx + i])
                 xi = x_start + (t-1)*nx + i - 1
                 di = δ_start + (t-1)*nx + i - 1
                 Jtv[xi] -= λ[(t-1)*nx + i]
@@ -269,8 +279,8 @@ function build_embedded_deterministic_equivalent(
             end
 
             if t > 1
-                _, back = Zygote.pullback(xp -> policy(vcat(w_t, xp)), x_prev)
-                dinput = back(λ_t)[1]
+                _, back = Zygote.pullback(xp -> policy(vcat(_w_t, xp)), _x_prev)
+                dinput = back(_λ_t)[1]
                 if dinput !== nothing
                     for j in 1:nx
                         xj = x_start + (t-2)*nx + j - 1
@@ -278,8 +288,7 @@ function build_embedded_deterministic_equivalent(
                     end
                 end
             else
-                # Forward pass at t=1 to update LSTM hidden state
-                policy(vcat(w_t, x_prev))
+                policy(vcat(_w_t, _x_prev))
             end
         end
         return nothing
