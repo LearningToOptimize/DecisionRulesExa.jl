@@ -43,6 +43,7 @@ struct HydroReachablePolicy{E,C,V,S}
     min_turn::V
     max_turn::V
     spill_max::S
+    upstream_max_inflow::V
     K::Float64
     output_lower::Nothing
     output_scale::Nothing
@@ -62,9 +63,10 @@ function _hydro_reachable_bounds(policy::HydroReachablePolicy, inflow, x_prev, r
     max_vol  = _hydro_adapt_bound(policy.max_vol, ref)
     min_turn = _hydro_adapt_bound(policy.min_turn, ref)
     max_turn = _hydro_adapt_bound(policy.max_turn, ref)
+    upstream = _hydro_adapt_bound(policy.upstream_max_inflow, ref)
     K = convert(eltype(ref), policy.K)
 
-    upper_raw = x_prev .+ K .* inflow .- K .* min_turn
+    upper_raw = x_prev .+ K .* inflow .- K .* min_turn .+ upstream
     upper = min.(max_vol, upper_raw)
 
     lower = if policy.spill_max === nothing
@@ -123,6 +125,13 @@ function hydro_reachable_policy(
     if spill_vec !== nothing && length(spill_vec) != nHyd
         throw(ArgumentError("spill_max length must be nHyd=$nHyd"))
     end
+
+    K = Float64(hydro_data.K)
+    upstream_max = zeros(Float32, nHyd)
+    for conn in hydro_data.upstream_turns
+        upstream_max[conn.downstream_pos] += Float32(K * hydro_data.units[conn.upstream_pos].max_turn)
+    end
+
     return HydroReachablePolicy(
         encoder, combiner, nHyd, nHyd,
         Float32.([h.min_vol for h in hydro_data.units]),
@@ -130,7 +139,8 @@ function hydro_reachable_policy(
         Float32.([h.min_turn for h in hydro_data.units]),
         Float32.([h.max_turn for h in hydro_data.units]),
         spill_vec,
-        Float64(hydro_data.K),
+        upstream_max,
+        K,
         nothing, nothing,
     )
 end
@@ -342,16 +352,20 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
     min_turn_f32 = similar(x0_buf, Float32, nHyd)
     max_turn_f32 = similar(x0_buf, Float32, nHyd)
     spill_max_f32 = similar(x0_buf, Float32, nHyd)
+    upstream_max_f32 = similar(x0_buf, Float32, nHyd)
     if reachable_policy
         min_vol_f32 .= policy.min_vol
         max_vol_f32 .= policy.max_vol
         min_turn_f32 .= policy.min_turn
         max_turn_f32 .= policy.max_turn
+        upstream_max_f32 .= policy.upstream_max_inflow
         if policy.spill_max !== nothing
             spill_max_f32 .= policy.spill_max
         else
             fill!(spill_max_f32, Float32(Inf))
         end
+    else
+        fill!(upstream_max_f32, 0f0)
     end
 
     function _act_deriv!(σ_prime, output)
@@ -406,7 +420,7 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
 
     function _reachable_bounds!(inflow, x_prev)
         K32 = Float32(policy.K)
-        upper_f32 .= x_prev .+ K32 .* inflow .- K32 .* min_turn_f32
+        upper_f32 .= x_prev .+ K32 .* inflow .- K32 .* min_turn_f32 .+ upstream_max_f32
         dupper_dx_f32 .= ifelse.(upper_f32 .<= max_vol_f32, 1f0, 0f0)
         upper_f32 .= min.(max_vol_f32, upper_f32)
 
