@@ -73,7 +73,7 @@ For a custom problem you need:
 
 The package provides `build_deterministic_equivalent` for generic problems and `build_linear_tracking_problem` as a ready-made demo. For domain-specific models (power systems, robotics), build the ExaModels NLP directly — see `examples/HydroPowerModels/` for a complete AC-OPF example.
 
-## Strict embedded target equality
+## Strict reachable target equality
 
 The usual TS-DDR deterministic equivalent uses slack-penalized target
 constraints,
@@ -88,8 +88,8 @@ the policy can request states that are not reachable from the previous realized
 state. The target multipliers are then gradients of the penalized projection
 problem, so their quality depends on the penalty calibration.
 
-For embedded closed-loop policies, a stricter formulation is possible when the
-policy output is guaranteed to lie in a one-stage reachable state set:
+For policies whose output is guaranteed to lie in a one-stage reachable state
+set, a stricter formulation is possible:
 
 ```text
 x_t = pi_theta(w_t, x_{t-1}),      pi_theta(w_t, x_{t-1}) in R(w_t, x_{t-1}).
@@ -100,16 +100,30 @@ or target penalties. The multiplier on the equality is the local envelope
 sensitivity of the true stage problem with respect to the policy-imposed next
 state, not the sensitivity of a penalized approximation. This is useful when:
 
-- the policy is embedded stage by stage and receives the realized previous
-  state;
 - users can define a differentiable or piecewise differentiable map into a
   subset of the one-stage reachable set;
 - total recourse is guaranteed by the model for every state produced by that
   map.
 
-Do not use strict equality for a generic open-loop target policy unless the
-target generator is proven reachable at every stage. For unreachable targets,
-the slack-penalty formulation is the robust fallback.
+There are two strict hydro paths:
+
+- **Embedded strict DE** evaluates the policy inside the NLP against realized
+  reservoir states. This is the usual way to make strict mode safe because the
+  policy sees the state from which its next target must be reachable.
+- **Regular strict DE with reachable rollout** computes targets before solving
+  the NLP, but starts from the true initial state and feeds the previous target
+  back to the reachable policy. If
+  `x̂_t ∈ R(x̂_{t-1}, w_t)` and `x̂_0 = x_0`, the full target path is feasible by
+  induction. The strict equality then forces the realized path to equal that
+  reachable target path.
+
+Do not use strict equality for a generic open-loop target policy. For
+unreachable targets, the slack-penalty formulation is the robust fallback.
+
+The hydro reachable policy keeps recurrence over inflows only. Optional
+`combiner_layers` / `DR_HEAD_LAYERS` add a nonlinear feed-forward map from
+`[encoded_inflow; reservoir_state]` to targets without adding recurrence over
+the state input.
 
 ## Parallel GPU solves
 
@@ -256,6 +270,23 @@ Choose DecisionRules.jl when:
 - [`examples/end_to_end_cpu.jl`](examples/end_to_end_cpu.jl) — minimal CPU demo with a linear tracking problem
 - [`examples/end_to_end_gpu.jl`](examples/end_to_end_gpu.jl) — same demo on GPU with CUDSS
 - [`examples/HydroPowerModels/`](examples/HydroPowerModels/) — full multi-stage hydrothermal scheduling with DC and AC OPF (open-loop DE, embedded closed-loop, strict targets, critic control variate)
+
+## Repository Map
+
+| Path | Purpose |
+|---|---|
+| `src/DecisionRulesExa.jl` | Module entrypoint and public exports |
+| `src/policy.jl` | MLP, state-conditioned LSTM policies, bounded target policies, nonlinear target heads |
+| `src/deterministic_equivalent.jl` | Generic open-loop deterministic-equivalent builder and solve helpers |
+| `src/embedded_deterministic_equivalent.jl` | Generic embedded-policy deterministic equivalent with nonlinear oracle |
+| `src/training.jl` | `train_tsddr`, embedded training, solver retry/warm-start handling |
+| `src/rollout.jl` | Stage-wise rollout evaluation for ExaModels problems |
+| `src/critic_control_variate.jl` | Scalar critic/control-variate helpers |
+| `src/utils.jl` | Indexing and small shared utilities |
+| `examples/end_to_end_cpu.jl` | Minimal CPU training demo |
+| `examples/end_to_end_gpu.jl` | Minimal GPU training demo |
+| `examples/HydroPowerModels/` | Bolivia hydrothermal scheduling examples |
+| `test/runtests.jl` | Unit and smoke tests |
 
 ## Citation
 

@@ -1,10 +1,31 @@
-# train_hydro_exa.jl
+# train_hydro_exa_strict.jl
 #
-# HydroPowerModels training with ExaModels + MadNLP (DC or AC OPF).
-# Uses train_tsddr from DecisionRulesExa — no custom functions or structs needed.
+# Strict-mode regular DE training with ExaModels + MadNLP (AC polar OPF).
+# Uses HydroReachablePolicy (sigmoid-bounded to one-stage reachable set)
+# with strict_targets=true (delta variables fixed to zero, no target penalty).
+#
+# Key insight: ordinary regular DE target generation is open-loop after x0, so
+# strict equality is usually unsafe: the optimizer may discover realized states
+# different from the target path, and later targets were not computed from those
+# realized states. Here the reachable policy is rolled out from the true x0 and
+# uses the previous target as the next policy state. Since every target is
+# one-stage reachable from the previous target, the full target trajectory is
+# feasible by induction and strict regular DE is valid.
+#
+# Environment variables:
+#   DR_ENCODER_LAYERS       = "128,128"  (LSTM encoder layer sizes)
+#   DR_HEAD_LAYERS          = ""         (state-conditioned target-head hidden sizes)
+#   DR_LAYERS               = "128,128"  (legacy alias for DR_ENCODER_LAYERS)
+#   DR_NUM_STAGES           = "126"
+#   DR_NUM_ROLLOUT_STAGES   = "96"
+#   DR_NUM_EPOCHS           = "80"
+#   DR_NUM_BATCHES          = "100"
+#   DR_EVAL_EVERY           = "50"
+#   DR_GRAD_CLIP            = "0"
+#   DR_MAX_ITER             = "9000"
 #
 # Usage:
-#   julia --project -t auto train_hydro_exa.jl
+#   julia --project -t auto train_hydro_exa_strict.jl
 
 using DecisionRulesExa
 using ExaModels
@@ -19,11 +40,12 @@ using CUDSS, CUDSS_jll, cuDNN
 const SCRIPT_DIR = dirname(@__FILE__)
 include(joinpath(SCRIPT_DIR, "hydro_power_data.jl"))
 include(joinpath(SCRIPT_DIR, "hydro_power_exa.jl"))
+include(joinpath(SCRIPT_DIR, "hydro_power_exa_embedded.jl"))
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 const CASE_NAME   = "bolivia"
-const FORMULATION = :ac_polar        # :dc  or  :ac_polar
+const FORMULATION = :ac_polar
 const FORM_LABEL  = FORMULATION === :ac_polar ? "ACPPowerModel" : "DCPPowerModel"
 
 const CASE_DIR    = joinpath(SCRIPT_DIR, CASE_NAME)
@@ -35,36 +57,35 @@ const DEMAND_FILE = joinpath(CASE_DIR, "demand.csv")
 """
     parse_layers(s::AbstractString) -> Vector{Int}
 
-Parse a comma-separated neural-network layer specification from an environment
-variable.
+Parse a comma-separated hidden-layer specification used by the Slurm and local
+training entrypoints.
 
-`DR_LAYERS` controls the recurrent uncertainty encoder. `DR_HEAD_LAYERS`
-controls optional hidden layers in the nonrecurrent state-conditioned target
-head. An empty string intentionally returns `Int[]`, preserving the historical
-single Dense head.
+An empty string means "no hidden layers" for the nonrecurrent target head. This
+lets `DR_HEAD_LAYERS=""` preserve the historical single Dense head, while values
+such as `"128,128"` create a deeper state-conditioned feed-forward head.
 
 # Arguments
 - `s::AbstractString`: comma-separated layer widths, with optional whitespace.
 
 # Returns
-- `Vector{Int}`: parsed hidden widths; `Int[]` for an empty specification.
+- `Vector{Int}`: parsed hidden widths; `Int[]` when `s` is empty or whitespace.
 
 # Examples
 ```julia
-parse_layers("128,128") == [128, 128]
+parse_layers("128, 64") == [128, 64]
 parse_layers("") == Int[]
 ```
 """
 parse_layers(s::AbstractString) =
     isempty(strip(s)) ? Int[] : [parse(Int, strip(x)) for x in split(s, ",") if !isempty(strip(x))]
 
-const LAYERS      = parse_layers(get(ENV, "DR_LAYERS", "128,128"))
-const HEAD_LAYERS = parse_layers(get(ENV, "DR_HEAD_LAYERS", ""))
+const ENCODER_LAYERS = parse_layers(get(ENV, "DR_ENCODER_LAYERS", get(ENV, "DR_LAYERS", "128,128")))
+const HEAD_LAYERS    = parse_layers(get(ENV, "DR_HEAD_LAYERS", ""))
 const ACTIVATION  = sigmoid
 const NUM_STAGES  = parse(Int, get(ENV, "DR_NUM_STAGES", "126"))
 const NUM_ROLLOUT_STAGES = parse(Int, get(ENV, "DR_NUM_ROLLOUT_STAGES", "96"))
 const NUM_EPOCHS  = parse(Int, get(ENV, "DR_NUM_EPOCHS", "80"))
-const NUM_BATCHES = 100
+const NUM_BATCHES = parse(Int, get(ENV, "DR_NUM_BATCHES", "100"))
 const NUM_TRAIN_PER_BATCH = 1
 const NUM_EVAL_SCENARIOS  = 4
 const EVAL_EVERY  = parse(Int, get(ENV, "DR_EVAL_EVERY", "50"))
@@ -72,63 +93,24 @@ const LR          = 1f-3
 const GRAD_CLIP   = parse(Float32, get(ENV, "DR_GRAD_CLIP", "0"))
 
 const TARGET_PEN_ARG = :auto
-const HYDRO_TARGET_PENALTY_MULT = parse(Float64, get(ENV, "DR_TARGET_PENALTY_MULT", "8.0"))
+const HYDRO_TARGET_PENALTY_MULT = 8.0
 const DEFICIT_COST   = 1e5
 const USE_GPU        = true
 const load_scaler    = 0.6
 const NUM_WORKERS    = 1
 
-const DISCOUNT_GAMMA = parse(Float64, get(ENV, "DR_DISCOUNT_GAMMA", "1.0"))
 const ROLLOUT_PARALLEL = parse(Bool, get(ENV, "DR_ROLLOUT_PARALLEL", "false"))
-
-const _PENALTY_MODE = get(ENV, "DR_PENALTY_SCHEDULE", "const")
-const _N_TOTAL = NUM_EPOCHS * NUM_BATCHES
-const _ANNEAL_1_END = max(1, div(_N_TOTAL, 100))
-const _ANNEAL_2_END = max(_ANNEAL_1_END + 1, div(_N_TOTAL, 40))
-const _ANNEAL_3_END = max(_ANNEAL_2_END + 1, div(_N_TOTAL, 10))
-const PENALTY_SCHEDULE = if _PENALTY_MODE == "annealed"
-    [
-        (1,  _ANNEAL_1_END, 0.1),
-        (_ANNEAL_1_END + 1, _ANNEAL_2_END, 1.0),
-        (_ANNEAL_2_END + 1, _ANNEAL_3_END, 4.0),
-        (_ANNEAL_3_END + 1, _N_TOTAL, HYDRO_TARGET_PENALTY_MULT),
-    ]
-elseif _PENALTY_MODE == "annealed_discount"
-    [
-        (1,  _ANNEAL_1_END, 0.1),
-        (_ANNEAL_1_END + 1, _ANNEAL_2_END, 1.0),
-        (_ANNEAL_2_END + 1, _ANNEAL_3_END, 4.0),
-        (_ANNEAL_3_END + 1, _N_TOTAL, HYDRO_TARGET_PENALTY_MULT),
-    ]
-else
-    [(1, _N_TOTAL, HYDRO_TARGET_PENALTY_MULT)]
-end
-
-# Optional: ramp num_train_per_batch and eval scenarios over training.
-# Set to `nothing` to use fixed NUM_TRAIN_PER_BATCH / NUM_EVAL_SCENARIOS.
-const NUM_TRAIN_SCHEDULE = nothing  # e.g. [(1,500,1),(501,2000,4),(2001,4000,8)]
-const EVAL_SCHEDULE      = nothing  # e.g. [(1,2000,4),(2001,4000,32)]
 
 const MAX_ITER = parse(Int, get(ENV, "DR_MAX_ITER", "9000"))
 const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = MAX_ITER)
 
 const _CLIP_TAG  = GRAD_CLIP > 0 ? "-clip$(Int(GRAD_CLIP))" : ""
-const _DISC_TAG  = DISCOUNT_GAMMA < 1.0 ? "-disc$(replace(string(DISCOUNT_GAMMA), "." => ""))" : ""
-const _SCHED_TAG = if _PENALTY_MODE == "annealed"
-    "-anneal"
-elseif _PENALTY_MODE == "annealed_discount"
-    "-anndisc"
-else
-    "-const"
-end
-const _LAYER_TAG = LAYERS == [128, 128] ? "" : "-L$(join(LAYERS, "_"))"
-const _HEAD_TAG  = isempty(HEAD_LAYERS) ? "" : "-H$(join(HEAD_LAYERS, "_"))"
-const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-deteq-gpu$(_CLIP_TAG)$(_SCHED_TAG)$(_DISC_TAG)$(_LAYER_TAG)$(_HEAD_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
+const _ENC_TAG   = ENCODER_LAYERS == [128, 128] ? "" : "-E$(join(ENCODER_LAYERS, "_"))"
+const _HEAD_TAG  = isempty(HEAD_LAYERS) ? "-Hlinear" : "-H$(join(HEAD_LAYERS, "_"))"
+const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-deteq-strict-gpu$(_CLIP_TAG)$(_ENC_TAG)$(_HEAD_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
 const MODEL_DIR = joinpath(CASE_DIR, FORM_LABEL, "models")
 mkpath(MODEL_DIR)
 const MODEL_PATH = joinpath(MODEL_DIR, RUN_NAME * ".jld2")
-
-const PRE_TRAINED = nothing
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
@@ -151,13 +133,12 @@ else
     nothing
 end
 
-# ── Build ExaModels DE ────────────────────────────────────────────────────────
+# ── Build ExaModels DE (strict: delta variables fixed to zero) ────────────────
 
 resolved_pen = TARGET_PEN_ARG === :auto ?
                auto_target_penalty(power_data, hydro_data) :
                Float64(TARGET_PEN_ARG)
-@info "Auto target penalty: ρ=$(round(resolved_pen; digits=2))"
-@info "Bolivia hydro target-penalty multiplier default: $(HYDRO_TARGET_PENALTY_MULT)"
+@info "Auto target penalty: ρ=$(round(resolved_pen; digits=2)) (not used — strict mode)"
 
 backend = USE_GPU ? (@info "Using GPU backend"; CUDA.CUDABackend()) :
                     (@info "Using CPU backend"; nothing)
@@ -171,10 +152,11 @@ function _build_de()
         deficit_cost   = DEFICIT_COST,
         demand_matrix  = demand_mat,
         load_scaler    = load_scaler,
+        strict_targets = true,
     )
 end
 
-@info "Building $(T)-stage ExaModels DE (formulation=$FORMULATION)..."
+@info "Building strict $(T)-stage ExaModels DE (formulation=$FORMULATION)..."
 prob = _build_de()
 
 @info "Building $(NUM_WORKERS)-worker problem pool..."
@@ -183,7 +165,7 @@ for i in 2:NUM_WORKERS
     p = _build_de()
     push!(problem_pool, (p, p.p_x0, p.p_target, p.p_inflow))
 end
-@info "  Pool ready: $(NUM_WORKERS) independent DE instances on GPU"
+@info "  Pool ready: $(NUM_WORKERS) independent strict DE instances on GPU"
 
 x0_init = Float32.([clamp(hydro_data.initial_volumes[r],
                            hydro_data.units[r].min_vol,
@@ -192,38 +174,70 @@ x0_init = Float32.([clamp(hydro_data.initial_volumes[r],
 target_lower = Float32.([h.min_vol for h in hydro_data.units])
 target_upper = Float32.([h.max_vol for h in hydro_data.units])
 
+# ── Policy (HydroReachablePolicy — one-stage reachable sigmoid bounds) ────────
+
+Random.seed!(42)
+policy = hydro_reachable_policy(hydro_data, ENCODER_LAYERS;
+                                activation       = ACTIVATION,
+                                encoder_type     = Flux.LSTM,
+                                combiner_layers  = HEAD_LAYERS)
+
+"""
+    rollout_reachable_targets(policy, x0, w_flat, T, nHyd) -> Vector{Float64}
+
+Roll out a [`HydroReachablePolicy`] target trajectory before solving the strict
+regular deterministic equivalent.
+
+The regular DE receives an external target vector, so it cannot query the policy
+inside the NLP. This helper constructs that vector in a way that preserves
+strict-mode feasibility: it starts from the known feasible initial state `x0`,
+feeds `[w_t; previous_target]` to the policy, and stores each reachable target as
+the next previous state. By induction, every target in the returned trajectory is
+reachable from the prior target under the sampled inflow path.
+
+# Arguments
+- `policy`: reachable hydro policy with input `[inflow; previous_state]`.
+- `x0`: initial reservoir state.
+- `w_flat`: stage-major flat inflow vector of length `T * nHyd`.
+- `T::Int`: number of stages.
+- `nHyd::Int`: number of hydro reservoir state components.
+
+# Returns
+- `Vector{Float64}`: stage-major target trajectory suitable for
+  `ExaModels.set_parameter!(prob.core, prob.p_target, targets)`.
+
+# Examples
+```julia
+targets = rollout_reachable_targets(policy, x0_init, mean_inflow(hydro_data, T), T, nHyd)
+```
+"""
+function rollout_reachable_targets(policy, x0, w_flat, T, nHyd)
+    Flux.reset!(policy)
+    prev = x0
+    targets = Vector{Vector{Float32}}(undef, T)
+    for t in 1:T
+        wt = Float32.(view(w_flat, ((t - 1) * nHyd + 1):(t * nHyd)))
+        target = policy(vcat(wt, prev))
+        targets[t] = Float32.(target)
+        prev = targets[t]
+    end
+    return Float64.(vcat(targets...))
+end
+
 # ── Smoke test ────────────────────────────────────────────────────────────────
 
 w_mean = mean_inflow(hydro_data, T)
+xhat_mean = rollout_reachable_targets(policy, x0_init, w_mean, T, nHyd)
 ExaModels.set_parameter!(prob.core, prob.p_x0,     x0_init)
 ExaModels.set_parameter!(prob.core, prob.p_inflow,  w_mean)
-ExaModels.set_parameter!(prob.core, prob.p_target,  zeros(T * nHyd))
-@info "Smoke test: solving DE with mean inflows..."
+ExaModels.set_parameter!(prob.core, prob.p_target,  xhat_mean)
+@info "Smoke test: solving strict DE with mean inflows and reachable policy targets..."
 result0 = MadNLP.madnlp(prob.model; SOLVER_KWARGS..., print_level = MadNLP.WARN)
 @info "  Status: $(result0.status)   Objective: $(round(result0.objective; digits=4))"
 isfinite(result0.objective) || error("Smoke test returned non-finite objective")
 solve_succeeded(result0) || @warn "Smoke test did not fully converge; proceeding anyway"
 
-resolved_pen_l1 = prob.base_penalty_l1
-
-const _discount_weights = Float64[DISCOUNT_GAMMA^(t-1) for t in 1:T for _ in 1:nHyd]
-if DISCOUNT_GAMMA < 1.0
-    @info "Discount γ=$(DISCOUNT_GAMMA): stage 1 weight=1.0, stage $T weight=$(round(DISCOUNT_GAMMA^(T-1); sigdigits=4))"
-end
-
-# ── Policy ────────────────────────────────────────────────────────────────────
-
-policy_active_mask = trues(nHyd)
-policy = bounded_state_policy(nHyd, target_lower, target_upper, LAYERS;
-                              activation   = ACTIVATION,
-                              encoder_type = Flux.LSTM,
-                              active_mask  = policy_active_mask,
-                              combiner_layers = HEAD_LAYERS)
-
-if !isnothing(PRE_TRAINED)
-    @info "Loading pre-trained model from $(PRE_TRAINED)..."
-    load_stateconditioned_policy!(policy, JLD2.load(PRE_TRAINED, "model_state"))
-end
+Flux.reset!(policy)
 
 if USE_GPU
     policy  = CUDA.cu(policy)
@@ -240,14 +254,13 @@ lg = WandbLogger(
     config  = Dict(
         "case"            => CASE_NAME,
         "formulation"     => FORM_LABEL,
+        "method"          => "deteq-strict",
         "num_stages"      => T,
         "num_rollout_stages" => T_ROLLOUT,
-        "layers"          => LAYERS,
+        "encoder_layers"  => ENCODER_LAYERS,
         "head_layers"     => HEAD_LAYERS,
         "activation"      => string(ACTIVATION),
-        "target_penalty"  => "auto=$(round(resolved_pen; digits=2))",
-        "target_penalty_l1" => "auto=$(round(resolved_pen_l1; digits=2))",
-        "hydro_target_penalty_mult" => HYDRO_TARGET_PENALTY_MULT,
+        "target_penalty"  => "strict (disabled)",
         "deficit_cost"    => DEFICIT_COST,
         "num_epochs"      => NUM_EPOCHS,
         "num_batches"     => NUM_BATCHES,
@@ -258,10 +271,8 @@ lg = WandbLogger(
         "grad_clip"       => GRAD_CLIP,
         "backend"         => USE_GPU ? "GPU" : "CPU",
         "load_scaler"     => load_scaler,
-        "penalty_schedule" => string(PENALTY_SCHEDULE),
-        "discount_gamma"  => DISCOUNT_GAMMA,
-        "num_train_schedule" => string(something(NUM_TRAIN_SCHEDULE, "fixed")),
-        "eval_schedule"   => string(something(EVAL_SCHEDULE, "fixed")),
+        "strict_targets"  => true,
+        "policy_type"     => "HydroReachablePolicy",
         "num_workers"     => NUM_WORKERS,
     ),
 )
@@ -279,10 +290,11 @@ function _build_rollout_de()
         backend        = backend,
         float_type     = Float64,
         formulation    = FORMULATION,
-        target_penalty = resolved_pen * HYDRO_TARGET_PENALTY_MULT,
+        target_penalty = TARGET_PEN_ARG,
         deficit_cost   = DEFICIT_COST,
         demand_matrix  = stage_demand,
         load_scaler    = load_scaler,
+        strict_targets = true,
     )
 end
 rollout_prob = _build_rollout_de()
@@ -308,16 +320,7 @@ const _max_vols = Float64.([h.max_vol for h in hydro_data.units])
 const _min_vols_dev = USE_GPU ? CUDA.cu(_min_vols) : _min_vols
 const _max_vols_dev = USE_GPU ? CUDA.cu(_max_vols) : _max_vols
 
-const _rollout_pen = resolved_pen * HYDRO_TARGET_PENALTY_MULT
-const _rollout_pen_l1 = _rollout_pen
-
-function hydro_objective_no_target_penalty(stage_prob, result)
-    sol = hydro_solution(stage_prob, result)
-    delta = sol.delta
-    penalty_l2_cost = (_rollout_pen / 2) * sum(abs2, delta)
-    penalty_l1_cost = _rollout_pen_l1 * sum(abs, delta)
-    return result.objective - penalty_l2_cost - penalty_l1_cost
-end
+hydro_objective_no_target_penalty(stage_prob, result) = result.objective
 
 Random.seed!(8789)
 eval_scenarios = [sample_scenario(hydro_data, T_ROLLOUT) for _ in 1:NUM_EVAL_SCENARIOS]
@@ -333,7 +336,7 @@ rollout_evaluation = RolloutEvaluation(
     madnlp_kwargs = SOLVER_KWARGS,
     warmstart = false,
     stride = EVAL_EVERY,
-    policy_state = :target,
+    policy_state = :realized,
     stage_problem_pool = rollout_pool,
     retry_on_failure = true,
     active_scenarios = NUM_EVAL_SCENARIOS,
@@ -342,14 +345,6 @@ rollout_evaluation = RolloutEvaluation(
 
 Random.seed!(8788)
 
-function _schedule_value(schedule, iter, default)
-    for (lo, hi, val) in schedule
-        lo <= iter <= hi && return val
-    end
-    return default
-end
-
-current_penalty_mult = Ref(NaN)
 last_batch_stats = Ref(Dict{String, Any}())
 
 function _merge_batch_stats!(metrics, stats)
@@ -398,26 +393,7 @@ train_tsddr(
             @info "Training solve status at iter $iter" n_ok n_total status_counts=get(stats, "status_counts", nothing) retry_counts=get(stats, "retry_counts", nothing)
         end
     end,
-    adjust_hyperparameters = (iter, opt_state, n) -> begin
-        mult = _schedule_value(PENALTY_SCHEDULE, iter, last(PENALTY_SCHEDULE)[3])
-        if mult != current_penalty_mult[]
-            current_penalty_mult[] = mult
-            ρ_half_scaled = prob.base_penalty_half * mult
-            ρ_l1_scaled   = prob.base_penalty_l1 * mult
-            penalty_vals    = ρ_half_scaled .* _discount_weights
-            penalty_l1_vals = ρ_l1_scaled   .* _discount_weights
-            for (p, _, _, _) in problem_pool
-                ExaModels.set_parameter!(p.core, p.p_penalty_half, penalty_vals)
-                ExaModels.set_parameter!(p.core, p.p_penalty_l1,   penalty_l1_vals)
-            end
-            @info "Penalty multiplier → $mult  (ρ/2 = $(round(ρ_half_scaled; digits=2)), λ_l1 = $(round(ρ_l1_scaled; digits=2)), γ=$DISCOUNT_GAMMA)"
-        end
-        if !isnothing(EVAL_SCHEDULE)
-            n_eval = _schedule_value(EVAL_SCHEDULE, iter, NUM_EVAL_SCENARIOS)
-            rollout_evaluation.active_scenarios = n_eval
-        end
-        return isnothing(NUM_TRAIN_SCHEDULE) ? n : _schedule_value(NUM_TRAIN_SCHEDULE, iter, n)
-    end,
+    adjust_hyperparameters = (iter, opt_state, n) -> n,
     record_loss          = (iter, m, loss, tag) -> begin
         metrics = Dict{String, Any}(tag => loss, "batch" => iter)
         _merge_batch_stats!(metrics, last_batch_stats[])
@@ -433,10 +409,6 @@ train_tsddr(
                 rollout_evaluation.last_violation_share
             metrics["metrics/rollout_n_ok"] =
                 rollout_evaluation.last_n_ok
-        end
-
-        if !isnan(current_penalty_mult[])
-            metrics["metrics/target_penalty_multiplier"] = current_penalty_mult[]
         end
 
         batch_in_epoch = (iter - 1) % NUM_BATCHES + 1

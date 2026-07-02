@@ -22,7 +22,7 @@ import DecisionRulesExa: set_x0!, set_uncertainty!, set_targets!, invalidate_pol
 
 """
     hydro_reachable_policy(hydro_data, layers; activation=sigmoid, encoder_type=Flux.LSTM,
-                           spill_max=nothing)
+                           spill_max=nothing, combiner_layers=Int[])
 
 Build a state-conditioned policy whose outputs are one-stage reachable
 reservoir targets for the hydro water-balance model. The neural network predicts
@@ -32,6 +32,18 @@ from `(inflow_t, reservoir_t)`.
 The current HydroData model has no finite spill upper bound, so by default the
 lower bound is the storage minimum. Pass `spill_max` to use a finite
 `x + K*inflow - K*max_turn - spill_max` lower reachability bound.
+
+`layers` controls the recurrent encoder over inflows only. `combiner_layers`
+adds feed-forward hidden layers after `[encoded_inflow; reservoir_state]`, so
+the state-to-target map can be nonlinear without making the state input
+recurrent.
+
+For strict regular deterministic equivalents, the same reachable policy can be
+rolled out from the known initial state using previous targets as the policy
+state. Since every emitted target is one-stage reachable from the previous
+target, the whole target trajectory is feasible by induction. Embedded strict
+DEs use the same policy with realized reservoir states inside the NLP; their
+manual oracle currently supports the default single Dense head only.
 """
 struct HydroReachablePolicy{E,C,V,S}
     encoder::E
@@ -112,6 +124,7 @@ function hydro_reachable_policy(
     activation = sigmoid,
     encoder_type = Flux.LSTM,
     spill_max = nothing,
+    combiner_layers = Int[],
 )
     (activation === sigmoid || activation === NNlib.sigmoid || activation === NNlib.sigmoid_fast) ||
         throw(ArgumentError("hydro_reachable_policy requires a sigmoid-style activation so normalized targets stay in [0, 1]"))
@@ -120,7 +133,12 @@ function hydro_reachable_policy(
     enc_layers = [encoder_type(enc_sizes[i] => enc_sizes[i+1])
                   for i in 1:length(layers)]
     encoder  = Flux.Chain(enc_layers...)
-    combiner = Flux.Dense(layers[end] + nHyd => nHyd, activation)
+    combiner = DecisionRulesExa._dense_policy_head(
+        layers[end] + nHyd,
+        nHyd,
+        collect(Int, combiner_layers);
+        activation = activation,
+    )
     spill_vec = spill_max === nothing ? nothing : Float32.(collect(spill_max))
     if spill_vec !== nothing && length(spill_vec) != nHyd
         throw(ArgumentError("spill_max length must be nHyd=$nHyd"))
@@ -295,6 +313,8 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
 
     encoder  = policy.encoder
     combiner = policy.combiner
+    combiner isa Flux.Dense ||
+        throw(ArgumentError("embedded hydro DE currently requires the default single Dense reachable-policy head; use combiner_layers=Int[] or regular strict DE for multilayer state heads"))
     n_h      = size(combiner.weight, 2) - policy.n_state
     reachable_policy = policy isa HydroReachablePolicy
     has_spill_cap = reachable_policy && policy.spill_max !== nothing

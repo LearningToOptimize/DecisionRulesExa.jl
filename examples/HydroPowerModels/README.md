@@ -47,18 +47,50 @@ Pre-solved deterministic-equivalent references (MOF format) are provided for val
 
 | File | Description |
 |---|---|
+| `Project.toml` | Example-specific environment with CUDA, CUDSS, MadNLPGPU, W&B, and JLD2 |
+| `README.md` | This guide |
+| `bolivia/PowerModels.json` | Bolivia network topology and generator data |
+| `bolivia/hydro.json` | Hydro unit limits, initial volumes, cascade metadata, and stage duration |
+| `bolivia/inflows.csv` | Historical inflow scenarios |
+| `bolivia/_demand.csv` | Optional per-stage demand scaling data |
+| `bolivia/DCPPowerModel.mof.json` | Pre-exported DC OPF stage template |
+| `bolivia/ACPPowerModel.mof.json` | Pre-exported AC polar OPF stage template |
+| `bolivia/SOCWRConicPowerModel.mof.json` | Convex relaxation template used for validation/baselines |
+| `hydro_power_data.jl` | Data parsing for PowerModels JSON, hydro JSON, inflows, and demand |
+| `hydro_power_exa.jl` | Regular open-loop ExaModels DE builder; supports `strict_targets=true` |
+| `hydro_power_exa_embedded.jl` | Embedded-policy DE builder and `HydroReachablePolicy` implementation |
 | `train_hydro_exa.jl` | Open-loop DE training with penalty scheduling, parallel GPU solves, and W&B logging |
 | `train_hydro_exa_embedded.jl` | Embedded (closed-loop) DE training; supports `DR_STRICT_EMBEDDED_TARGETS=true` for penalty-free strict mode |
+| `train_hydro_exa_strict.jl` | Regular strict DE training using reachable-policy target rollout and no target slack penalty |
 | `train_hydro_exa_critic.jl` | Critic/control-variate variant; adds a scalar critic with replay buffer and cheap rollout samples |
-| `hydro_power_data.jl` | Data parsing (PowerModels JSON, hydro JSON, inflows CSV) |
-| `hydro_power_exa.jl` | ExaModels problem builder for open-loop DE (DC and AC OPF) |
-| `hydro_power_exa_embedded.jl` | ExaModels problem builder for embedded DE with `VectorNonlinearOracle`; includes reachable-set policy for strict mode |
 | `eval_exa_de.jl` | Validation script comparing ExaModels results against JuMP reference |
-| `Project.toml` | Example-specific dependencies (W&B, JLD2, CUDA, etc.) |
 
 ## Running
 
-### Strict embedded training (recommended)
+### Strict regular DE training (recommended for the current experiments)
+
+```bash
+DR_ENCODER_LAYERS=128,128 \
+DR_HEAD_LAYERS=128,128 \
+julia --project -t auto train_hydro_exa_strict.jl
+```
+
+This path removes all target slack penalties from the regular deterministic
+equivalent. The target trajectory is generated before the solve, but it is not a
+generic open-loop trajectory: `HydroReachablePolicy` starts from the known
+initial reservoir state and feeds each previous target into the next policy call.
+Because every emitted target is one-stage reachable from the previous target,
+the full strict DE target path is feasible by induction. The strict solve then
+forces the realized reservoir path to equal that reachable target path.
+
+Use:
+
+- `DR_ENCODER_LAYERS`: recurrent LSTM layers over inflows only.
+- `DR_HEAD_LAYERS`: optional feed-forward hidden layers over
+  `[encoded_inflow; reservoir_state]`. This is the nonlinear state-to-target
+  map; it does not add recurrence over the state input.
+
+### Strict embedded training
 
 ```bash
 DR_STRICT_EMBEDDED_TARGETS=true julia --project -t auto train_hydro_exa_embedded.jl
@@ -66,7 +98,10 @@ DR_STRICT_EMBEDDED_TARGETS=true julia --project -t auto train_hydro_exa_embedded
 
 Strict mode embeds the policy inside the NLP and enforces hard equality
 targets — no penalty tuning needed.  Requires a reachable-set policy
-(built automatically from the hydro data).
+(built automatically from the hydro data). The current embedded oracle manually
+codes the reachable-policy Jacobian for the default single Dense target head;
+use the regular strict DE script for multilayer state-conditioned heads unless
+the embedded oracle is extended.
 
 ### Open-loop DE training (GPU)
 
@@ -102,6 +137,7 @@ Key parameters in `train_hydro_exa.jl`:
 | `NUM_BATCHES` | 100 | Gradient steps per epoch |
 | `NUM_WORKERS` | 4 | Parallel GPU solver instances |
 | `LAYERS` | `[128, 128]` | LSTM hidden layer sizes |
+| `DR_HEAD_LAYERS` | `""` | Optional nonrecurrent state-conditioned target-head hidden sizes |
 | `LR` | 1e-3 | Learning rate |
 | `DEFICIT_COST` | 1e5 | Load-shedding penalty ($/pu) |
 | `DR_TARGET_PENALTY_MULT` | `8.0` | Bolivia hydro default multiplier applied to the `:auto` target-penalty coefficients |
@@ -160,14 +196,17 @@ increasing target leakage and worsens the no-target objective gap.
 | 126 | 8 | 0.97 | 375477.644 | -861.990 | 2.86e-4 | 4.47e-3 |
 | 126 | 8 | 0.95 | 375175.342 | -1164.292 | 4.89e-4 | 1.55e-2 |
 
-### Strict embedded hydro targets
+### Strict reachable hydro targets
 
-The embedded hydro builder also supports a strict target mode:
+The hydro builders support strict target mode when paired with
+`HydroReachablePolicy`:
 
 ```julia
 policy = hydro_reachable_policy(hydro_data, LAYERS;
-                                activation = sigmoid,
-                                encoder_type = Flux.LSTM)
+    activation = sigmoid,
+    encoder_type = Flux.LSTM,
+    combiner_layers = HEAD_LAYERS,
+)
 
 prob = build_embedded_hydro_de(policy, power_data, hydro_data, T;
     formulation = :ac_polar,
@@ -182,7 +221,7 @@ export DR_STRICT_EMBEDDED_TARGETS=true
 julia --project -t auto train_hydro_exa_embedded.jl
 ```
 
-In strict mode the embedded oracle enforces
+In embedded strict mode the oracle enforces
 
 ```text
 reservoir[t+1, r] = pi_theta(inflow[t], reservoir[t])[r]
@@ -190,8 +229,21 @@ reservoir[t+1, r] = pi_theta(inflow[t], reservoir[t])[r]
 
 directly. No `delta_pos`, `delta_neg`, L2 target penalty, or L1 target penalty
 is created for the target equality. This is intended for closed-loop embedded
-training only: the policy is evaluated with the realized previous reservoir
-state, so it can produce a physically reachable next reservoir by construction.
+training: the policy is evaluated with the realized previous reservoir state, so
+it can produce a physically reachable next reservoir by construction.
+
+In regular strict DE, `train_hydro_exa_strict.jl` instead constructs the target
+trajectory externally:
+
+```text
+target[0] = initial_volume
+target[t] = pi_theta(inflow[t], target[t-1])
+```
+
+Since `pi_theta` maps into the one-stage reachable set from its input state, the
+target trajectory is feasible by induction. This is the specific reason strict
+mode is valid for regular DE here, despite regular DE target generation usually
+being open-loop after the initial state.
 
 For the current hydro water balance,
 

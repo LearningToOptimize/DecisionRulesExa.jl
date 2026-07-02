@@ -124,6 +124,21 @@ end
     @test lower[3] <= y[3] <= upper[3]
     @test length(policy.policy.combiner.bias) == 2
 
+    deep_policy = bounded_state_policy(
+        2,
+        lower,
+        upper,
+        [4];
+        activation = sigmoid,
+        combiner_layers = [5, 4],
+    )
+    @test deep_policy.policy.combiner isa Flux.Chain
+    y_deep = deep_policy(Float32[0.2, -0.1, 3, 1, -1])
+    @test length(y_deep) == 3
+    @test lower[1] <= y_deep[1] <= upper[1]
+    @test y_deep[2] == lower[2]
+    @test lower[3] <= y_deep[3] <= upper[3]
+
     constant_policy = bounded_state_policy(1, Float32[3, -4], Float32[3, -4], [4])
     @test constant_policy(Float32[0, 99, 100]) == Float32[3, -4]
     @test isempty(Flux.trainables(constant_policy))
