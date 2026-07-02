@@ -40,9 +40,12 @@ struct EmbeddedDeterministicEquivalentProblem{P}
     _x0_buf::Vector{Float64}
 end
 
-# Duck-typing: set_x0! and set_uncertainty! update both ExaModels parameters
-# AND the oracle's closure buffers so the callbacks see the new data.
+"""
+    set_x0!(prob::EmbeddedDeterministicEquivalentProblem, x0)
 
+Update the initial state ``x_0`` for both the ExaModels parameter and the
+oracle's closure buffer (so the policy callback sees the new ``x_0``).
+"""
 function set_x0!(prob::EmbeddedDeterministicEquivalentProblem, x0::AbstractVector)
     length(x0) == prob.nx || error("x0 length must be nx=$(prob.nx), got $(length(x0))")
     ExaModels.set_parameter!(prob.core, prob.p_x0, x0)
@@ -50,6 +53,12 @@ function set_x0!(prob::EmbeddedDeterministicEquivalentProblem, x0::AbstractVecto
     return prob
 end
 
+"""
+    set_uncertainty!(prob::EmbeddedDeterministicEquivalentProblem, w)
+
+Update the disturbance trajectory ``w_{1:T}`` for both the ExaModels parameter
+and the oracle's closure buffer. Accepts length `(T-1)*nw` or `T*nw`.
+"""
 function set_uncertainty!(prob::EmbeddedDeterministicEquivalentProblem, w::AbstractVector)
     expected = (prob.horizon - 1) * prob.nw
     full_len = prob.horizon * prob.nw
@@ -66,7 +75,12 @@ function set_uncertainty!(prob::EmbeddedDeterministicEquivalentProblem, w::Abstr
     return prob
 end
 
-# No-op: targets live inside the oracle, not as parameters.
+"""
+    set_targets!(::EmbeddedDeterministicEquivalentProblem, ::AbstractVector) -> Nothing
+
+No-op for embedded problems: targets are computed inline by the oracle callback,
+not stored as NLP parameters.
+"""
 function set_targets!(::EmbeddedDeterministicEquivalentProblem, ::AbstractVector)
     return nothing
 end
@@ -343,9 +357,20 @@ function build_embedded_deterministic_equivalent(
     )
 end
 
+"""
+    target_multipliers(prob::EmbeddedDeterministicEquivalentProblem, result) -> λ
+
+Return the dual multipliers ``\\lambda_t`` on the oracle constraint
+``\\pi_\\theta(w_t, x_{t-1}) - x_t - \\delta_t = 0``.
+"""
 target_multipliers(prob::EmbeddedDeterministicEquivalentProblem, result) =
     result.multipliers[prob.target_con_range]
 
+"""
+    solution_components(prob::EmbeddedDeterministicEquivalentProblem, result) -> (x, u, δ)
+
+Split the flat solution vector into state, control, and slack components.
+"""
 function solution_components(prob::EmbeddedDeterministicEquivalentProblem, result)
     n_x = prob.horizon * prob.nx
     n_u = (prob.horizon - 1) * prob.nu

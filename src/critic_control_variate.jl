@@ -170,6 +170,13 @@ function CriticSample(
     )
 end
 
+"""
+    CriticReplayBuffer(max_size)
+
+Fixed-capacity FIFO replay buffer for [`CriticSample`](@ref)s. When the buffer
+exceeds `max_size`, the oldest samples are discarded. A `max_size` of 0
+disables buffering (all pushes are no-ops).
+"""
 mutable struct CriticReplayBuffer{S}
     samples::Vector{S}
     max_size::Int
@@ -178,6 +185,12 @@ end
 CriticReplayBuffer(max_size::Integer) =
     CriticReplayBuffer{Any}(Any[], max(0, Int(max_size)))
 
+"""
+    push_critic_sample!(buffer, sample) -> buffer
+
+Append one [`CriticSample`](@ref) to the buffer, evicting the oldest sample if
+the buffer is at capacity.
+"""
 function push_critic_sample!(buffer::CriticReplayBuffer, sample::CriticSample)
     buffer.max_size == 0 && return buffer
     push!(buffer.samples, sample)
@@ -186,6 +199,11 @@ function push_critic_sample!(buffer::CriticReplayBuffer, sample::CriticSample)
     return buffer
 end
 
+"""
+    push_critic_samples!(buffer, samples) -> buffer
+
+Append multiple [`CriticSample`](@ref)s to the buffer in order.
+"""
 function push_critic_samples!(buffer::CriticReplayBuffer, samples)
     for sample in samples
         push_critic_sample!(buffer, sample)

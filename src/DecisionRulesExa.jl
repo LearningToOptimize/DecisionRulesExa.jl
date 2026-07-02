@@ -1,3 +1,21 @@
+"""
+    DecisionRulesExa
+
+GPU-accelerated companion to DecisionRules.jl for Two-Stage Deep Decision
+Rules (TS-DDR) training via ExaModels + MadNLP.
+
+Provides the same TS-DDR workflow — policy predicts target states, NLP
+projects onto the feasible set, dual multipliers feed the policy gradient —
+but formulates subproblems as `ExaModels.ExaModel` instances solved by MadNLP.
+This enables GPU-native training (CUDA via `CUDABackend()`) and exploits
+MadNLP's warm-start capability for fast sequential solves.
+
+Key types:
+- [`DeterministicEquivalentProblem`](@ref): open-loop DE with explicit targets
+- [`EmbeddedDeterministicEquivalentProblem`](@ref): DE with policy embedded via `VectorNonlinearOracle`
+- [`StateConditionedPolicy`](@ref): stateful LSTM policy for sequential rollout
+- [`MLPPolicy`](@ref): stateless MLP policy for full-horizon prediction
+"""
 module DecisionRulesExa
 
 using ExaModels

@@ -1,16 +1,25 @@
 # HydroPowerModels Example
 
-Multi-stage hydrothermal scheduling using DecisionRulesExa.jl with DC or AC OPF formulations.
+Multi-stage hydrothermal scheduling using DecisionRulesExa.jl with DC or AC
+OPF formulations.  This is the GPU-accelerated counterpart of the
+[DecisionRules.jl hydro example](https://github.com/LearningToOptimize/DecisionRules.jl/tree/main/examples/HydroPowerModels).
 
 ## Problem description
 
-A hydro-dominated power system (Bolivia test case) is operated over a planning horizon of up to 96 stages. At each stage, the operator must decide generator dispatch, reservoir outflows, and spillage subject to:
+A hydro-dominated power system (Bolivia test case) is operated over a
+planning horizon of up to 126 stages (96 operational + 30 look-ahead).
+At each stage, the operator must decide generator dispatch, reservoir
+outflows, and spillage subject to:
 
 - **Power flow constraints** (DC linearization or full AC polar OPF)
 - **Reservoir dynamics** (water balance with stochastic inflows)
 - **Generator and transmission limits**
 
-The TS-DDR policy (an LSTM network) predicts target reservoir levels at each stage. The deterministic-equivalent NLP projects these targets onto the feasible set via slack-penalized target constraints. Training uses envelope-theorem gradients: dual multipliers on the target constraints give the policy gradient without differentiating through the solver.
+The TS-DDR policy (an LSTM network) predicts target reservoir levels at
+each stage.  The deterministic-equivalent NLP projects these targets onto
+the feasible set.  Training uses envelope-theorem gradients: dual
+multipliers on the target constraints give the policy gradient without
+differentiating through the solver.
 
 ## Formulations
 
@@ -38,19 +47,30 @@ Pre-solved deterministic-equivalent references (MOF format) are provided for val
 
 | File | Description |
 |---|---|
-| `train_hydro_exa.jl` | Main training script with penalty scheduling, parallel GPU solves, and W&B logging |
-| `train_hydro_exa_critic.jl` | Critic/control-variate variant of the main training script; uses normalized hydro features, a replay buffer, and cheap critic rollouts |
+| `train_hydro_exa.jl` | Open-loop DE training with penalty scheduling, parallel GPU solves, and W&B logging |
+| `train_hydro_exa_embedded.jl` | Embedded (closed-loop) DE training; supports `DR_STRICT_EMBEDDED_TARGETS=true` for penalty-free strict mode |
+| `train_hydro_exa_critic.jl` | Critic/control-variate variant; adds a scalar critic with replay buffer and cheap rollout samples |
 | `hydro_power_data.jl` | Data parsing (PowerModels JSON, hydro JSON, inflows CSV) |
-| `hydro_power_exa.jl` | ExaModels problem builder for DC and AC OPF formulations |
+| `hydro_power_exa.jl` | ExaModels problem builder for open-loop DE (DC and AC OPF) |
+| `hydro_power_exa_embedded.jl` | ExaModels problem builder for embedded DE with `VectorNonlinearOracle`; includes reachable-set policy for strict mode |
 | `eval_exa_de.jl` | Validation script comparing ExaModels results against JuMP reference |
 | `Project.toml` | Example-specific dependencies (W&B, JLD2, CUDA, etc.) |
 
 ## Running
 
-### GPU training (recommended)
+### Strict embedded training (recommended)
 
-```julia
-# From this directory:
+```bash
+DR_STRICT_EMBEDDED_TARGETS=true julia --project -t auto train_hydro_exa_embedded.jl
+```
+
+Strict mode embeds the policy inside the NLP and enforces hard equality
+targets — no penalty tuning needed.  Requires a reachable-set policy
+(built automatically from the hydro data).
+
+### Open-loop DE training (GPU)
+
+```bash
 julia --project -t auto train_hydro_exa.jl
 ```
 
@@ -58,21 +78,17 @@ Set `USE_GPU = true` in `train_hydro_exa.jl` (default). Requires a CUDA-capable 
 
 ### GPU training with critic control variate
 
-```julia
-# From this directory:
+```bash
 julia --project -t auto train_hydro_exa_critic.jl
 ```
 
 The critic script keeps the dual-multiplier actor update but adds a damped
 control variate (`critic_cv_weight = 0.5`) trained on the stage-wise rollout
-objective without target penalty. Its default critic rollout uses
-`policy_state = :target`; set `CRITIC_POLICY_STATE = :realized` for closed-loop
-critic labels. Deterministic-equivalent critic fitting remains available as an
-ablation through `DeterministicEquivalentCriticTarget()`.
+objective without target penalty.
 
 ### CPU training
 
-Set `USE_GPU = false` in `train_hydro_exa.jl`, then run the same command.
+Set `USE_GPU = false` in the training script, then run the same command.
 
 ### Configuration
 
