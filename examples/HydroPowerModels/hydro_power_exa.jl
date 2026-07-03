@@ -19,6 +19,13 @@
 # target_multipliers(prob, result) gives ∇_{x̂} Q. In strict mode the
 # reservoir trajectory is a parameter and target_multipliers transforms
 # water-balance duals into target sensitivities.
+#
+# Strict-mode invariant: with reservoir a parameter, the initial condition
+# reservoir[1,r] − p_x0[r] = 0 would be a parameter-only constraint (an
+# all-zero Jacobian row), so the builders omit it and the initial condition is
+# enforced purely by data: prepare_solve! must keep p_reservoir[1:nHyd] equal
+# to the initial state x0 (it writes reservoir_vals = vcat(init, xhat)). Any
+# code that updates p_reservoir must preserve p_reservoir[1:nH] == x0.
 
 using ExaModels
 using MadNLP
@@ -449,7 +456,10 @@ function _build_dc_hydro_de(power_data::PowerData,
     )
     n_con += T * nBus
 
-    # 5. Initial reservoir condition (skip in strict: reservoir is a parameter)
+    # 5. Initial reservoir condition (skip in strict: reservoir is a parameter,
+    # so reservoir[1,r] − p_x0[r] = 0 would be parameter-only — an all-zero
+    # Jacobian row. The initial condition is instead maintained by the invariant
+    # that prepare_solve! writes p_reservoir[1:nHyd] = x0; see file-top comment.)
     if !strict_targets
         ic_items = [(r = r,) for r in 1:nHyd]
         ExaModels.constraint(core,
@@ -856,7 +866,10 @@ function _build_ac_hydro_de(power_data::PowerData,
     )
     n_con += T * nBus
 
-    # 9. Initial reservoir condition (skip in strict: reservoir is a parameter)
+    # 9. Initial reservoir condition (skip in strict: reservoir is a parameter,
+    # so reservoir[1,r] − p_x0[r] = 0 would be parameter-only — an all-zero
+    # Jacobian row. The initial condition is instead maintained by the invariant
+    # that prepare_solve! writes p_reservoir[1:nHyd] = x0; see file-top comment.)
     if !strict_targets
         ic_items = [(r = r,) for r in 1:nHyd]
         ExaModels.constraint(core,
@@ -1006,6 +1019,9 @@ function prepare_solve!(prob::HydroExaDEProblem, init_state, w_flat, xhat_flat)
                 end
             end
         end
+        # Strict-mode invariant: p_reservoir[1:nH] must equal x0, because the
+        # builders omit the (parameter-only) initial-condition constraint in
+        # strict mode — see file-top comment. vcat(init, xhat) guarantees it.
         reservoir_vals = vcat(init, xhat)
         copyto!(prob.strict_reservoir_values, reservoir_vals)
         ExaModels.set_parameter!(prob.core, prob.p_reservoir, reservoir_vals)

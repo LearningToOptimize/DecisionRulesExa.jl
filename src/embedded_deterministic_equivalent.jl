@@ -11,15 +11,43 @@
 #
 # One oracle for all T stages guarantees sequential LSTM evaluation with
 # Flux.reset! at the top of each callback invocation.
+#
+# Jacobian exactness caveat: the oracle callbacks (oracle_jac!, oracle_vjp!)
+# compute only the DIRECT partial ∂π_t/∂x_{t-1} via a per-stage Zygote pullback.
+# For a recurrent policy whose recurrent layers see x_{t-1}, stage t's output
+# also depends on x_{1..t-2} through the hidden state; those cross-stage entries
+# are absent from both the sparsity pattern and the pullbacks, so the oracle
+# Jacobian is exact for feedforward (stateless-in-x) policies and a structural
+# approximation for such recurrent ones. When the recurrent encoder reads only
+# the uncertainty w_t (as in StateConditionedPolicy and HydroReachablePolicy,
+# where the combiner over [h_t; x_{t-1}] is feedforward in x), the hidden state
+# does not depend on x and the direct partial IS the full derivative.
 
 """
     EmbeddedDeterministicEquivalentProblem
 
-Like `DeterministicEquivalentProblem` but the target constraints are replaced
-by a `VectorNonlinearOracle` that evaluates the Flux policy inline.
+Container for a deterministic-equivalent NLP whose target constraints are
+computed by an embedded Flux policy.
 
-The oracle closures capture the policy **by reference**: updating Flux
-parameters between solves automatically changes the NLP — no rebuild needed.
+# Fields
+
+- `core`: ExaModels core used to build variables, parameters, objectives, and
+  constraints.
+- `model`: ExaModels model passed to MadNLP.
+- `x`, `u`, `δ`: Flat state, control, and target-slack variables.
+- `p_x0`, `p_w`: Initial-state and uncertainty parameters.
+- `policy`: Flux policy evaluated by the nonlinear oracle.
+- `nx`, `nu`, `nw`, `horizon`: State, control, uncertainty, and time dimensions.
+- `target_con_range`: Range of oracle-constraint multipliers in solver results.
+- `_w_buf`, `_x0_buf`: Mutable host buffers captured by oracle callbacks.
+
+# Notes
+
+This problem is analogous to `DeterministicEquivalentProblem`, but the explicit
+target parameter is replaced by a `VectorNonlinearOracle` enforcing
+``\\pi_\\theta(w_t, x_{t-1}) - x_t - \\delta_t = 0``. The oracle closures capture
+`policy` by reference, so changing Flux parameters between solves changes the
+NLP callbacks without rebuilding the ExaModel.
 """
 struct EmbeddedDeterministicEquivalentProblem{P}
     core
@@ -41,10 +69,27 @@ struct EmbeddedDeterministicEquivalentProblem{P}
 end
 
 """
-    set_x0!(prob::EmbeddedDeterministicEquivalentProblem, x0)
+    set_x0!(prob::EmbeddedDeterministicEquivalentProblem, x0::AbstractVector)
 
-Update the initial state ``x_0`` for both the ExaModels parameter and the
-oracle's closure buffer (so the policy callback sees the new ``x_0``).
+Update the initial state used by the embedded problem and oracle callbacks.
+
+# Arguments
+
+- `prob::EmbeddedDeterministicEquivalentProblem`: Embedded problem to update.
+- `x0::AbstractVector`: Initial state with length `prob.nx`.
+
+# Returns
+
+- `prob`: The updated problem.
+
+# Throws
+
+Throws an error if `length(x0) != prob.nx`.
+
+# Notes
+
+The value is written both to the ExaModels parameter and to the oracle closure
+buffer, ensuring the policy callback sees the same initial state as the NLP.
 """
 function set_x0!(prob::EmbeddedDeterministicEquivalentProblem, x0::AbstractVector)
     length(x0) == prob.nx || error("x0 length must be nx=$(prob.nx), got $(length(x0))")
@@ -54,10 +99,31 @@ function set_x0!(prob::EmbeddedDeterministicEquivalentProblem, x0::AbstractVecto
 end
 
 """
-    set_uncertainty!(prob::EmbeddedDeterministicEquivalentProblem, w)
+    set_uncertainty!(prob::EmbeddedDeterministicEquivalentProblem, w::AbstractVector)
 
-Update the disturbance trajectory ``w_{1:T}`` for both the ExaModels parameter
-and the oracle's closure buffer. Accepts length `(T-1)*nw` or `T*nw`.
+Update the disturbance trajectory used by the embedded problem and oracle
+callbacks.
+
+# Arguments
+
+- `prob::EmbeddedDeterministicEquivalentProblem`: Embedded problem to update.
+- `w::AbstractVector`: Disturbance trajectory with length `(T - 1) * nw` or
+  `T * nw`.
+
+# Returns
+
+- `prob`: The updated problem.
+
+# Throws
+
+Throws an error if `w` has any length other than `(T - 1) * nw` or `T * nw`.
+
+# Notes
+
+The first `(T - 1) * nw` entries are passed to the ExaModels dynamics
+parameter. The full length-`T * nw` trajectory is retained in the oracle buffer
+when provided, because the policy callback may evaluate a final-stage
+disturbance.
 """
 function set_uncertainty!(prob::EmbeddedDeterministicEquivalentProblem, w::AbstractVector)
     expected = (prob.horizon - 1) * prob.nw
@@ -76,10 +142,24 @@ function set_uncertainty!(prob::EmbeddedDeterministicEquivalentProblem, w::Abstr
 end
 
 """
-    set_targets!(::EmbeddedDeterministicEquivalentProblem, ::AbstractVector) -> Nothing
+    set_targets!(::EmbeddedDeterministicEquivalentProblem, ::AbstractVector) -> nothing
 
-No-op for embedded problems: targets are computed inline by the oracle callback,
-not stored as NLP parameters.
+Ignore explicit targets for embedded deterministic-equivalent problems.
+
+# Arguments
+
+- `::EmbeddedDeterministicEquivalentProblem`: Embedded problem whose targets are
+  generated by the policy oracle.
+- `::AbstractVector`: Ignored target vector.
+
+# Returns
+
+- `nothing`.
+
+# Notes
+
+Embedded problems compute targets inline through the nonlinear oracle instead of
+storing them in an NLP parameter.
 """
 function set_targets!(::EmbeddedDeterministicEquivalentProblem, ::AbstractVector)
     return nothing
@@ -88,9 +168,23 @@ end
 """
     invalidate_policy_cache!(embedded_de)
 
-Hook for embedded problems whose nonlinear oracle caches policy-dependent
-intermediates across solver calls.  Generic embedded problems evaluate the
-policy directly in each callback and do not need invalidation.
+Invalidate policy-dependent caches for an embedded deterministic-equivalent
+problem.
+
+# Arguments
+
+- `embedded_de`: Embedded deterministic-equivalent problem.
+
+# Returns
+
+- `embedded_de`.
+
+# Notes
+
+The generic embedded problem evaluates the policy directly in each oracle
+callback and has no cache to invalidate. Specialized embedded problem types may
+extend this hook when their oracle stores policy-dependent intermediates across
+solver calls.
 """
 function invalidate_policy_cache!(embedded_de)
     return embedded_de
@@ -99,17 +193,62 @@ end
 """
     build_embedded_deterministic_equivalent(policy; kwargs...)
 
-Build a deterministic-equivalent NLP with the Flux `policy` embedded via
-`VectorNonlinearOracle`.
+Build a deterministic-equivalent NLP with a Flux policy embedded as a nonlinear
+oracle.
 
-Same keyword interface as `build_deterministic_equivalent` except:
-- `policy` is a positional argument (the Flux model to embed)
-- No `p_target` parameter — targets are computed inline by the oracle
-- The oracle is added **last** so its multipliers are a contiguous trailing
-  slice of `result.multipliers` (same convention as the open-loop version)
+# Arguments
 
-The returned problem supports `set_x0!`, `set_uncertainty!`, `target_multipliers`,
-and `solution_components` with the same signatures.
+- `policy`: Flux model mapping each stage input to an `nx`-vector target.
+
+# Keywords
+
+- `horizon::Int`: Number of stages. States are indexed over `1:horizon`;
+  controls and uncertainties over `1:(horizon - 1)`.
+- `nx::Int`: State dimension and policy output dimension.
+- `nu::Int = nx`: Control dimension.
+- `nw::Int = nx`: Uncertainty dimension and first part of the policy input.
+- `backend = nothing`: ExaModels backend, such as `nothing` for CPU or a CUDA
+  backend for GPU execution.
+- `float_type::Type{<:AbstractFloat} = Float64`: Scalar type used by the model.
+- `x_bounds::Tuple{<:Real,<:Real} = (-Inf, Inf)`: Lower and upper bounds applied
+  to every state variable.
+- `u_bounds = (-Inf, Inf)`: Control bounds, either a scalar `(lb, ub)` tuple or
+  a tuple of length-`nu` lower and upper bound vectors.
+- `slack_penalty::Real = 1.0`: Nonnegative target-slack penalty weight ``ρ``.
+- `dynamics_eq::Function = default_dynamics_eq`: Function
+  `(t, i, x, u, w, nx, nu, nw) -> residual` defining one scalar dynamics
+  equality.
+- `stage_cost::Function = default_stage_cost`: Function
+  `(t, i, x, u, w, nx, nu, nw) -> term` defining one scalar objective term.
+
+# Returns
+
+- `EmbeddedDeterministicEquivalentProblem`: Problem supporting `set_x0!`,
+  `set_uncertainty!`, `target_multipliers`, and `solution_components`.
+
+# Throws
+
+Throws an error if dimensions are invalid, if vector control bounds have the
+wrong length, or if the default dynamics/cost are used with dimensions other
+than `nu == nx` and `nw == nx`.
+
+# Notes
+
+The oracle enforces
+``\\pi_\\theta(w_t, x_{t-1}) - x_t - \\delta_t = 0`` and is added last so its
+multipliers form a contiguous trailing slice of `result.multipliers`. This
+matches the open-loop deterministic-equivalent convention while allowing the
+policy to depend on realized previous states.
+
+The oracle Jacobian and vector-Jacobian callbacks differentiate each stage
+independently, providing only the direct partial ``\\partial \\pi_t /
+\\partial x_{t-1}``. If the policy's recurrent layers consume ``x_{t-1}``,
+stage ``t``'s output also depends on ``x_{1..t-2}`` through the hidden state,
+and those cross-stage Jacobian entries are omitted — the reported Jacobian is
+then a structural approximation. The Jacobian is exact whenever the recurrent
+part of the policy reads only ``w_t`` and the state enters through a
+feedforward head (the [`StateConditionedPolicy`](@ref) architecture), because
+then the hidden state carries no dependence on ``x``.
 """
 function build_embedded_deterministic_equivalent(
     policy;
@@ -240,6 +379,10 @@ function build_embedded_deterministic_equivalent(
         return nothing
     end
 
+    # NOTE: this Jacobian holds only the per-stage direct partial ∂π_t/∂x_{t-1}.
+    # Cross-stage terms through a recurrent hidden state that depends on x are
+    # not represented (see file-top comment); exact when the recurrent encoder
+    # reads only w_t, as in StateConditionedPolicy / HydroReachablePolicy.
     function oracle_jac!(vals, xv)
         Flux.reset!(policy)
         k = 0
@@ -360,7 +503,21 @@ end
 """
     target_multipliers(prob::EmbeddedDeterministicEquivalentProblem, result) -> λ
 
-Return the dual multipliers ``\\lambda_t`` on the oracle constraint
+Return the dual multipliers associated with the embedded oracle constraints.
+
+# Arguments
+
+- `prob::EmbeddedDeterministicEquivalentProblem`: Problem that defines the
+  multiplier slice.
+- `result`: MadNLP result containing `multipliers`.
+
+# Returns
+
+- `λ`: Multipliers in `result.multipliers[prob.target_con_range]`.
+
+# Notes
+
+The multipliers correspond to the constraints
 ``\\pi_\\theta(w_t, x_{t-1}) - x_t - \\delta_t = 0``.
 """
 target_multipliers(prob::EmbeddedDeterministicEquivalentProblem, result) =
@@ -370,6 +527,17 @@ target_multipliers(prob::EmbeddedDeterministicEquivalentProblem, result) =
     solution_components(prob::EmbeddedDeterministicEquivalentProblem, result) -> (x, u, δ)
 
 Split the flat solution vector into state, control, and slack components.
+
+# Arguments
+
+- `prob::EmbeddedDeterministicEquivalentProblem`: Problem that defines component
+  sizes.
+- `result`: MadNLP result containing `solution`.
+
+# Returns
+
+- `(x, u, δ)`: Flat slices of the primal solution for states, controls, and
+  target slacks.
 """
 function solution_components(prob::EmbeddedDeterministicEquivalentProblem, result)
     n_x = prob.horizon * prob.nx

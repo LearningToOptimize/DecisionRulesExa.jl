@@ -11,16 +11,7 @@
     _target_violation_share(objective::Real, objective_no_target_penalty::Real) -> Float64
 
 Compute the fraction of a stage objective attributable to the target-tracking
-penalty.  If the total objective includes both operational cost and a quadratic
-penalty ``\\lambda \\|x_t - \\hat{x}_t\\|^2``, this function returns
-
-```math
-\\text{share} = \\frac{\\text{objective} - \\text{objective\\_no\\_target\\_penalty}}{\\text{objective}}.
-```
-
-Returns `NaN` when the objective is non-finite, the penalty is non-finite, or
-the objective is too close to zero (below ``10^{-12}``) to form a meaningful
-ratio.
+penalty.
 
 # Arguments
 - `objective::Real`: total stage objective (operational cost + target penalty).
@@ -30,10 +21,16 @@ ratio.
 # Returns
 - `Float64`: fraction in ``[0, 1]``, or `NaN` if the ratio is ill-defined.
 
-# Examples
-```julia
-share = DecisionRulesExa._target_violation_share(150.0, 100.0)  # 0.333…
+# Notes
+If the total objective includes both operational cost and a quadratic penalty
+``\\lambda \\|x_t - \\hat{x}_t\\|^2``, this function returns
+
+```math
+\\frac{\\text{objective} - \\text{objective\\_no\\_target\\_penalty}}{\\text{objective}}.
 ```
+
+The return value is `NaN` when the objective is non-finite, the penalty is
+non-finite, or the objective magnitude is below ``10^{-12}``.
 """
 function _target_violation_share(objective::Real, objective_no_target_penalty::Real)
     # The penalty is the difference between the full and penalty-free objectives.
@@ -49,20 +46,16 @@ end
 
 Flatten `x` into a contiguous one-dimensional vector.
 
-`SubArray` inputs are materialized with `collect` because downstream solvers
-and array operations (e.g. `copyto!`, `vcat`) require contiguous storage.
-All other array types are reshaped in-place via `vec`.
-
 # Arguments
 - `x`: any array-like object (matrix, vector, or view).
 
 # Returns
 - `AbstractVector`: a one-dimensional vector with the same elements as `x`.
 
-# Examples
-```julia
-v = DecisionRulesExa._to_vec(rand(3, 1))  # 3-element Vector
-```
+# Notes
+`SubArray` inputs are materialized with `collect` because downstream solvers
+and array operations such as `copyto!` and `vcat` require contiguous storage.
+All other array types are reshaped via `vec`.
 """
 _to_vec(x) = vec(x)                     # reshape in-place for contiguous arrays
 _to_vec(x::SubArray) = collect(x)        # materialize views to contiguous storage
@@ -72,14 +65,6 @@ _to_vec(x::SubArray) = collect(x)        # materialize views to contiguous stora
 
 Convert a user-supplied state bound into a concrete vector whose element type
 and device (CPU or GPU) match `ref`.
-
-Bounds can be specified in three forms:
-- `nothing` — no bound on this side (returns `nothing`).
-- A scalar ``b`` — broadcast to a constant vector ``[b, b, \\ldots, b]``.
-- A vector of the same length as `ref` — element-wise bounds.
-
-`SubArray` bounds are materialized via [`_to_vec`](@ref) before device
-adaptation so that GPU kernels receive contiguous storage.
 
 # Arguments
 - `bound`: the bound specification (`nothing`, a `Real` scalar, or an
@@ -95,11 +80,11 @@ adaptation so that GPU kernels receive contiguous storage.
 - `ArgumentError` if a vector bound has the wrong length or `bound` is an
   unsupported type.
 
-# Examples
-```julia
-lb = DecisionRulesExa._state_bound_vector(0.0, zeros(Float64, 5))   # [0,0,0,0,0]
-ub = DecisionRulesExa._state_bound_vector([1,2,3], zeros(Float64, 3))
-```
+# Notes
+Accepted bound forms are `nothing`, a scalar broadcast to all state entries,
+or a vector of the same length as `ref`. `SubArray` bounds are materialized via
+[`_to_vec`](@ref) before device adaptation so GPU kernels receive contiguous
+storage.
 """
 function _state_bound_vector(bound, ref::AbstractVector)
     # Nothing means "no bound on this side" — propagate the sentinel.
@@ -126,18 +111,6 @@ end
 
 Clamp every element of `state` to lie within `[lower, upper]`.
 
-Given bounds ``l`` and ``u``, the projection is the element-wise clamp
-
-```math
-\\text{proj}(x)_i = \\min\\bigl(\\max(x_i,\\, l_i),\\, u_i\\bigr).
-```
-
-Either side may be `nothing` (no bound) or a scalar/vector; see
-[`_state_bound_vector`](@ref) for accepted formats.
-
-This is intended to correct solver-tolerance drift at stage interfaces, not
-as a substitute for a recourse-feasible model.
-
 # Arguments
 - `state::AbstractVector`: realized state vector to project.
 - `state_bounds`: `nothing` (no projection), or a 2-element tuple/pair
@@ -150,11 +123,15 @@ as a substitute for a recourse-feasible model.
 - `ArgumentError` if `state_bounds` is not `nothing` and does not have
   exactly two elements.
 
-# Examples
-```julia
-x = DecisionRulesExa._project_state_to_bounds([1.5, -0.1], (0.0, 1.0))
-# x == [1.0, 0.0]
+# Notes
+Given bounds ``l`` and ``u``, the projection is the element-wise clamp
+
+```math
+\\operatorname{proj}(x)_i = \\min\\bigl(\\max(x_i,\\, l_i),\\, u_i\\bigr).
 ```
+
+This repair is intended for solver-tolerance drift at stage interfaces, not as
+a substitute for a recourse-feasible model.
 """
 function _project_state_to_bounds(state::AbstractVector, state_bounds)
     # No bounds means the state passes through unchanged.
@@ -176,15 +153,7 @@ end
     _project_realized_state(state::AbstractVector, state_bounds, project_state)
         -> AbstractVector
 
-Apply two successive feasibility repairs to a realized state before it is
-fed into the next stage of a rollout:
-
-1. **Box projection** via [`_project_state_to_bounds`](@ref) — clamps each
-   element to ``[l_i, u_i]``.
-2. **Custom projection** via the user-supplied `project_state` callback —
-   handles non-box feasibility sets (e.g. simplices, conic constraints).
-
-If `project_state` is `nothing`, only the box projection is applied.
+Repair a realized state before it is fed into the next rollout stage.
 
 # Arguments
 - `state::AbstractVector`: raw realized state from the stage solver.
@@ -197,12 +166,11 @@ If `project_state` is `nothing`, only the box projection is applied.
 - `AbstractVector`: the doubly-projected state, cast to the element type
   of the input `state`.
 
-# Examples
-```julia
-proj = DecisionRulesExa._project_realized_state(
-    [1.5, -0.1], (0.0, 1.0), nothing,
-)
-```
+# Notes
+The function first applies box projection via
+[`_project_state_to_bounds`](@ref), then applies `project_state` when a custom
+projector is supplied. If `project_state === nothing`, only the box projection
+is applied.
 """
 function _project_realized_state(state::AbstractVector, state_bounds, project_state)
     # First pass: box-clamp the raw realized state.
@@ -304,6 +272,10 @@ where ``\\pi_\\theta`` is the learned policy (`model`),
   - `state_trajectory::Vector`: realized states ``[x_0, x_1, \\ldots, x_T]``.
   - `target_trajectory::Vector`: policy targets
     ``[\\hat{x}_1, \\ldots, \\hat{x}_T]``.
+
+# Throws
+- `ArgumentError` if `horizon < 1`, `n_uncertainty < 1`, `w_flat` has the
+  wrong length, or `policy_state` is not `:realized` or `:target`.
 
 # Examples
 ```julia
@@ -480,24 +452,11 @@ function rollout_tsddr(
 end
 
 """
-    RolloutEvaluation <: Function
+    RolloutEvaluation
 
-Callable struct that periodically evaluates a policy via out-of-sample
-rollouts during training.
-
-At every `stride`-th training iteration, `RolloutEvaluation` runs
-[`rollout_tsddr`](@ref) on each of its pre-loaded scenarios (up to
-`active_scenarios`), accumulates the mean objective, and stores the results
-in mutable summary fields.  The struct is callable as
-`evaluation(iter, model)`, making it usable as a training callback.
-
-When a `stage_problem_pool` with more than one entry is provided, scenarios
-are distributed across the pool and evaluated in parallel using Julia
-`Threads.@spawn`.
+Store configuration and mutable summaries for periodic rollout evaluation.
 
 # Fields
-
-## Problem specification (immutable across evaluations)
 - `stage_problem`: the single-stage optimization problem template.
 - `initial_state`: initial state ``x_0`` for every rollout.
 - `scenarios::Vector`: pre-sampled uncertainty vectors, each of length
@@ -524,14 +483,27 @@ are distributed across the pool and evaluated in parallel using Julia
   evaluation.
 - `active_scenarios::Int`: number of scenarios to evaluate (at most
   `length(scenarios)`).
-
-## Mutable result fields (updated after each evaluation)
 - `last_objective::Float64`: mean objective across successful scenarios.
 - `last_objective_no_target_penalty::Float64`: mean penalty-free objective.
 - `last_violation_share::Float64`: mean target-violation share.
 - `last_n_ok::Int`: number of scenarios that solved successfully.
 - `last_scenario_data::Vector{Any}`: per-scenario `(index, result)` pairs
   from the most recent evaluation.
+
+# Notes
+The struct is callable as `evaluation(iter, model)`. At every `stride`-th
+iteration, it runs [`rollout_tsddr`](@ref) on up to `active_scenarios`
+scenarios and updates the mutable summary fields. When `stage_problem_pool`
+contains more than one entry, scenarios are distributed across the pool with
+`Threads.@spawn`.
+
+Thread-safety: the single `set_stage_parameters!`, `realized_state`, and
+`objective_no_target_penalty` callbacks are shared across all spawned tasks
+while each task receives its own stage problem from the pool. When
+`stage_problem_pool` has more than one entry, these callbacks must therefore be
+thread-safe and must write only into the stage problem they are handed — any
+shared mutable buffer (e.g. a captured scratch array reused across calls)
+races across tasks and silently corrupts results.
 """
 mutable struct RolloutEvaluation <: Function
     stage_problem                            # single-stage optimization problem template
@@ -611,8 +583,20 @@ initialized to `NaN` / `0` / empty and are populated on the first call.
 - `retry_on_failure::Bool`: retry failed solves with cold start.
 - `stage_problem_pool::Vector`: pool of independent stage problems for
   multi-threaded evaluation.  An empty pool uses sequential evaluation.
+  With more than one pool entry, the shared `set_stage_parameters!`,
+  `realized_state`, and `objective_no_target_penalty` callbacks run
+  concurrently on different tasks: they must be thread-safe and write only
+  into the stage problem passed to them (no shared mutable buffers),
+  otherwise results race.
 - `active_scenarios::Int`: cap on how many scenarios to evaluate (defaults
   to all).
+
+# Returns
+- `RolloutEvaluation`: callable training callback with empty result summaries.
+
+# Throws
+- `ArgumentError` if `scenarios` is empty, `stride < 1`, or `policy_state` is
+  not `:realized` or `:target`.
 
 # Examples
 ```julia
@@ -685,6 +669,26 @@ function RolloutEvaluation(
     )
 end
 
+"""
+    (evaluation::RolloutEvaluation)(iter, model) -> Nothing
+
+Evaluate `model` on rollout scenarios when `iter` is aligned with
+`evaluation.stride`.
+
+# Arguments
+- `evaluation::RolloutEvaluation`: callback state and rollout configuration.
+- `iter`: current training iteration.
+- `model`: policy model passed to [`rollout_tsddr`](@ref).
+
+# Returns
+- `nothing`: summary fields on `evaluation` are updated in place.
+
+# Notes
+If `iter % evaluation.stride != 0`, the method only clears stale per-scenario
+data and returns. Otherwise it records mean objective, mean penalty-free
+objective, mean target-violation share, the number of successful scenarios, and
+per-scenario results.
+"""
 function (evaluation::RolloutEvaluation)(iter, model)
     empty!(evaluation.last_scenario_data)
     iter % evaluation.stride == 0 || return nothing
@@ -787,13 +791,30 @@ function (evaluation::RolloutEvaluation)(iter, model)
 end
 
 """
-    critic_samples_from_evaluation(eval; objective_key) -> Vector{CriticSample}
+    critic_samples_from_evaluation(
+        eval_obj::RolloutEvaluation;
+        objective_key::Symbol = :objective,
+    ) -> Vector{CriticSample}
 
 Convert the last rollout evaluation results into `CriticSample`s for critic
-training.  Target multipliers are zero (rollout evaluation does not produce
-duals), so these samples contribute only to the value loss term. By default the
-critic target uses the full rollout objective; pass
-`objective_key = :objective_no_target_penalty` to remove target-slack penalties.
+training.
+
+# Arguments
+- `eval_obj::RolloutEvaluation`: evaluation callback containing
+  `last_scenario_data` from a previous call.
+
+# Keywords
+- `objective_key::Symbol`: field of each rollout result used as the scalar
+  critic target; commonly `:objective` or `:objective_no_target_penalty`.
+
+# Returns
+- `Vector{CriticSample}`: one sample per successful rollout scenario from the
+  last evaluation.
+
+# Notes
+Rollout evaluation does not produce dual multipliers, so generated samples use
+zero target multipliers and contribute only to the value-loss term unless
+combined with other samples.
 """
 function critic_samples_from_evaluation(
     eval_obj::RolloutEvaluation;

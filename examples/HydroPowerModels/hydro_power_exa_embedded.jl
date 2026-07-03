@@ -10,234 +10,16 @@
 # Strict target constraint:
 #     π_θ(inflow_t, reservoir_t) − reservoir_{t+1,r} = 0
 #
-# Depends on: hydro_power_data.jl, hydro_power_exa.jl (index helpers, data types)
+# Depends on: hydro_power_data.jl, hydro_power_exa.jl, hydro_reachable_policy.jl
 
 using Flux
-using Zygote
 using LinearAlgebra: I
-import DecisionRulesExa: set_x0!, set_uncertainty!, set_targets!, invalidate_policy_cache!,
-                         load_stateconditioned_policy!
+import DecisionRulesExa: set_x0!, set_uncertainty!, set_targets!, invalidate_policy_cache!
 
-# ── Hydro-specific feasible target policy ─────────────────────────────────────
-
-"""
-    hydro_reachable_policy(hydro_data, layers; activation=sigmoid, encoder_type=Flux.LSTM,
-                           spill_max=nothing, combiner_layers=Int[])
-
-Build a state-conditioned policy whose outputs are one-stage reachable
-reservoir targets for the hydro water-balance model. The neural network predicts
-a normalized vector `y_t`; the wrapper maps it to `[lower_t, upper_t]` computed
-from `(inflow_t, reservoir_t)`.
-
-The current HydroData model has no finite spill upper bound, so by default the
-lower bound is the storage minimum. Pass `spill_max` to use a finite
-`x + K*inflow - K*max_turn - spill_max` lower reachability bound.
-
-`layers` controls the recurrent encoder over inflows only. `combiner_layers`
-adds feed-forward hidden layers after `[encoded_inflow; reservoir_state]`, so
-the state-to-target map can be nonlinear without making the state input
-recurrent.
-
-For strict regular deterministic equivalents, the same reachable policy can be
-rolled out from the known initial state using previous targets as the policy
-state. Since every emitted target is one-stage reachable from the previous
-target, the whole target trajectory is feasible by induction. Embedded strict
-DEs use the same policy with realized reservoir states inside the NLP; their
-manual oracle currently supports the default single Dense head only.
-
-Cascade connections (upstream→downstream water flows) are handled by clamping
-downstream targets to the actual reachable upper bound implied by the upstream
-unit's target at the same stage.
-"""
-struct HydroReachablePolicy{E,C,V,S,I}
-    encoder::E
-    combiner::C
-    n_uncertainty::Int
-    n_state::Int
-    min_vol::V
-    max_vol::V
-    min_turn::V
-    max_turn::V
-    spill_max::S
-    upstream_max_inflow::V
-    K::Float64
-    output_lower::Nothing
-    output_scale::Nothing
-    cascade::Vector{CascadeLink}
-    cascade_upstream::I
-    cascade_downstream::I
-    cascade_turn_only::V
-    cascade_k_max_turn::V
-    cascade_reservoir_ids::I
-end
-
-Flux.@layer HydroReachablePolicy trainable=(encoder, combiner)
-
-function _hydro_adapt_bound(x::AbstractVector, ref::AbstractVector)
-    typeof(x) === typeof(ref) && return x
-    y = similar(ref, length(x))
-    copyto!(y, convert.(eltype(ref), x))
-    return y
-end
-
-function _hydro_adapt_index(x::AbstractVector, ref::AbstractVector)
-    y = similar(ref, Int, length(x))
-    copyto!(y, Int.(vec(Array(x))))
-    return y
-end
-
-function _hydro_reachable_bounds(policy::HydroReachablePolicy, inflow, x_prev, ref)
-    min_vol  = _hydro_adapt_bound(policy.min_vol, ref)
-    max_vol  = _hydro_adapt_bound(policy.max_vol, ref)
-    min_turn = _hydro_adapt_bound(policy.min_turn, ref)
-    max_turn = _hydro_adapt_bound(policy.max_turn, ref)
-    upstream = _hydro_adapt_bound(policy.upstream_max_inflow, ref)
-    K = convert(eltype(ref), policy.K)
-
-    upper_raw = x_prev .+ K .* inflow .- K .* min_turn .+ upstream
-    upper = min.(max_vol, upper_raw)
-
-    lower = if policy.spill_max === nothing
-        min_vol
-    else
-        spill_max = _hydro_adapt_bound(policy.spill_max, ref)
-        lower_raw = x_prev .+ K .* inflow .- K .* max_turn .- spill_max
-        max.(min_vol, lower_raw)
-    end
-
-    upper = max.(upper, lower)
-    return lower, upper
-end
-Zygote.@nograd _hydro_reachable_bounds
-
-function _cascade_upper_bounds(policy::HydroReachablePolicy, target, inflow, x_prev)
-    cascade = policy.cascade
-    T = eltype(target)
-    K = T(policy.K)
-    n = length(target)
-    isempty(cascade) && return _hydro_adapt_bound(fill(T(Inf), n), target)
-
-    upstream = _hydro_adapt_index(policy.cascade_upstream, target)
-    downstream = _hydro_adapt_index(policy.cascade_downstream, target)
-    reservoir_ids = _hydro_adapt_index(policy.cascade_reservoir_ids, target)
-    turn_only = _hydro_adapt_bound(policy.cascade_turn_only, target)
-    k_max_turn = _hydro_adapt_bound(policy.cascade_k_max_turn, target)
-    min_turn = _hydro_adapt_bound(policy.min_turn, target)
-    max_vol = _hydro_adapt_bound(policy.max_vol, target)
-
-    release = K .* inflow[upstream] .+ x_prev[upstream] .- target[upstream]
-    positive_release = max.(zero(T), release)
-    max_contrib = ifelse.(turn_only .> zero(T), min.(k_max_turn, positive_release), positive_release)
-
-    link_upper = x_prev[downstream] .+
-                 K .* inflow[downstream] .-
-                 K .* min_turn[downstream] .+
-                 max_contrib
-    link_upper = min.(max_vol[downstream], link_upper)
-
-    link_by_reservoir = ifelse.(
-        reshape(downstream, :, 1) .== reshape(reservoir_ids, 1, :),
-        reshape(link_upper, :, 1),
-        T(Inf),
-    )
-    return vec(minimum(link_by_reservoir; dims = 1))
-end
-Zygote.@nograd _cascade_upper_bounds
-
-function (m::HydroReachablePolicy)(input)
-    inflow = input[1:m.n_uncertainty]
-    x_prev = input[m.n_uncertainty+1:end]
-    h = vec(m.encoder(reshape(inflow, :, 1)))
-    y = m.combiner(vcat(h, x_prev))
-    lower, upper = _hydro_reachable_bounds(m, inflow, x_prev, y)
-    raw_target = lower .+ (upper .- lower) .* y
-    if !isempty(m.cascade)
-        cascade_upper = _cascade_upper_bounds(m, raw_target, inflow, x_prev)
-        return min.(raw_target, cascade_upper)
-    end
-    return raw_target
-end
-
-Flux.reset!(m::HydroReachablePolicy) = Flux.reset!(m.encoder)
-
-function load_stateconditioned_policy!(policy::HydroReachablePolicy, state)
-    try
-        Flux.loadmodel!(policy, state)
-        return policy
-    catch err
-        hasproperty(state, :encoder) && hasproperty(state, :combiner) || rethrow(err)
-        @warn "Full HydroReachablePolicy checkpoint load failed; loading encoder/combiner only and keeping hydro reachability bounds" exception=(err, catch_backtrace())
-        Flux.loadmodel!(policy.encoder, getproperty(state, :encoder))
-        Flux.loadmodel!(policy.combiner, getproperty(state, :combiner))
-        return policy
-    end
-end
-
-function hydro_reachable_policy(
-    hydro_data::HydroData,
-    layers::AbstractVector{Int};
-    activation = sigmoid,
-    encoder_type = Flux.LSTM,
-    spill_max = nothing,
-    combiner_layers = Int[],
-)
-    (activation === sigmoid || activation === NNlib.sigmoid || activation === NNlib.sigmoid_fast) ||
-        throw(ArgumentError("hydro_reachable_policy requires a sigmoid-style activation so normalized targets stay in [0, 1]"))
-    nHyd = hydro_data.nHyd
-    enc_sizes  = vcat(nHyd, layers)
-    enc_layers = [encoder_type(enc_sizes[i] => enc_sizes[i+1])
-                  for i in 1:length(layers)]
-    encoder  = Flux.Chain(enc_layers...)
-    combiner = DecisionRulesExa._dense_policy_head(
-        layers[end] + nHyd,
-        nHyd,
-        collect(Int, combiner_layers);
-        activation = activation,
-    )
-    spill_vec = spill_max === nothing ? nothing : Float32.(collect(spill_max))
-    if spill_vec !== nothing && length(spill_vec) != nHyd
-        throw(ArgumentError("spill_max length must be nHyd=$nHyd"))
-    end
-
-    K = Float64(hydro_data.K)
-    upstream_max = zeros(Float32, nHyd)
-    for conn in hydro_data.upstream_turns
-        upstream_max[conn.downstream_pos] += Float32(K * hydro_data.units[conn.upstream_pos].max_turn)
-    end
-
-    spill_dests = Dict{Int,Set{Int}}()
-    for conn in hydro_data.upstream_spills
-        push!(get!(spill_dests, conn.upstream_pos, Set{Int}()), conn.downstream_pos)
-    end
-    cascade = CascadeLink[]
-    for conn in hydro_data.upstream_turns
-        d, u = conn.downstream_pos, conn.upstream_pos
-        has_spill = haskey(spill_dests, u) && d in spill_dests[u]
-        push!(cascade, CascadeLink(d, u, !has_spill, Float32(K * hydro_data.units[u].max_turn)))
-    end
-    for conn in hydro_data.upstream_spills
-        d, u = conn.downstream_pos, conn.upstream_pos
-        already = any(c -> c.downstream == d && c.upstream == u, cascade)
-        already || push!(cascade, CascadeLink(d, u, false, Float32(K * hydro_data.units[u].max_turn)))
-    end
-
-    return HydroReachablePolicy(
-        encoder, combiner, nHyd, nHyd,
-        Float32.([h.min_vol for h in hydro_data.units]),
-        Float32.([h.max_vol for h in hydro_data.units]),
-        Float32.([h.min_turn for h in hydro_data.units]),
-        Float32.([h.max_turn for h in hydro_data.units]),
-        spill_vec,
-        upstream_max,
-        K,
-        nothing, nothing,
-        cascade,
-        getfield.(cascade, :upstream),
-        getfield.(cascade, :downstream),
-        Float32.(getfield.(cascade, :turn_only)),
-        Float32.(getfield.(cascade, :K_max_turn)),
-        collect(1:nHyd),
-    )
+# Keep legacy `include("hydro_power_exa_embedded.jl")` scripts working while
+# letting training entrypoints include the policy explicitly.
+if !isdefined(@__MODULE__, :HydroReachablePolicy)
+    include(joinpath(@__DIR__, "hydro_reachable_policy.jl"))
 end
 
 # ── Problem struct ──────────────────────────────────────────────────────────────
@@ -275,6 +57,23 @@ end
 
 # ── Interface (duck-typing for train_tsddr_embedded) ────────────────────────────
 
+"""
+    set_x0!(prob::EmbeddedHydroExaDEProblem, x0)
+
+Set the initial reservoir state for the embedded hydro DE.
+
+# Arguments
+- `prob::EmbeddedHydroExaDEProblem`: embedded hydro deterministic equivalent.
+- `x0::AbstractVector`: initial reservoir volumes, one value per hydro unit.
+
+# Returns
+- `prob`.
+
+# Notes
+The oracle closure reads `_x0_buf` directly when evaluating the first-stage
+policy input, so this method updates both the ExaModels parameter and the
+oracle-side buffer.
+"""
 function set_x0!(prob::EmbeddedHydroExaDEProblem, x0::AbstractVector)
     length(x0) == prob.nHyd || error("x0 length must be nHyd=$(prob.nHyd)")
     ExaModels.set_parameter!(prob.core, prob.p_x0, x0)
@@ -282,6 +81,22 @@ function set_x0!(prob::EmbeddedHydroExaDEProblem, x0::AbstractVector)
     return prob
 end
 
+"""
+    set_inflows!(prob::EmbeddedHydroExaDEProblem, w)
+
+Set the full inflow trajectory parameter.
+
+# Arguments
+- `prob::EmbeddedHydroExaDEProblem`: embedded hydro deterministic equivalent.
+- `w::AbstractVector`: stage-major vector with length `prob.horizon * prob.nHyd`.
+
+# Returns
+- `prob`.
+
+# Notes
+Updating inflows invalidates cached recurrent encoder states because each stage
+encoder input has changed.
+"""
 function set_inflows!(prob::EmbeddedHydroExaDEProblem, w::AbstractVector)
     expected = prob.horizon * prob.nHyd
     length(w) == expected || error("w must have length T*nHyd=$expected")
@@ -291,19 +106,79 @@ function set_inflows!(prob::EmbeddedHydroExaDEProblem, w::AbstractVector)
     return prob
 end
 
+"""
+    set_uncertainty!(prob::EmbeddedHydroExaDEProblem, w)
+
+Set the uncertainty trajectory for generic embedded training code.
+
+# Arguments
+- `prob::EmbeddedHydroExaDEProblem`: embedded hydro deterministic equivalent.
+- `w::AbstractVector`: stage-major inflow trajectory.
+
+# Returns
+- `prob`.
+
+# Notes
+In the hydro example, uncertainty is exactly the inflow trajectory, so this
+delegates to [`set_inflows!`](@ref).
+"""
 function set_uncertainty!(prob::EmbeddedHydroExaDEProblem, w::AbstractVector)
     set_inflows!(prob, w)
 end
 
+"""
+    set_targets!(prob::EmbeddedHydroExaDEProblem, target)
+
+Ignore external targets for embedded hydro DEs.
+
+# Arguments
+- `prob::EmbeddedHydroExaDEProblem`: ignored.
+- `target::AbstractVector`: ignored.
+
+# Returns
+- `nothing`.
+
+# Notes
+Embedded hydro DEs generate targets inside the NLP through the policy oracle, so
+there is no target parameter to update.
+"""
 function set_targets!(::EmbeddedHydroExaDEProblem, ::AbstractVector)
     return nothing
 end
 
+"""
+    invalidate_policy_cache!(prob::EmbeddedHydroExaDEProblem)
+
+Mark cached recurrent encoder states dirty after policy parameters change. The
+oracle recomputes those states lazily on the next function/Jacobian evaluation.
+
+# Arguments
+- `prob::EmbeddedHydroExaDEProblem`: embedded hydro deterministic equivalent.
+
+# Returns
+- `prob`.
+"""
 function invalidate_policy_cache!(prob::EmbeddedHydroExaDEProblem)
     prob._h_cache_dirty[] = true
     return prob
 end
 
+"""
+    set_demand!(prob::EmbeddedHydroExaDEProblem, demand_matrix)
+
+Update active power demand parameters.
+
+# Arguments
+- `prob::EmbeddedHydroExaDEProblem`: embedded hydro deterministic equivalent.
+- `demand_matrix::AbstractMatrix`: `T x nBus` matrix of active demand values.
+
+# Returns
+- `prob`.
+
+# Notes
+The matrix is flattened in stage-major order to match the ExaModels parameter
+layout.
+"""
 function set_demand!(prob::EmbeddedHydroExaDEProblem, demand_matrix::AbstractMatrix)
     T, nB = size(demand_matrix)
     T == prob.horizon || error("demand_matrix must have T=$(prob.horizon) rows")
@@ -313,6 +188,18 @@ function set_demand!(prob::EmbeddedHydroExaDEProblem, demand_matrix::AbstractMat
     return prob
 end
 
+"""
+    embedded_hydro_realized_states(prob, result)
+
+Extract realized reservoir states from an embedded hydro solve.
+
+# Arguments
+- `prob::EmbeddedHydroExaDEProblem`: embedded hydro deterministic equivalent.
+- `result`: MadNLP result with a flat primal solution.
+
+# Returns
+- A flat vector containing stages `1:T`, excluding the initial state.
+"""
 function embedded_hydro_realized_states(prob::EmbeddedHydroExaDEProblem, result)
     T  = prob.horizon
     nH = prob.nHyd
@@ -320,6 +207,24 @@ function embedded_hydro_realized_states(prob::EmbeddedHydroExaDEProblem, result)
     return sol[prob._res_start + nH : prob._res_start + (T + 1) * nH - 1]
 end
 
+"""
+    hydro_solution(prob::EmbeddedHydroExaDEProblem, result) -> NamedTuple
+
+Reshape the flat NLP solution into named physical blocks. This mirrors the
+regular hydro DE post-processing helper so rollout diagnostics can read
+reservoirs, generation, deficits, outflows, spills, and target slacks by name.
+
+# Arguments
+- `prob::EmbeddedHydroExaDEProblem`: embedded hydro deterministic equivalent.
+- `result`: MadNLP result with a flat primal solution.
+
+# Returns
+- A `NamedTuple` of solution arrays.
+
+# Notes
+For strict targets, slack arrays are returned as zeros because no slack
+variables are present in the strict NLP.
+"""
 function hydro_solution(prob::EmbeddedHydroExaDEProblem, result)
     T   = prob.horizon
     nH  = prob.nHyd

@@ -245,12 +245,21 @@ end
 """
     prepare_solve!(de, init_state, w_flat, xhat_flat)
 
-Hook called after setting the standard parameters (x0, inflow, target) and
-before each NLP solve. Override for problem types that need additional
-parameter updates — e.g. setting a reservoir parameter from x0 + targets
-when the reservoir is not a decision variable.
+Hook called after standard parameter updates and before each NLP solve.
 
-Default: no-op.
+# Arguments
+- `de`: deterministic-equivalent problem.
+- `init_state`: initial state used for the current sample.
+- `w_flat`: flat uncertainty trajectory for the current sample.
+- `xhat_flat`: flat target trajectory for the current sample.
+
+# Returns
+- `nothing` by default.
+
+# Notes
+Override this method for problem types that need additional parameter updates,
+for example setting a reservoir parameter from `x0` and targets when the
+reservoir is not a decision variable.
 """
 prepare_solve!(de, init_state, w_flat, xhat_flat) = nothing
 
@@ -622,6 +631,28 @@ for the no-op [`NoCriticControlVariate`](@ref).
 _has_critic(::NoCriticControlVariate) = false            # no-op sentinel → no critic
 _has_critic(::AbstractCriticControlVariate) = true       # any concrete critic → active
 
+"""
+    _validate_critic_training_args(; kwargs...) -> Bool
+
+Validate critic/control-variate keyword arguments passed to [`train_tsddr`](@ref).
+
+# Keywords
+- `actor_gradient_mode`: must be `:control_variate` or `:surrogate`.
+- `critic_cv_weight`: nonnegative control-variate weight.
+- `dual_actor_weight`: nonnegative dual-gradient actor weight.
+- `critic_actor_weight`: nonnegative critic actor weight.
+- `critic_updates_per_batch`: nonnegative number of critic updates.
+- `critic_buffer_size`: nonnegative replay-buffer capacity.
+- `critic_rollout_samples_per_batch`: nonnegative integer or `nothing`.
+- `num_cheap_critic_samples_per_batch`: nonnegative number of extra policy
+  rollouts.
+
+# Returns
+- `true` when all arguments are valid.
+
+# Throws
+- `ErrorException` if any argument is outside its admissible set.
+"""
 function _validate_critic_training_args(;
     actor_gradient_mode,
     critic_cv_weight,
@@ -648,6 +679,25 @@ function _validate_critic_training_args(;
     return true
 end
 
+"""
+    _resolve_critic_training_target(target, has_critic::Bool)
+
+Resolve a user-facing critic target configuration to a concrete
+`AbstractCriticTrainingTarget`.
+
+# Arguments
+- `target`: critic target object or symbolic alias.
+- `has_critic::Bool`: whether critic training is active.
+
+# Returns
+- `DeterministicEquivalentCriticTarget()` when no critic is active or the user
+  selected deterministic-equivalent critic targets.
+- `target` unchanged when it is already an `AbstractCriticTrainingTarget`.
+
+# Throws
+- `ErrorException` when rollout critic training is requested without a
+  concrete [`RolloutCriticTarget`](@ref) configuration.
+"""
 function _resolve_critic_training_target(target, has_critic::Bool)
     has_critic || return DeterministicEquivalentCriticTarget()
     target isa AbstractCriticTrainingTarget && return target
@@ -660,6 +710,30 @@ function _resolve_critic_training_target(target, has_critic::Bool)
     end
 end
 
+"""
+    _critic_sample_from_rollout(model, initial_state, target, w_flat, lambda, F, solver_state)
+
+Build one [`CriticSample`](@ref) by rerunning a solved scenario through
+stage-wise rollout.
+
+# Arguments
+- `model`: Flux policy being trained.
+- `initial_state`: initial state vector.
+- `target::RolloutCriticTarget`: rollout critic-target configuration.
+- `w_flat`: uncertainty trajectory from a deterministic-equivalent sample.
+- `lambda`: target multipliers from the deterministic-equivalent solve.
+- `F`: element type used for critic sample arrays.
+- `solver_state`: optional reusable rollout solver state.
+
+# Returns
+- `CriticSample` when rollout succeeds.
+- `nothing` when rollout fails.
+
+# Notes
+The rollout objective supplies the critic value target. The deterministic
+equivalent multipliers are sliced to the rollout target length and used as the
+critic gradient target.
+"""
 function _critic_sample_from_rollout(
     model,
     initial_state,
@@ -703,6 +777,29 @@ function _critic_sample_from_rollout(
     return CriticSample(F.(initial_state), F.(w_rollout), xhat_flat, objective, F.(λ_rollout))
 end
 
+"""
+    _rollout_critic_samples(model, initial_state, target, de_samples, F, max_samples, solver_state)
+        -> Vector{CriticSample}
+
+Convert deterministic-equivalent training samples into rollout critic samples.
+
+# Arguments
+- `model`: Flux policy being trained.
+- `initial_state`: initial state vector.
+- `target::RolloutCriticTarget`: rollout critic-target configuration.
+- `de_samples`: deterministic-equivalent samples containing uncertainty and
+  target multipliers.
+- `F`: element type used for critic sample arrays.
+- `max_samples`: maximum number of solved scenarios to rerun, or `nothing`.
+- `solver_state`: optional reusable rollout solver state.
+
+# Returns
+- `Vector{CriticSample}` containing only successful rollout conversions.
+
+# Notes
+When `max_samples` is smaller than `length(de_samples)`, samples are selected
+without replacement using `randperm`.
+"""
 function _rollout_critic_samples(
     model,
     initial_state,
@@ -740,56 +837,69 @@ end
     train_tsddr(model, initial_state, det_equivalent,
                 p_x0, p_target, p_uncertainty,
                 uncertainty_sampler;
-                num_batches, num_train_per_batch, optimizer,
-                adjust_hyperparameters, record_loss,
-                madnlp_kwargs, warmstart,
-                problem_pool) -> model
+                num_batches=100,
+                num_train_per_batch=1,
+                optimizer,
+                adjust_hyperparameters,
+                record_loss,
+                madnlp_kwargs=NamedTuple(),
+                warmstart=true,
+                problem_pool=nothing,
+                kwargs...) -> model
 
-TS-DDR policy gradient training. Mirrors `train_multistage` from DecisionRules.jl.
+Train a TS-DDR policy with open-loop deterministic-equivalent solves.
 
-Arguments:
-- `model`              : Flux policy (LSTM or MLP)
-- `initial_state`      : initial state vector
-- `det_equivalent`     : any ExaModels NLP with fields `.core`, `.model`,
-                         `.horizon`, `.target_con_range`
-- `p_x0`               : ExaModels parameter for the initial state
-- `p_target`           : ExaModels parameter for policy targets
-- `p_uncertainty`      : ExaModels parameter for per-stage uncertainty
-- `uncertainty_sampler`: `() -> w_flat` — flat vector of length `T * nw_per_stage`.
-                         For multi-unit problems (e.g., hydro reservoirs) the sampler
-                         should draw one joint scenario index per stage to preserve
-                         spatial correlation; see `sample_scenario` in examples.
+The policy rolls out a target trajectory, the ExaModels problem projects that
+trajectory onto the feasible set, and target multipliers provide the actor
+gradient by the envelope theorem.
 
-Keyword arguments (mirror `train_multistage`):
-- `num_batches`             : total gradient steps (default 100)
-- `num_train_per_batch`     : scenarios averaged per step (default 1)
-- `optimizer`               : Flux.Optimisers optimizer
-- `adjust_hyperparameters`  : `(iter, opt_state, n) -> n`
-- `record_loss`             : `(iter, model, loss, tag) -> Bool`; return `true` to stop
-- `madnlp_kwargs`           : NamedTuple forwarded to MadNLP
-- `warmstart`               : warm-start MadNLP between solves (default `true`)
-- `problem_pool`            : vector of `(de, p_x0, p_target, p_uncertainty)` tuples
-                              for parallel GPU solves; each entry gets its own MadNLP solver
-                              and samples are distributed round-robin across the pool
-- `control_variate`         : optional `ScalarCriticControlVariate`; default
-                              `NoCriticControlVariate()` recovers the original update
-- `critic_training_target`  : `RolloutCriticTarget(...)` for rollout-objective
-                              critic fitting, or `DeterministicEquivalentCriticTarget()`
-                              / `:deterministic_equivalent` for DE ablations
-- `critic_rollout_samples_per_batch`: number of solved batch scenarios to rerun
-                              through stage-wise rollout for critic targets;
-                              `nothing` uses all successful solved scenarios
-- `actor_gradient_mode`     : `:control_variate` or `:surrogate`
-- `num_cheap_critic_samples_per_batch`: extra policy rollouts used only for
-                              critic actor terms; these do not trigger NLP solves
-- `external_critic_samples`  : mutable vector; `record_loss` can push
-                              `CriticSample`s (e.g. from `critic_samples_from_evaluation`)
-                              to feed the critic replay buffer without extra solves
-- `reuse_solver`            : override `has_fixed_vars` detection to force solver
-                              reuse with warm-starting. Use when fixed variables
-                              have constant bounds across solves (e.g., strict
-                              mode delta variables with `lvar == uvar == 0`).
-                              Default `false`.
+# Arguments
+- `model`: Flux policy.
+- `initial_state::AbstractVector`: initial state vector.
+- `det_equivalent`: ExaModels deterministic-equivalent problem.
+- `p_x0`: ExaModels parameter for the initial state.
+- `p_target`: ExaModels parameter for policy targets.
+- `p_uncertainty`: ExaModels parameter for uncertainty.
+- `uncertainty_sampler`: callable returning a flat uncertainty trajectory.
+
+# Keywords
+- `num_batches::Int`: number of gradient steps.
+- `num_train_per_batch::Int`: number of scenarios averaged per step.
+- `optimizer`: Flux optimizer or optimizer chain.
+- `adjust_hyperparameters`: callback `(iter, opt_state, n) -> n`.
+- `record_loss`: callback `(iter, model, loss, tag) -> Bool`; return `true`
+  to stop training.
+- `madnlp_kwargs`: keyword arguments forwarded to MadNLP.
+- `warmstart::Bool`: warm-start MadNLP between solves.
+- `retry_on_failure::Bool`: retry failed solves with a fresh solver state.
+- `problem_pool`: optional vector of `(de, p_x0, p_target, p_uncertainty)`
+  tuples for independent solves.
+- `control_variate`: optional critic control variate.
+- `actor_gradient_mode::Symbol`: `:control_variate` or `:surrogate`.
+- `critic_cv_weight`, `dual_actor_weight`, `critic_actor_weight`: actor loss
+  weights.
+- `critic_updates_per_batch::Int`: critic optimizer steps per batch.
+- `critic_buffer_size::Int`: replay-buffer capacity.
+- `critic_batch_size`: critic minibatch size, or `nothing` for all samples.
+- `critic_training_target`: rollout or deterministic-equivalent critic target.
+- `critic_rollout_samples_per_batch`: number of solved samples rerun through
+  rollout for critic targets; `nothing` uses all successful solved samples.
+- `num_cheap_critic_samples_per_batch::Int`: extra policy rollouts used only
+  for critic actor terms.
+- `critic_optimizer`: Flux optimizer for the critic.
+- `external_critic_samples`: optional mutable vector of externally produced
+  `CriticSample`s.
+- `batch_diagnostics`: callback `(iter, stats) -> nothing`.
+- `reuse_solver::Bool`: force solver reuse when fixed variables have constant
+  bounds across solves.
+
+# Returns
+- `model`, updated in place.
+
+# Notes
+For multi-unit stochastic processes, `uncertainty_sampler` should preserve
+within-stage spatial correlation, for example by drawing one joint scenario
+index per stage.
 """
 function train_tsddr(
     model,
@@ -901,7 +1011,9 @@ function train_tsddr(
                         failure = "status_" * _status_key(result.status)
                     elseif !isfinite(result.objective)
                         failure = "nonfinite_objective"
-                    elseif solve_succeeded(result) && isfinite(result.objective)
+                    else
+                        # Solve succeeded with a finite objective (both negations
+                        # were tested above); only the multipliers remain to check.
                         λ = target_multipliers(de, result)
                         if all(isfinite, λ)
                             put!(out_ch, (s_idx, F.(w_flat), _adapt_array(F.(λ), w_flat),
@@ -933,6 +1045,14 @@ function train_tsddr(
         # ── Forward pass: rollout + solve (outside AD tape) ───────────────────
 
         # Step 1: Roll out policy for all samples
+        # Precision note: uncertainties are cast to F (typically Float32, the
+        # policy precision) here, and this F-cast array is later written into
+        # the Float64 NLP via set_parameter!. The round-trip through Float32 is
+        # intentional: the NLP must be solved for exactly the targets the policy
+        # produced from these Float32 inputs, so the resulting λ multipliers
+        # pair with the same Float32 rollout in the gradient step below
+        # (train/gradient consistency). Do not "fix" this by keeping w in
+        # Float64 for the NLP only.
         sample_data = Vector{Tuple{AbstractVector{F}, AbstractVector{F}}}(undef, num_train_per_batch)
         for s in 1:num_train_per_batch
             w_flat = uncertainty_sampler()
@@ -1171,12 +1291,29 @@ function train_tsddr(
     end
 
     finally
-        # Shut down worker threads
-        for ch in in_channels
-            put!(ch, nothing)
+        # Shut down worker threads. A worker that already died never drains its
+        # input channel, so an unconditional put! on a full Channel{Any}(1)
+        # would block forever; only signal workers that are still running, and
+        # guard the put! itself against the check-then-put race.
+        for (i, ch) in enumerate(in_channels)
+            if !istaskdone(worker_tasks[i])            # skip dead workers (nobody consumes)
+                try
+                    put!(ch, nothing)                  # normal shutdown sentinel
+                catch err
+                    # Worker died between the istaskdone check and the put!
+                    # (or the channel was closed) — nothing left to signal.
+                    @warn "train_tsddr worker $i shutdown signal failed" exception=(err, catch_backtrace())
+                end
+            end
         end
-        for t in worker_tasks
-            wait(t)
+        for (i, t) in enumerate(worker_tasks)
+            try
+                wait(t)                                # join worker task
+            catch err
+                # A failed worker rethrows on wait; log instead of masking the
+                # original in-flight exception during cleanup.
+                @warn "train_tsddr worker $i failed" exception=(err, catch_backtrace())
+            end
         end
     end
 
@@ -1189,28 +1326,39 @@ end
     train_tsddr_embedded(model, initial_state, embedded_de,
                          uncertainty_sampler; kwargs...) -> model
 
-TS-DDR training with the policy embedded inside the NLP via VectorNonlinearOracle.
+Train a TS-DDR policy embedded directly in the NLP.
 
-Unlike `train_tsddr`, this version:
-- Does NOT roll out the policy externally to generate targets
-- Solves the coupled NLP where oracle constraints evaluate π_θ inline
-- Extracts closed-loop duals λ and realized states x* from the solution
-- Computes ∇_θ Q = Σ_t λ_t · ∇_θ π_θ(w_t, x*_{t-1}) using realized states
+Unlike [`train_tsddr`](@ref), this function does not roll out targets
+externally. The NLP oracle evaluates `model` inline, the solve returns
+closed-loop multipliers and realized states, and the actor gradient is computed
+from those realized states.
 
-Arguments:
-- `model`              : Flux policy (same object captured by the oracle closures)
-- `initial_state`      : initial state vector
-- `embedded_de`        : `EmbeddedDeterministicEquivalentProblem`
-- `uncertainty_sampler` : `() -> w_flat` — flat vector of length `T * nw_per_stage`
+# Arguments
+- `model`: Flux policy captured by the embedded oracle closures.
+- `initial_state::AbstractVector`: initial state vector.
+- `embedded_de`: embedded deterministic-equivalent problem.
+- `uncertainty_sampler`: callable returning a flat uncertainty trajectory.
 
-Keyword arguments:
-- `num_batches`            : total gradient steps (default 100)
-- `num_train_per_batch`    : scenarios averaged per step (default 1)
-- `optimizer`              : Flux.Optimisers optimizer
-- `adjust_hyperparameters` : `(iter, opt_state, n) -> n`
-- `record_loss`            : `(iter, model, loss, tag) -> Bool`; return `true` to stop
-- `madnlp_kwargs`          : NamedTuple forwarded to MadNLP
-- `warmstart`              : warm-start MadNLP between solves (default `true`)
+# Keywords
+- `num_batches::Int`: number of gradient steps.
+- `num_train_per_batch::Int`: number of scenarios averaged per step.
+- `optimizer`: Flux optimizer or optimizer chain.
+- `adjust_hyperparameters`: callback `(iter, opt_state, n) -> n`.
+- `record_loss`: callback `(iter, model, loss, tag) -> Bool`; return `true`
+  to stop training.
+- `madnlp_kwargs`: keyword arguments forwarded to MadNLP.
+- `warmstart::Bool`: warm-start MadNLP between solves.
+- `retry_on_failure::Bool`: retry failed solves with a fresh solver state.
+- `get_realized_states`: optional callback `(prob, result) -> x_flat`.
+- `batch_diagnostics`: callback `(iter, stats) -> nothing`.
+
+# Returns
+- `model`, updated in place.
+
+# Notes
+The gradient uses
+`sum_t dot(lambda_t, pi_theta(w_t, x^*_{t-1}))`, where `x^*` is the realized
+state trajectory from the coupled NLP solution.
 """
 function train_tsddr_embedded(
     model,

@@ -38,9 +38,10 @@ using MadNLPGPU, KernelAbstractions, CUDA
 using CUDSS, CUDSS_jll, cuDNN
 
 const SCRIPT_DIR = dirname(@__FILE__)
+include(joinpath(SCRIPT_DIR, "hydro_training_utils.jl"))
 include(joinpath(SCRIPT_DIR, "hydro_power_data.jl"))
 include(joinpath(SCRIPT_DIR, "hydro_power_exa.jl"))
-include(joinpath(SCRIPT_DIR, "hydro_power_exa_embedded.jl"))
+include(joinpath(SCRIPT_DIR, "hydro_reachable_policy.jl"))
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -53,31 +54,6 @@ const PM_FILE     = joinpath(CASE_DIR, "PowerModels.json")
 const HYDRO_FILE  = joinpath(CASE_DIR, "hydro.json")
 const INFLOW_FILE = joinpath(CASE_DIR, "inflows.csv")
 const DEMAND_FILE = joinpath(CASE_DIR, "demand.csv")
-
-"""
-    parse_layers(s::AbstractString) -> Vector{Int}
-
-Parse a comma-separated hidden-layer specification used by the Slurm and local
-training entrypoints.
-
-An empty string means "no hidden layers" for the nonrecurrent target head. This
-lets `DR_HEAD_LAYERS=""` preserve the historical single Dense head, while values
-such as `"128,128"` create a deeper state-conditioned feed-forward head.
-
-# Arguments
-- `s::AbstractString`: comma-separated layer widths, with optional whitespace.
-
-# Returns
-- `Vector{Int}`: parsed hidden widths; `Int[]` when `s` is empty or whitespace.
-
-# Examples
-```julia
-parse_layers("128, 64") == [128, 64]
-parse_layers("") == Int[]
-```
-"""
-parse_layers(s::AbstractString) =
-    isempty(strip(s)) ? Int[] : [parse(Int, strip(x)) for x in split(s, ",") if !isempty(strip(x))]
 
 const ENCODER_LAYERS = parse_layers(get(ENV, "DR_ENCODER_LAYERS", get(ENV, "DR_LAYERS", "128,128")))
 const HEAD_LAYERS    = parse_layers(get(ENV, "DR_HEAD_LAYERS", ""))

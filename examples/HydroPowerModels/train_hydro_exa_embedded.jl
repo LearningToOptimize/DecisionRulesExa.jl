@@ -20,8 +20,10 @@ using MadNLP, MadNLPGPU
 using CUDA, CUDSS, KernelAbstractions
 
 const SCRIPT_DIR = dirname(@__FILE__)
+include(joinpath(SCRIPT_DIR, "hydro_training_utils.jl"))
 include(joinpath(SCRIPT_DIR, "hydro_power_data.jl"))
 include(joinpath(SCRIPT_DIR, "hydro_power_exa.jl"))
+include(joinpath(SCRIPT_DIR, "hydro_reachable_policy.jl"))
 include(joinpath(SCRIPT_DIR, "hydro_power_exa_embedded.jl"))
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -36,7 +38,7 @@ const HYDRO_FILE  = joinpath(CASE_DIR, "hydro.json")
 const INFLOW_FILE = joinpath(CASE_DIR, "inflows.csv")
 const DEMAND_FILE = joinpath(CASE_DIR, "demand.csv")
 
-const LAYERS      = let s = get(ENV, "DR_LAYERS", "128,128"); [parse(Int, x) for x in split(s, ",")] end
+const LAYERS      = parse_layers(get(ENV, "DR_LAYERS", "128,128"))
 const ACTIVATION  = sigmoid
 const NUM_STAGES  = parse(Int, get(ENV, "DR_NUM_STAGES", "126"))
 const NUM_ROLLOUT_STAGES = parse(Int, get(ENV, "DR_NUM_ROLLOUT_STAGES", "96"))
@@ -297,6 +299,7 @@ function set_hydro_rollout_stage!(stage_prob, state_in, wt, target, stage)
         set_demand!(stage_prob, load_scaler .* demand_mat[stage:stage, :])
     end
     ExaModels.set_parameter!(stage_prob.core, stage_prob.p_target, target)
+    prepare_solve!(stage_prob, state_in, wt, target)
     return stage_prob
 end
 

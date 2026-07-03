@@ -11,8 +11,17 @@
 """
     MLPPolicy(model, output_dim)
 
-Stateless MLP policy: one call with `vcat(x0, w_flat)` returns the full target
-trajectory `x̂` as a flat vector of length `T*nx`.
+Wrap a stateless Flux model as a full-horizon target policy.
+
+The wrapped model is called once per scenario with `vcat(x0, w_flat)` and
+returns the full target trajectory as a flat vector of length `output_dim`.
+
+# Arguments
+- `model`: Flux-compatible callable.
+- `output_dim::Int`: number of target components retained from `vec(model(input))`.
+
+# Returns
+- `MLPPolicy`: a Flux layer wrapper around `model`.
 """
 struct MLPPolicy{M}
     model::M
@@ -21,6 +30,17 @@ end
 
 Flux.@layer MLPPolicy
 
+"""
+    (policy::MLPPolicy)(input) -> AbstractVector
+
+Evaluate a stateless full-horizon policy.
+
+# Arguments
+- `input`: concatenated initial state and flat uncertainty trajectory.
+
+# Returns
+- The first `policy.output_dim` entries of `vec(policy.model(input))`.
+"""
 function (π::MLPPolicy)(input)
     y = π.model(input)
     return vec(y)[1:π.output_dim]
@@ -28,6 +48,19 @@ end
 
 """
     MLPPolicy(input_dim, output_dim; hidden=(64,64), act=tanh)
+
+Construct a feed-forward [`MLPPolicy`](@ref).
+
+# Arguments
+- `input_dim::Int`: length of the concatenated scenario input.
+- `output_dim::Int`: length of the flattened target trajectory.
+
+# Keywords
+- `hidden`: hidden-layer widths.
+- `act`: hidden-layer activation.
+
+# Returns
+- `MLPPolicy`: stateless full-horizon policy.
 """
 function MLPPolicy(input_dim::Int, output_dim::Int;
     hidden = (64, 64),
@@ -99,18 +132,29 @@ end
 """
     StateConditionedPolicy{E,C}
 
-Stateful LSTM policy for sequential rollout:
+Flux-compatible state-conditioned policy for sequential target rollout.
 
-    x̂_t = policy(vcat(w_t, x̂_{t-1}))
+At each stage the policy is called as
 
-- `encoder`: LSTM chain operating on the uncertainty slice `w_t`
-- `combiner`: Dense layer combining encoder output with previous state
+```julia
+xhat_t = policy(vcat(w_t, x_prev))
+```
 
-Call `Flux.reset!(policy)` before each episode.
+where the recurrent encoder reads only `w_t` and the combiner reads
+`[encoded_uncertainty; x_prev]`.
 
-# Flux 0.16 note
-LSTM requires ≥2D input.  The forward pass reshapes the 1D `w_t` slice to
-`(n_uncertainty, 1)` before encoding and squeezes back with `vec`.
+# Fields
+- `encoder`: recurrent uncertainty encoder.
+- `combiner`: nonrecurrent target head.
+- `n_uncertainty::Int`: number of uncertainty features at each stage.
+- `n_state::Int`: number of previous-state features.
+- `output_lower`: optional lower bounds for affine output scaling.
+- `output_scale`: optional `upper - lower` scale for affine output scaling.
+
+# Notes
+Call `Flux.reset!(policy)` before each scenario. Recurrent Flux layers require
+two-dimensional input, so the forward pass reshapes the one-dimensional
+uncertainty slice to `(n_uncertainty, 1)` before encoding.
 """
 struct StateConditionedPolicy{E,C,L,U}
     encoder::E
@@ -123,6 +167,18 @@ end
 
 Flux.@layer StateConditionedPolicy trainable=(encoder, combiner)
 
+"""
+    (policy::StateConditionedPolicy)(input) -> AbstractVector
+
+Evaluate one stage of a state-conditioned policy.
+
+# Arguments
+- `input`: concatenated vector `[w_t; x_prev]`.
+
+# Returns
+- Raw combiner output, or affine-scaled output when `output_bounds` were
+  supplied at construction.
+"""
 function (m::StateConditionedPolicy)(input)
     w = reshape(input[1:m.n_uncertainty], :, 1)   # (n_unc, 1) for LSTM
     s = input[m.n_uncertainty+1:end]
@@ -136,8 +192,31 @@ function (m::StateConditionedPolicy)(input)
     return lower .+ scale .* y
 end
 
+"""
+    Flux.reset!(policy::StateConditionedPolicy)
+
+Reset the recurrent uncertainty encoder.
+
+# Returns
+- The result of `Flux.reset!(policy.encoder)`.
+"""
 Flux.reset!(m::StateConditionedPolicy) = Flux.reset!(m.encoder)
 
+"""
+    _adapt_policy_bound(x, ref)
+
+Move a policy bound vector to the same storage family and element type as
+`ref`.
+
+# Arguments
+- `x::AbstractVector`: bound vector stored on the policy.
+- `ref::AbstractVector`: output vector whose element type and device should be
+  matched.
+
+# Returns
+- `x` itself when the concrete vector type already matches `ref`; otherwise a
+  copied vector compatible with `ref`.
+"""
 function _adapt_policy_bound(x::AbstractVector, ref::AbstractVector)
     typeof(x) === typeof(ref) && return x
     y = similar(ref, length(x))
@@ -148,11 +227,19 @@ end
 """
     load_stateconditioned_policy!(policy, state)
 
-Load a `Flux.state` checkpoint into a `StateConditionedPolicy`.
+Load a Flux checkpoint into a [`StateConditionedPolicy`](@ref).
 
-Checkpoints saved before `output_bounds` existed contain only the trainable
-encoder and combiner state.  In that case, restore those trainable components
-and keep the current policy's case-defined output bounds.
+# Arguments
+- `policy::StateConditionedPolicy`: policy to update in place.
+- `state`: checkpoint object accepted by `Flux.loadmodel!`.
+
+# Returns
+- `policy`.
+
+# Notes
+Checkpoints saved before output bounds were added contain only the trainable
+encoder and combiner state. In that case, this method restores those trainable
+components and keeps the current policy's case-defined output bounds.
 """
 function load_stateconditioned_policy!(policy::StateConditionedPolicy, state)
     try
@@ -172,7 +259,7 @@ raw"""
                            activation=tanh, encoder_type=Flux.LSTM,
     output_bounds=nothing, combiner_layers=Int[])
 
-Construct a `StateConditionedPolicy`.
+Construct a state-conditioned sequential target policy.
 
 The policy separates memory from state conditioning:
 
@@ -191,6 +278,8 @@ recurrence over the state input.
 - `n_state::Int`: number of previous-state features appended after uncertainty.
 - `n_out::Int`: output dimension, usually the state-target dimension.
 - `layers::AbstractVector{Int}`: recurrent encoder hidden sizes.
+
+# Keywords
 - `activation`: head activation. Use `sigmoid` with `output_bounds` when targets
   must remain inside bounds.
 - `encoder_type`: recurrent layer constructor, typically `Flux.LSTM`.
@@ -202,6 +291,11 @@ recurrence over the state input.
 
 # Returns
 - `StateConditionedPolicy` with trainable `encoder` and `combiner`.
+
+# Notes
+The recurrent encoder receives only uncertainty. The previous state enters
+through the feed-forward combiner, so `combiner_layers` increases
+state-to-target expressiveness without making the state input recurrent.
 
 # Examples
 ```julia
@@ -255,8 +349,17 @@ end
 """
     ConstantStatePolicy(output_template, n_uncertainty, n_state)
 
-Policy for cases where no target dimension is trainable. It always returns the
-case-defined target vector and has no trainable parameters.
+Represent a policy with no trainable target dimensions.
+
+The policy always returns `output_template`, adapted to the input device.
+
+# Arguments
+- `output_template`: fixed full target vector.
+- `n_uncertainty::Int`: number of uncertainty features expected in the input.
+- `n_state::Int`: number of state features expected in the input.
+
+# Returns
+- `ConstantStatePolicy`: Flux layer with no trainable parameters.
 """
 struct ConstantStatePolicy{O}
     output_template::O
@@ -266,16 +369,43 @@ end
 
 Flux.@layer ConstantStatePolicy trainable=()
 
+"""
+    (policy::ConstantStatePolicy)(input) -> AbstractVector
+
+Return the fixed target template, adapted to the input storage family.
+
+# Arguments
+- `input`: vector used only as an adaptation reference.
+
+# Returns
+- The fixed target vector.
+"""
 (m::ConstantStatePolicy)(input) = _adapt_policy_bound(m.output_template, input)
+
+"""
+    Flux.reset!(policy::ConstantStatePolicy) -> Nothing
+
+No-op reset method for constant policies.
+"""
 Flux.reset!(::ConstantStatePolicy) = nothing
 
 """
     FixedOutputPolicy(policy, output_template, output_expansion)
 
-Wrap a policy that predicts only active target dimensions and expand its output
-to the full state-target vector. `output_template` stores constants for
-inactive dimensions and zeros for active dimensions; `output_expansion` maps
-active outputs into the full state vector without mutation.
+Expand active target dimensions into a full target vector.
+
+The wrapped policy predicts only active dimensions. `output_template` stores
+constants for inactive dimensions and zeros for active dimensions;
+`output_expansion` maps active outputs into the full state vector without
+mutation.
+
+# Arguments
+- `policy`: Flux-compatible policy for active dimensions.
+- `output_template`: full target vector with inactive constants.
+- `output_expansion`: matrix mapping active outputs into full target space.
+
+# Returns
+- `FixedOutputPolicy`: Flux layer wrapper around `policy`.
 """
 struct FixedOutputPolicy{P,O,E}
     policy::P
@@ -285,13 +415,44 @@ end
 
 Flux.@layer FixedOutputPolicy trainable=(policy,)
 
+"""
+    (policy::FixedOutputPolicy)(input) -> AbstractVector
+
+Evaluate the active-dimension policy and expand it into the full target vector.
+
+# Arguments
+- `input`: stage input forwarded to the wrapped policy.
+
+# Returns
+- Full target vector with active outputs inserted and inactive dimensions fixed.
+"""
 function (m::FixedOutputPolicy)(input)
     y = m.policy(input)
     return m.output_template .+ m.output_expansion * y
 end
 
+"""
+    Flux.reset!(policy::FixedOutputPolicy)
+
+Reset the wrapped active-dimension policy.
+
+# Returns
+- The result of `Flux.reset!(policy.policy)`.
+"""
 Flux.reset!(m::FixedOutputPolicy) = Flux.reset!(m.policy)
 
+"""
+    load_stateconditioned_policy!(policy::FixedOutputPolicy, state)
+
+Load checkpoint state into the wrapped active-dimension policy.
+
+# Arguments
+- `policy::FixedOutputPolicy`: wrapper whose inner policy is updated.
+- `state`: checkpoint object accepted by the inner policy loader.
+
+# Returns
+- The result of `load_stateconditioned_policy!(policy.policy, state)`.
+"""
 load_stateconditioned_policy!(policy::FixedOutputPolicy, state) =
     load_stateconditioned_policy!(policy.policy, state)
 
@@ -326,6 +487,8 @@ uncertainty encoder while making the state-to-target map nonlinear.
 - `lower::AbstractVector`: lower bound for each full target dimension.
 - `upper::AbstractVector`: upper bound for each full target dimension.
 - `layers::AbstractVector{Int}`: recurrent uncertainty-encoder hidden sizes.
+
+# Keywords
 - `activation`: head activation, defaulting to `sigmoid`.
 - `encoder_type`: recurrent layer constructor.
 - `active_mask`: optional Boolean mask selecting trainable output dimensions.
@@ -336,6 +499,10 @@ uncertainty encoder while making the state-to-target map nonlinear.
 - `StateConditionedPolicy` when all dimensions are active.
 - `ConstantStatePolicy` when no dimensions are active.
 - `FixedOutputPolicy` when only a subset is active.
+
+# Throws
+- `ArgumentError` if bound lengths differ, `active_mask` has the wrong length,
+  or any upper bound is smaller than its lower bound.
 
 # Examples
 ```julia

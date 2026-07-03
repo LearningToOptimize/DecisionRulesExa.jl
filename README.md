@@ -59,6 +59,16 @@ train_tsddr(
 )
 ```
 
+> **Note on the uncertainty parameter**: `train_tsddr` writes the full sampled
+> trajectory (length `T * nw`) into `p_uncertainty` with
+> `ExaModels.set_parameter!`, which enforces an exact size match (ExaModels ≥
+> 0.11). The `p_w` built by `build_deterministic_equivalent` /
+> `build_linear_tracking_problem` holds only the `(T - 1) * nw` dynamics
+> entries, so for `train_tsddr` your NLP needs an uncertainty parameter of
+> length `T * nw` (as the Hydro example's `p_inflow` is). See the
+> `"train_tsddr open-loop smoke test"` testset in `test/runtests.jl` for a
+> minimal full-length variant of the problem above.
+
 For GPU, replace `backend = nothing` with `backend = CUDABackend()` and add `linear_solver = CUDSSSolver` to `madnlp_kwargs`.
 
 ## What you need to provide

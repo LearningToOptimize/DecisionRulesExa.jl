@@ -9,30 +9,80 @@ abstract type AbstractCriticTrainingTarget end
 """
     DeterministicEquivalentCriticTarget()
 
-Train critic value targets from the full deterministic-equivalent objective.
-This is useful for ablations and for pure DE control-variate experiments.
+Select critic value targets from the full deterministic-equivalent training
+objective.
+
+# Returns
+- `DeterministicEquivalentCriticTarget`: a target selector for deterministic-
+  equivalent critic supervision.
+
+# Notes
+Use this target for ablations or for control-variate experiments tied to the
+training surrogate rather than to deployed rollout performance.
 """
 struct DeterministicEquivalentCriticTarget <: AbstractCriticTrainingTarget end
 
 """
-    RolloutCriticTarget(stage_problem; kwargs...)
+    RolloutCriticTarget(
+        stage_problem;
+        horizon::Int,
+        n_uncertainty::Int,
+        set_stage_parameters!::Function,
+        realized_state::Function,
+        objective_no_target_penalty::Function = (prob, result) -> result.objective,
+        madnlp_kwargs = NamedTuple(),
+        warmstart::Bool = true,
+        policy_state::Symbol = :target,
+        reuse_solver::Bool = false,
+        objective_value::Symbol = :objective,
+        state_bounds = nothing,
+        project_state = nothing,
+        retry_on_failure::Bool = true,
+    ) -> RolloutCriticTarget
 
-Train critic value targets from stage-wise rollout evaluation. This is the
-preferred target when the critic is meant to guide convergence of the deployed
-rollout objective rather than the deterministic-equivalent surrogate.
+Select critic value targets from stage-wise rollout evaluation.
 
-Required keyword callbacks match `rollout_tsddr`:
-- `set_stage_parameters!`
-- `realized_state`
+# Arguments
+- `stage_problem`: single-stage optimization problem template used by
+  [`rollout_tsddr`](@ref).
 
-By default `policy_state = :target`, matching the differentiable target
-recurrence used by the actor. Set `policy_state = :realized` to train on
-closed-loop realized-state rollout targets.
+# Keywords
+- `horizon::Int`: number of rollout stages.
+- `n_uncertainty::Int`: dimension of each per-stage uncertainty slice.
+- `set_stage_parameters!::Function`: callback that writes state,
+  uncertainty, target, and stage index into `stage_problem`.
+- `realized_state::Function`: callback that extracts the realized next state
+  from a solved stage.
+- `objective_no_target_penalty::Function`: callback returning the stage
+  objective with target-tracking penalties removed.
+- `madnlp_kwargs`: keyword arguments forwarded to the MadNLP solver wrapper.
+- `warmstart::Bool`: whether rollout solves should warm-start from previous
+  stage information.
+- `policy_state::Symbol`: `:target` trains against the differentiable target
+  recurrence; `:realized` trains against closed-loop realized states.
+- `reuse_solver::Bool`: whether rollout evaluation may reuse one solver
+  object across stages.
+- `objective_value::Symbol`: `:objective` uses the full rollout objective;
+  `:objective_no_target_penalty` removes target-slack penalties.
+- `state_bounds`: optional `(lower, upper)` projection bounds for realized
+  states.
+- `project_state`: optional custom projection callback for realized states.
+- `retry_on_failure::Bool`: whether failed stage solves should be retried with
+  a cold-start solver.
 
-By default `objective_value = :objective`, so critic value targets include the
-same target-penalty contribution that appears in the dual actor signal. Set
-`objective_value = :objective_no_target_penalty` to train on the rollout
-objective with target-slack penalties removed.
+# Returns
+- `RolloutCriticTarget`: a target selector carrying the rollout callbacks and
+  options.
+
+# Throws
+- Throws an error if `policy_state` is not `:target` or `:realized`.
+- Throws an error if `objective_value` is not `:objective` or
+  `:objective_no_target_penalty`.
+
+# Notes
+This is the preferred target when the critic is meant to guide convergence of
+the deployed rollout objective rather than the deterministic-equivalent
+surrogate.
 """
 struct RolloutCriticTarget{S,R,O,M,B,P} <: AbstractCriticTrainingTarget
     stage_problem
@@ -92,26 +142,57 @@ end
 """
     NoCriticControlVariate()
 
-Default no-op critic configuration. Passing this to `train_tsddr` recovers the
-original dual-multiplier actor update.
+Construct the no-op critic configuration.
+
+# Returns
+- `NoCriticControlVariate`: a sentinel that disables critic/control-variate
+  terms.
+
+# Notes
+Passing this value to `train_tsddr` recovers the original dual-multiplier actor
+update.
 """
 struct NoCriticControlVariate <: AbstractCriticControlVariate end
 
 """
-    ScalarCriticControlVariate(critic; featurizer=default_critic_featurizer,
-                               value_loss_weight=0.1,
-                               gradient_loss_weight=1.0)
+    ScalarCriticControlVariate(
+        critic;
+        featurizer = default_critic_featurizer,
+        value_loss_weight::Real = 0.1,
+        gradient_loss_weight::Real = 1.0,
+    ) -> ScalarCriticControlVariate
 
-Wrap a scalar Flux-compatible critic `C(w, xhat)` for optional TS-DDR
-control-variate training. The critic is called as `critic(features)`, where
-`features = featurizer(initial_state, uncertainty, xhat)`.
+Wrap a scalar Flux-compatible critic for optional TS-DDR control-variate
+training.
 
-The critic loss is
+# Arguments
+- `critic`: callable scalar model evaluated as `critic(features)`.
 
-    value_loss_weight * mse(C, objective)
-  + gradient_loss_weight * mse(gradient(xhat -> C, xhat), target_multipliers)
+# Keywords
+- `featurizer`: callable
+  `featurizer(initial_state, uncertainty, xhat) -> features`.
+- `value_loss_weight::Real`: nonnegative weight on objective-value matching.
+- `gradient_loss_weight::Real`: nonnegative weight on target-gradient
+  matching.
 
-Either loss weight may be zero.
+# Returns
+- `ScalarCriticControlVariate`: critic configuration with loss weights stored
+  as `Float64`.
+
+# Throws
+- Throws an error if either loss weight is negative.
+
+# Notes
+For each [`CriticSample`](@ref), the critic loss is
+
+```math
+w_v |C(f) - J|^2
++ w_g \\frac{1}{n}\\|\\nabla_{\\hat{x}} C(f) - \\lambda_{\\hat{x}}\\|_2^2,
+```
+
+where `f = featurizer(initial_state, uncertainty, xhat)`, `J` is the scalar
+objective target, and ``\\lambda_{\\hat{x}}`` is the target multiplier array.
+Either weight may be zero.
 """
 struct ScalarCriticControlVariate{C,F} <: AbstractCriticControlVariate
     critic::C
@@ -137,11 +218,33 @@ function ScalarCriticControlVariate(
 end
 
 """
-    CriticSample(initial_state, uncertainty, xhat, objective_value,
-                 target_multipliers; metadata=nothing)
+    CriticSample(
+        initial_state,
+        uncertainty,
+        xhat,
+        objective_value::Real,
+        target_multipliers;
+        metadata = nothing,
+    ) -> CriticSample
 
-Training sample for a scalar critic. Samples are produced from already-solved
-TS-DDR scenarios and do not require additional optimization solves.
+Store one already-solved TS-DDR scenario as scalar-critic supervision.
+
+# Arguments
+- `initial_state`: initial state used for the scenario.
+- `uncertainty`: scenario uncertainty trajectory.
+- `xhat`: policy target trajectory.
+- `objective_value::Real`: scalar value target for the critic.
+- `target_multipliers`: multiplier-like target with the same shape as `xhat`.
+
+# Keywords
+- `metadata`: optional payload retained with the sample.
+
+# Returns
+- `CriticSample`: sample with `objective_value` converted to `Float64`.
+
+# Notes
+Creating a `CriticSample` does not run any optimization solve; samples are
+intended to be built from existing training or rollout results.
 """
 struct CriticSample{I,W,X,L,M}
     initial_state::I
@@ -171,11 +274,19 @@ function CriticSample(
 end
 
 """
-    CriticReplayBuffer(max_size)
+    CriticReplayBuffer(max_size::Integer) -> CriticReplayBuffer
 
-Fixed-capacity FIFO replay buffer for [`CriticSample`](@ref)s. When the buffer
-exceeds `max_size`, the oldest samples are discarded. A `max_size` of 0
-disables buffering (all pushes are no-ops).
+Construct a fixed-capacity FIFO replay buffer for [`CriticSample`](@ref)s.
+
+# Arguments
+- `max_size::Integer`: maximum number of samples retained; negative values are
+  clamped to zero.
+
+# Returns
+- `CriticReplayBuffer`: empty replay buffer with capacity `max(0, max_size)`.
+
+# Notes
+A capacity of zero disables buffering, so push operations become no-ops.
 """
 mutable struct CriticReplayBuffer{S}
     samples::Vector{S}
@@ -190,6 +301,16 @@ CriticReplayBuffer(max_size::Integer) =
 
 Append one [`CriticSample`](@ref) to the buffer, evicting the oldest sample if
 the buffer is at capacity.
+
+# Arguments
+- `buffer::CriticReplayBuffer`: replay buffer to mutate.
+- `sample::CriticSample`: sample to append.
+
+# Returns
+- `buffer`: the same buffer object, after optional insertion and eviction.
+
+# Notes
+If `buffer.max_size == 0`, the function returns without storing `sample`.
 """
 function push_critic_sample!(buffer::CriticReplayBuffer, sample::CriticSample)
     buffer.max_size == 0 && return buffer
@@ -203,6 +324,13 @@ end
     push_critic_samples!(buffer, samples) -> buffer
 
 Append multiple [`CriticSample`](@ref)s to the buffer in order.
+
+# Arguments
+- `buffer::CriticReplayBuffer`: replay buffer to mutate.
+- `samples`: iterable of [`CriticSample`](@ref) values.
+
+# Returns
+- `buffer`: the same buffer after appending the supplied samples.
 """
 function push_critic_samples!(buffer::CriticReplayBuffer, samples)
     for sample in samples
@@ -212,10 +340,17 @@ function push_critic_samples!(buffer::CriticReplayBuffer, samples)
 end
 
 """
-    default_critic_featurizer(initial_state, uncertainty, xhat)
+    default_critic_featurizer(initial_state, uncertainty, xhat) -> AbstractVector
 
-Default critic featurizer: concatenate flattened initial state, uncertainty, and
-policy target trajectory.
+Concatenate flattened critic inputs into one feature vector.
+
+# Arguments
+- `initial_state`: initial state for the scenario.
+- `uncertainty`: uncertainty trajectory for the scenario.
+- `xhat`: policy target trajectory for the scenario.
+
+# Returns
+- `AbstractVector`: `vcat(vec(initial_state), vec(uncertainty), vec(xhat))`.
 """
 default_critic_featurizer(initial_state, uncertainty, xhat) =
     vcat(vec(initial_state), vec(uncertainty), vec(xhat))
@@ -232,9 +367,21 @@ function _critic_value(critic, featurizer, initial_state, uncertainty, xhat)
 end
 
 """
-    critic_value(control_variate, initial_state, uncertainty, xhat)
+    critic_value(control_variate, initial_state, uncertainty, xhat) -> Number
 
 Evaluate the scalar critic on one scenario.
+
+# Arguments
+- `control_variate::ScalarCriticControlVariate`: critic configuration.
+- `initial_state`: initial state for the scenario.
+- `uncertainty`: uncertainty trajectory for the scenario.
+- `xhat`: policy target trajectory for the scenario.
+
+# Returns
+- `Number`: scalar critic prediction.
+
+# Throws
+- Throws an error if the critic returns a non-scalar array.
 """
 critic_value(
     cv::ScalarCriticControlVariate,
@@ -246,8 +393,23 @@ critic_value(
 """
     critic_xhat_gradient(control_variate, initial_state, uncertainty, xhat)
 
-Return `gradient(xhat -> C(initial_state, uncertainty, xhat), xhat)` and check
-that it has the same shape as `xhat`.
+Differentiate the scalar critic with respect to the policy target trajectory.
+
+# Arguments
+- `control_variate::ScalarCriticControlVariate`: critic configuration.
+- `initial_state`: initial state for the scenario.
+- `uncertainty`: uncertainty trajectory for the scenario.
+- `xhat`: policy target trajectory for the scenario.
+
+# Returns
+- An array with the same shape as `xhat`, equal to
+  `gradient(x -> critic_value(control_variate, initial_state, uncertainty, x), xhat)`.
+
+# Throws
+- Throws an error if the critic gradient shape differs from `xhat`.
+
+# Notes
+If Zygote reports `nothing`, the gradient is replaced by `zero(xhat)`.
 """
 function critic_xhat_gradient(
     cv::ScalarCriticControlVariate,
@@ -312,9 +474,32 @@ function _critic_loss_with(
 end
 
 """
-    critic_loss(control_variate, samples; value_loss_weight, gradient_loss_weight)
+    critic_loss(
+        control_variate,
+        samples;
+        value_loss_weight = control_variate.value_loss_weight,
+        gradient_loss_weight = control_variate.gradient_loss_weight,
+    ) -> Real
 
 Compute the scalar critic loss on a collection of `CriticSample`s.
+
+# Arguments
+- `control_variate::ScalarCriticControlVariate`: critic configuration.
+- `samples`: collection of [`CriticSample`](@ref) values.
+
+# Keywords
+- `value_loss_weight`: nonnegative override for objective-value loss weight.
+- `gradient_loss_weight`: nonnegative override for target-gradient loss
+  weight.
+
+# Returns
+- `Real`: average critic loss over `samples`, or `0.0` for an empty
+  collection.
+
+# Throws
+- Throws an error if either loss weight is negative.
+- Throws an error if a sample's target multipliers or critic gradient do not
+  match the shape of `xhat`.
 """
 critic_loss(cv::ScalarCriticControlVariate, samples; kwargs...) =
     _critic_loss_with(cv.critic, cv, samples; kwargs...)
@@ -330,10 +515,32 @@ function _critic_minibatch(samples, batch_size)
 end
 
 """
-    update_critic!(opt_state, control_variate, samples; batch_size=nothing)
+    update_critic!(
+        opt_state,
+        control_variate,
+        samples;
+        batch_size = nothing,
+    ) -> Float64
 
-Run one critic optimizer step and return the numeric loss. Only critic
-parameters are updated.
+Run one optimizer step for the scalar critic.
+
+# Arguments
+- `opt_state`: Flux optimizer state for `control_variate.critic`.
+- `control_variate::ScalarCriticControlVariate`: critic configuration.
+- `samples`: replay samples available for training.
+
+# Keywords
+- `batch_size`: optional minibatch size; `nothing` or a value greater than the
+  sample count uses all samples.
+
+# Returns
+- `Float64`: critic loss on the selected batch, or `NaN` when the selected
+  batch is empty.
+
+# Notes
+Only critic parameters are updated. If the materialized gradient is `nothing`
+or contains non-finite values, the optimizer update is skipped while the loss
+is still reported.
 """
 function update_critic!(
     opt_state,

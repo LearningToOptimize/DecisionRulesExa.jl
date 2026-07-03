@@ -17,6 +17,7 @@ using MadNLPGPU, KernelAbstractions, CUDA
 using CUDSS, CUDSS_jll, cuDNN
 
 const SCRIPT_DIR = dirname(@__FILE__)
+include(joinpath(SCRIPT_DIR, "hydro_training_utils.jl"))
 include(joinpath(SCRIPT_DIR, "hydro_power_data.jl"))
 include(joinpath(SCRIPT_DIR, "hydro_power_exa.jl"))
 
@@ -31,32 +32,6 @@ const PM_FILE     = joinpath(CASE_DIR, "PowerModels.json")
 const HYDRO_FILE  = joinpath(CASE_DIR, "hydro.json")
 const INFLOW_FILE = joinpath(CASE_DIR, "inflows.csv")
 const DEMAND_FILE = joinpath(CASE_DIR, "demand.csv")
-
-"""
-    parse_layers(s::AbstractString) -> Vector{Int}
-
-Parse a comma-separated neural-network layer specification from an environment
-variable.
-
-`DR_LAYERS` controls the recurrent uncertainty encoder. `DR_HEAD_LAYERS`
-controls optional hidden layers in the nonrecurrent state-conditioned target
-head. An empty string intentionally returns `Int[]`, preserving the historical
-single Dense head.
-
-# Arguments
-- `s::AbstractString`: comma-separated layer widths, with optional whitespace.
-
-# Returns
-- `Vector{Int}`: parsed hidden widths; `Int[]` for an empty specification.
-
-# Examples
-```julia
-parse_layers("128,128") == [128, 128]
-parse_layers("") == Int[]
-```
-"""
-parse_layers(s::AbstractString) =
-    isempty(strip(s)) ? Int[] : [parse(Int, strip(x)) for x in split(s, ",") if !isempty(strip(x))]
 
 const LAYERS      = parse_layers(get(ENV, "DR_LAYERS", "128,128"))
 const HEAD_LAYERS = parse_layers(get(ENV, "DR_HEAD_LAYERS", ""))

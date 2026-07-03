@@ -1,9 +1,19 @@
 using Test
 using DecisionRulesExa
+using ExaModels
 using Flux
 using MadNLP
 using Random
 using Zygote
+
+include(joinpath(@__DIR__, "..", "examples", "HydroPowerModels", "hydro_training_utils.jl"))
+
+@testset "HydroPowerModels training utilities" begin
+    @test parse_layers("128, 64") == [128, 64]
+    @test parse_layers("") == Int[]
+    @test parse_layers("  ") == Int[]
+    @test parse_layers("32,,16") == [32, 16]
+end
 
 @testset "DeterministicEquivalentProblem (CPU)" begin
     T = 6
@@ -373,4 +383,148 @@ end
 
     @test length(losses) == 5
     @test all(isfinite, losses)
+end
+
+@testset "rollout_tsddr (CPU)" begin
+    horizon = 3
+    nx = 1
+
+    # Stage problem: a horizon-2 linear tracking deterministic equivalent used
+    # as a one-stage projection problem. The realized next state is x_2.
+    stage_problem = build_linear_tracking_problem(
+        horizon = 2,
+        nx = nx,
+        backend = nothing,
+        slack_penalty = 10.0,
+        u_bounds = (-2.0, 2.0),
+    )
+
+    # Callback: write (x_{t-1}, w_t, xhat_t) into the stage problem. The stage-1
+    # target equals the incoming state (its constraint is slack-absorbed anyway);
+    # the stage-2 target is the policy target being projected.
+    set_stage_params! = (prob, state, w_t, target, stage) -> begin
+        set_x0!(prob, state)
+        set_uncertainty!(prob, w_t)
+        set_targets!(prob, vcat(state, target))
+        return nothing
+    end
+    # Callback: read the realized next state x_2 from the stage solution.
+    realized = (prob, result) -> begin
+        x_sol, _, _ = solution_components(prob, result)
+        return x_sol[end - prob.nx + 1 : end]
+    end
+
+    Random.seed!(31)
+    policy = StateConditionedPolicy(1, 1, 1, [4]; activation = tanh)
+    x0 = Float32[0.5]
+    w_flat = Float32.(0.1 .* randn(horizon * 1))
+
+    result = rollout_tsddr(
+        policy, x0, stage_problem, w_flat;
+        horizon = horizon,
+        n_uncertainty = 1,
+        set_stage_parameters! = set_stage_params!,
+        realized_state = realized,
+        madnlp_kwargs = (tol = 1e-6, max_iter = 300, print_level = MadNLP.ERROR),
+    )
+    @test result isa NamedTuple
+    @test isfinite(result.objective)
+    @test length(result.state_trajectory) == horizon + 1
+    @test length(result.target_trajectory) == horizon
+
+    # The :target feedback mode (policy sees its own previous target) must also run.
+    result_target = rollout_tsddr(
+        policy, x0, stage_problem, w_flat;
+        horizon = horizon,
+        n_uncertainty = 1,
+        set_stage_parameters! = set_stage_params!,
+        realized_state = realized,
+        policy_state = :target,
+        madnlp_kwargs = (tol = 1e-6, max_iter = 300, print_level = MadNLP.ERROR),
+    )
+    @test result_target isa NamedTuple
+    @test isfinite(result_target.objective)
+
+    # A wrong-length uncertainty vector must be rejected before any solve.
+    @test_throws ArgumentError rollout_tsddr(
+        policy, x0, stage_problem, Float32[0.1];
+        horizon = horizon,
+        n_uncertainty = 1,
+        set_stage_parameters! = set_stage_params!,
+        realized_state = realized,
+    )
+end
+
+@testset "train_tsddr open-loop smoke test" begin
+    T = 4
+    nx = 1
+
+    # train_tsddr writes the full length-T*nw uncertainty sample into
+    # p_uncertainty via ExaModels.set_parameter!, which enforces an exact size
+    # match. build_linear_tracking_problem's p_w has length (T-1)*nw (dynamics
+    # stages only), so this test builds the same linear tracking NLP manually
+    # with a full-length uncertainty parameter (mirroring the hydro p_inflow
+    # layout, where the final-stage entry does not enter the dynamics).
+    core = ExaModels.ExaCore(Float64)
+    x = ExaModels.variable(core, T * nx)
+    u = ExaModels.variable(core, (T - 1) * nx; lvar = -2.0, uvar = 2.0)
+    δ = ExaModels.variable(core, T * nx)
+    p_x0 = ExaModels.parameter(core, zeros(nx))
+    p_w = ExaModels.parameter(core, zeros(T * nx))       # full length T*nw
+    p_target = ExaModels.parameter(core, zeros(T * nx))
+    # Stage cost (x_t^2 + u_t^2)/2 plus slack penalty (rho/2)*delta^2, rho = 10.
+    ExaModels.objective(core,
+        (x[x_index(nx, t, i)]^2 + u[u_index(nx, t, i)]^2) / 2
+        for t in 1:(T - 1), i in 1:nx
+    )
+    ExaModels.objective(core,
+        5.0 * δ[x_index(nx, t, i)]^2
+        for t in 1:T, i in 1:nx
+    )
+    # Initial condition, dynamics x_{t+1} = x_t + u_t + w_t, then targets LAST.
+    ExaModels.constraint(core,
+        x[x_index(nx, 1, i)] - p_x0[i]
+        for i in 1:nx
+    )
+    ExaModels.constraint(core,
+        x[x_index(nx, t + 1, i)] - x[x_index(nx, t, i)] -
+        u[u_index(nx, t, i)] - p_w[w_index(nx, t, i)]
+        for t in 1:(T - 1), i in 1:nx
+    )
+    ExaModels.constraint(core,
+        p_target[x_index(nx, t, i)] - x[x_index(nx, t, i)] - δ[x_index(nx, t, i)]
+        for t in 1:T, i in 1:nx
+    )
+    model = ExaModels.ExaModel(core)
+    target_start = nx + (T - 1) * nx + 1
+    prob = DeterministicEquivalentProblem(
+        core, model, x, u, δ,
+        p_x0, p_w, p_target,
+        nx, nx, nx, T,
+        target_start:(target_start + T * nx - 1),
+    )
+
+    Random.seed!(123)
+    policy = StateConditionedPolicy(nx, nx, nx, [8]; activation = tanh)
+    x0 = Float32[1.0]
+    losses = Float64[]
+    params_before = _state_vector(policy)
+
+    train_tsddr(
+        policy, x0, prob,
+        prob.p_x0, prob.p_target, prob.p_w,
+        () -> randn(T * nx);
+        num_batches = 2,
+        num_train_per_batch = 1,
+        madnlp_kwargs = (tol = 1e-6, max_iter = 300, print_level = MadNLP.ERROR),
+        warmstart = true,
+        record_loss = (iter, m, loss, tag) -> begin
+            push!(losses, loss)
+            return false
+        end,
+    )
+
+    @test length(losses) == 2
+    @test all(isfinite, losses)
+    @test _state_vector(policy) != params_before
 end

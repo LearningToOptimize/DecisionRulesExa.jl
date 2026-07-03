@@ -1,20 +1,33 @@
 """
     DecisionRulesExa
 
-GPU-accelerated companion to DecisionRules.jl for Two-Stage Deep Decision
-Rules (TS-DDR) training via ExaModels + MadNLP.
+GPU-accelerated companion to DecisionRules.jl for Two-Stage Deep Decision Rules
+(TS-DDR) training with ExaModels and MadNLP.
 
-Provides the same TS-DDR workflow — policy predicts target states, NLP
-projects onto the feasible set, dual multipliers feed the policy gradient —
-but formulates subproblems as `ExaModels.ExaModel` instances solved by MadNLP.
-This enables GPU-native training (CUDA via `CUDABackend()`) and exploits
-MadNLP's warm-start capability for fast sequential solves.
+DecisionRulesExa implements the same target-projection workflow as
+DecisionRules.jl:
 
-Key types:
-- [`DeterministicEquivalentProblem`](@ref): open-loop DE with explicit targets
-- [`EmbeddedDeterministicEquivalentProblem`](@ref): DE with policy embedded via `VectorNonlinearOracle`
-- [`StateConditionedPolicy`](@ref): stateful LSTM policy for sequential rollout
-- [`MLPPolicy`](@ref): stateless MLP policy for full-horizon prediction
+1. a policy predicts target states,
+2. an NLP projects those targets onto the feasible set, and
+3. target-constraint multipliers provide the policy-gradient signal.
+
+The package formulates inner optimization problems as `ExaModels.ExaModel`
+instances solved by MadNLP, enabling GPU-native solves and warm-started repeated
+training solves.
+
+# Main Types
+- [`DeterministicEquivalentProblem`](@ref): deterministic equivalent with
+  explicit target parameters.
+- [`EmbeddedDeterministicEquivalentProblem`](@ref): deterministic equivalent
+  whose target policy is embedded with `VectorNonlinearOracle`.
+- [`StateConditionedPolicy`](@ref): recurrent policy for sequential target
+  rollout.
+- [`MLPPolicy`](@ref): stateless policy for full-horizon target prediction.
+
+# Main Training APIs
+- [`train_tsddr`](@ref): open-loop target-parameter training.
+- [`train_tsddr_embedded`](@ref): embedded-policy training.
+- [`rollout_tsddr`](@ref): stage-wise deployment-style evaluation.
 """
 module DecisionRulesExa
 

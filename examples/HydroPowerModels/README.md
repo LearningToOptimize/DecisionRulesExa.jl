@@ -37,7 +37,8 @@ The `bolivia/` directory contains:
 - `PowerModels.json` — power system topology (39 buses, 55 branches, 19 generators)
 - `hydro.json` — hydro unit parameters (7 reservoirs)
 - `inflows.csv` — historical inflow scenarios (144 stages x 200 scenarios x 7 reservoirs)
-- `_demand.csv` — per-stage bus demand scaling
+- `_demand.csv` — inactive per-stage demand candidate; rename to `demand.csv`
+  when you intentionally want training scripts to use it
 
 Pre-solved deterministic-equivalent references (MOF format) are provided for validation:
 - `DCPPowerModel.mof.json`
@@ -52,13 +53,15 @@ Pre-solved deterministic-equivalent references (MOF format) are provided for val
 | `bolivia/PowerModels.json` | Bolivia network topology and generator data |
 | `bolivia/hydro.json` | Hydro unit limits, initial volumes, cascade metadata, and stage duration |
 | `bolivia/inflows.csv` | Historical inflow scenarios |
-| `bolivia/_demand.csv` | Optional per-stage demand scaling data |
+| `bolivia/_demand.csv` | Inactive per-stage demand candidate; ignored unless renamed to `demand.csv` |
 | `bolivia/DCPPowerModel.mof.json` | Pre-exported DC OPF stage template |
 | `bolivia/ACPPowerModel.mof.json` | Pre-exported AC polar OPF stage template |
 | `bolivia/SOCWRConicPowerModel.mof.json` | Convex relaxation template used for validation/baselines |
 | `hydro_power_data.jl` | Data parsing for PowerModels JSON, hydro JSON, inflows, and demand |
 | `hydro_power_exa.jl` | Regular open-loop ExaModels DE builder; supports `strict_targets=true` |
-| `hydro_power_exa_embedded.jl` | Embedded-policy DE builder and `HydroReachablePolicy` implementation |
+| `hydro_reachable_policy.jl` | Reachable hydro target policy, cascade clamps, and reachability proof sketches |
+| `hydro_power_exa_embedded.jl` | Embedded-policy DE builder and nonlinear oracle |
+| `hydro_training_utils.jl` | Shared training-entrypoint helpers such as environment layer parsing |
 | `train_hydro_exa.jl` | Open-loop DE training with penalty scheduling, parallel GPU solves, and W&B logging |
 | `train_hydro_exa_embedded.jl` | Embedded (closed-loop) DE training; supports `DR_STRICT_EMBEDDED_TARGETS=true` for penalty-free strict mode |
 | `train_hydro_exa_strict.jl` | Regular strict DE training using reachable-policy target rollout and no target slack penalty |

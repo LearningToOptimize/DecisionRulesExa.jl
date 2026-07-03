@@ -2,25 +2,47 @@
 # Small helpers shared across the package.
 
 """
-    x_index(nx, t, i)
+    x_index(nx, t, i) -> Int
 
-Linear index for state component `i ∈ 1:nx` at stage `t ∈ 1:T`
-when state trajectory is stored as a flat vector of length `T*nx`.
+Return the flat-vector index for state component `i` at stage `t`.
+
+# Arguments
+- `nx::Int`: number of state components per stage.
+- `t`: one-based stage index.
+- `i`: one-based state-component index.
+
+# Returns
+- `Int`: index into a stage-major state trajectory of length `T * nx`.
 """
 @inline x_index(nx::Int, t, i) = (t - 1) * nx + i
 
 """
-    u_index(nu, t, i)
+    u_index(nu, t, i) -> Int
 
-Linear index for control component `i ∈ 1:nu` at stage `t ∈ 1:(T-1)`
-when controls are stored as a flat vector of length `(T-1)*nu`.
+Return the flat-vector index for control component `i` at stage `t`.
+
+# Arguments
+- `nu::Int`: number of control components per stage.
+- `t`: one-based stage index.
+- `i`: one-based control-component index.
+
+# Returns
+- `Int`: index into a stage-major control trajectory of length `(T - 1) * nu`.
 """
 @inline u_index(nu::Int, t, i) = (t - 1) * nu + i
 
 """
-    w_index(nw, t, i)
+    w_index(nw, t, i) -> Int
 
-Linear index for disturbance component `i ∈ 1:nw` at stage `t ∈ 1:(T-1)`
-when disturbances are stored as a flat vector of length `(T-1)*nw`.
+Return the flat-vector index for uncertainty component `i` at stage `t`.
+
+# Arguments
+- `nw::Int`: number of uncertainty components per stage.
+- `t`: one-based stage index.
+- `i`: one-based uncertainty-component index.
+
+# Returns
+- `Int`: index into a stage-major uncertainty trajectory of length
+  `(T - 1) * nw`.
 """
 @inline w_index(nw::Int, t, i) = (t - 1) * nw + i
