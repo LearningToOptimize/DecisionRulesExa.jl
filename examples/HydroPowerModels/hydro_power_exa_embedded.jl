@@ -49,7 +49,7 @@ Cascade connections (upstream→downstream water flows) are handled by clamping
 downstream targets to the actual reachable upper bound implied by the upstream
 unit's target at the same stage.
 """
-struct HydroReachablePolicy{E,C,V,S}
+struct HydroReachablePolicy{E,C,V,S,I}
     encoder::E
     combiner::C
     n_uncertainty::Int
@@ -64,6 +64,11 @@ struct HydroReachablePolicy{E,C,V,S}
     output_lower::Nothing
     output_scale::Nothing
     cascade::Vector{CascadeLink}
+    cascade_upstream::I
+    cascade_downstream::I
+    cascade_turn_only::V
+    cascade_k_max_turn::V
+    cascade_reservoir_ids::I
 end
 
 Flux.@layer HydroReachablePolicy trainable=(encoder, combiner)
@@ -72,6 +77,12 @@ function _hydro_adapt_bound(x::AbstractVector, ref::AbstractVector)
     typeof(x) === typeof(ref) && return x
     y = similar(ref, length(x))
     copyto!(y, convert.(eltype(ref), x))
+    return y
+end
+
+function _hydro_adapt_index(x::AbstractVector, ref::AbstractVector)
+    y = similar(ref, Int, length(x))
+    copyto!(y, Int.(vec(Array(x))))
     return y
 end
 
@@ -104,21 +115,32 @@ function _cascade_upper_bounds(policy::HydroReachablePolicy, target, inflow, x_p
     T = eltype(target)
     K = T(policy.K)
     n = length(target)
-    upper = fill(T(Inf), n)
-    for conn in cascade
-        u = conn.upstream
-        d = conn.downstream
-        R_u = K * inflow[u] + x_prev[u] - target[u]
-        if conn.turn_only
-            max_contrib = min(T(conn.K_max_turn), max(zero(T), R_u))
-        else
-            max_contrib = max(zero(T), R_u)
-        end
-        true_upper = x_prev[d] + K * inflow[d] - K * T(policy.min_turn[d]) + max_contrib
-        true_upper = min(T(policy.max_vol[d]), true_upper)
-        upper[d] = min(upper[d], true_upper)
-    end
-    return upper
+    isempty(cascade) && return _hydro_adapt_bound(fill(T(Inf), n), target)
+
+    upstream = _hydro_adapt_index(policy.cascade_upstream, target)
+    downstream = _hydro_adapt_index(policy.cascade_downstream, target)
+    reservoir_ids = _hydro_adapt_index(policy.cascade_reservoir_ids, target)
+    turn_only = _hydro_adapt_bound(policy.cascade_turn_only, target)
+    k_max_turn = _hydro_adapt_bound(policy.cascade_k_max_turn, target)
+    min_turn = _hydro_adapt_bound(policy.min_turn, target)
+    max_vol = _hydro_adapt_bound(policy.max_vol, target)
+
+    release = K .* inflow[upstream] .+ x_prev[upstream] .- target[upstream]
+    positive_release = max.(zero(T), release)
+    max_contrib = ifelse.(turn_only .> zero(T), min.(k_max_turn, positive_release), positive_release)
+
+    link_upper = x_prev[downstream] .+
+                 K .* inflow[downstream] .-
+                 K .* min_turn[downstream] .+
+                 max_contrib
+    link_upper = min.(max_vol[downstream], link_upper)
+
+    link_by_reservoir = ifelse.(
+        reshape(downstream, :, 1) .== reshape(reservoir_ids, 1, :),
+        reshape(link_upper, :, 1),
+        T(Inf),
+    )
+    return vec(minimum(link_by_reservoir; dims = 1))
 end
 Zygote.@nograd _cascade_upper_bounds
 
@@ -210,6 +232,11 @@ function hydro_reachable_policy(
         K,
         nothing, nothing,
         cascade,
+        getfield.(cascade, :upstream),
+        getfield.(cascade, :downstream),
+        Float32.(getfield.(cascade, :turn_only)),
+        Float32.(getfield.(cascade, :K_max_turn)),
+        collect(1:nHyd),
     )
 end
 

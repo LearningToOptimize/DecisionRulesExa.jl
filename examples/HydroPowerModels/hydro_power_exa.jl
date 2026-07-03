@@ -15,13 +15,15 @@
 #         reservoir dynamics (initial condition, water balance, turbine coupling)
 #         p_target[t,r] − reservoir[t+1,r] − δ[t,r] = 0  ← ADDED LAST
 #
-# Target constraints are added last so result.multipliers[target_con_range]
-# gives ∇_{x̂} Q directly (envelope theorem for policy gradient).
+# Target constraints are added last in non-strict mode so
+# target_multipliers(prob, result) gives ∇_{x̂} Q. In strict mode the
+# reservoir trajectory is a parameter and target_multipliers transforms
+# water-balance duals into target sensitivities.
 
 using ExaModels
 using MadNLP
 using LinearAlgebra
-import DecisionRulesExa: prepare_solve!
+import DecisionRulesExa: prepare_solve!, target_multipliers
 
 # ── Index helpers ─────────────────────────────────────────────────────────────
 # All arrays are flat, stage-major: index (t, i) → (t-1)*n + i
@@ -80,6 +82,7 @@ struct HydroExaDEProblem
     strict_targets::Bool
     # strict mode: reservoir is a parameter, not a variable (length (T+1)*nHyd)
     p_reservoir           # nothing when !strict_targets
+    strict_reservoir_values::Vector{Float64}
     # cascade data for target clamping (empty if no upstream connections)
     cascade::Vector{CascadeLink}
     K::Float64
@@ -506,7 +509,8 @@ function _build_dc_hydro_de(power_data::PowerData,
 
     # ── TARGET CONSTRAINTS (ADDED LAST) ───────────────────────────────────────
     if strict_targets
-        # Strict: reservoir is a parameter → water balance duals give ∇_{x̂} Q.
+        # Strict: reservoir is a parameter. target_multipliers transforms these
+        # water-balance duals into ∇_{x̂} Q by the adjacent-stage chain rule.
         target_con_range = wb_con_start:(wb_con_start + T * nHyd - 1)
     else
         # x̂ − x − (δ⁺ − δ⁻) = 0
@@ -533,6 +537,7 @@ function _build_dc_hydro_de(power_data::PowerData,
         nHyd, nBus, nGen, nBranch, T,
         :dc, target_con_range, strict_targets,
         p_reservoir,
+        strict_targets ? zeros(Float64, (T + 1) * nHyd) : Float64[],
         cascade, Float64(K),
         Float64.([h.min_turn for h in hydro_data.units]),
         Float64.([h.max_vol for h in hydro_data.units]),
@@ -911,6 +916,8 @@ function _build_ac_hydro_de(power_data::PowerData,
 
     # ── TARGET CONSTRAINTS (ADDED LAST) ───────────────────────────────────────
     if strict_targets
+        # Strict: reservoir is a parameter. target_multipliers transforms these
+        # water-balance duals into ∇_{x̂} Q by the adjacent-stage chain rule.
         target_con_range = wb_con_start:(wb_con_start + T * nHyd - 1)
     else
         # x̂ − x − (δ⁺ − δ⁻) = 0
@@ -937,6 +944,7 @@ function _build_ac_hydro_de(power_data::PowerData,
         nHyd, nBus, nGen, nBranch, T,
         :ac_polar, target_con_range, strict_targets,
         p_reservoir,
+        strict_targets ? zeros(Float64, (T + 1) * nHyd) : Float64[],
         cascade, Float64(K),
         Float64.([h.min_turn for h in hydro_data.units]),
         Float64.([h.max_vol for h in hydro_data.units]),
@@ -975,13 +983,15 @@ function prepare_solve!(prob::HydroExaDEProblem, init_state, w_flat, xhat_flat)
     if prob.p_reservoir !== nothing
         nH = prob.nHyd
         T  = prob.horizon
-        xhat = collect(Float64, xhat_flat)
+        init = Float64.(vec(Array(init_state)))
+        inflow = Float64.(vec(Array(w_flat)))
+        xhat = Float64.(vec(Array(xhat_flat)))
         if !isempty(prob.cascade)
             K = prob.K
             for t in 1:T
-                x_prev = t == 1 ? Float64.(init_state) : view(xhat, (t-2)*nH+1:(t-1)*nH)
+                x_prev = t == 1 ? init : view(xhat, (t-2)*nH+1:(t-1)*nH)
                 targets_t = view(xhat, (t-1)*nH+1:t*nH)
-                inflow_t = view(w_flat, (t-1)*nH+1:t*nH)
+                inflow_t = view(inflow, (t-1)*nH+1:t*nH)
                 for conn in prob.cascade
                     u, d = conn.upstream, conn.downstream
                     R_u = K * inflow_t[u] + x_prev[u] - targets_t[u]
@@ -996,10 +1006,25 @@ function prepare_solve!(prob::HydroExaDEProblem, init_state, w_flat, xhat_flat)
                 end
             end
         end
-        reservoir_vals = vcat(Float64.(init_state), xhat)
+        reservoir_vals = vcat(init, xhat)
+        copyto!(prob.strict_reservoir_values, reservoir_vals)
         ExaModels.set_parameter!(prob.core, prob.p_reservoir, reservoir_vals)
     end
     return nothing
+end
+
+function target_multipliers(prob::HydroExaDEProblem, result)
+    λ = result.multipliers[prob.target_con_range]
+    prob.strict_targets || return λ
+
+    nH = prob.nHyd
+    T = prob.horizon
+    raw = vec(Array(λ))
+    out = copy(raw)
+    if T > 1
+        out[1:(T - 1) * nH] .-= raw[(nH + 1):(T * nH)]
+    end
+    return out
 end
 
 # ── Post-processing ───────────────────────────────────────────────────────────
@@ -1028,12 +1053,20 @@ function hydro_solution(prob::HydroExaDEProblem, result)
         pg_sol    = reshape(sol[off .+ (1:T*nG)],        nG, T);  off += T*nG
         pf_sol    = reshape(sol[off .+ (1:T*nBR)],       nBR, T); off += T*nBR
         def_sol   = reshape(sol[off .+ (1:T*nB)],        nB, T);  off += T*nB
-        res_sol   = reshape(sol[off .+ (1:(T+1)*nH)],    nH, T+1); off += (T+1)*nH
+        if prob.strict_targets
+            res_sol = reshape(copy(prob.strict_reservoir_values), nH, T+1)
+        else
+            res_sol = reshape(sol[off .+ (1:(T+1)*nH)], nH, T+1); off += (T+1)*nH
+        end
         out_sol   = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
         spill_sol = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
-        dp_sol    = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
-        dn_sol    = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
-        delta_sol = dp_sol .- dn_sol
+        if prob.strict_targets
+            delta_sol = zeros(eltype(sol), nH, T)
+        else
+            dp_sol    = reshape(sol[off .+ (1:T*nH)],    nH, T);  off += T*nH
+            dn_sol    = reshape(sol[off .+ (1:T*nH)],    nH, T);  off += T*nH
+            delta_sol = dp_sol .- dn_sol
+        end
         return (va=va_sol, pg=pg_sol, pf=pf_sol, deficit=def_sol,
                 reservoir=res_sol, outflow=out_sol, spill=spill_sol, delta=delta_sol)
     else  # :ac_polar
@@ -1047,12 +1080,20 @@ function hydro_solution(prob::HydroExaDEProblem, result)
         q_to_sol   = reshape(sol[off .+ (1:T*nBR)],       nBR, T); off += T*nBR
         def_sol    = reshape(sol[off .+ (1:T*nB)],        nB, T);  off += T*nB
         def_q_sol  = reshape(sol[off .+ (1:T*nB)],        nB, T);  off += T*nB
-        res_sol    = reshape(sol[off .+ (1:(T+1)*nH)],    nH, T+1); off += (T+1)*nH
+        if prob.strict_targets
+            res_sol = reshape(copy(prob.strict_reservoir_values), nH, T+1)
+        else
+            res_sol = reshape(sol[off .+ (1:(T+1)*nH)], nH, T+1); off += (T+1)*nH
+        end
         out_sol    = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
         spill_sol  = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
-        dp_sol     = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
-        dn_sol     = reshape(sol[off .+ (1:T*nH)],        nH, T);  off += T*nH
-        delta_sol  = dp_sol .- dn_sol
+        if prob.strict_targets
+            delta_sol = zeros(eltype(sol), nH, T)
+        else
+            dp_sol     = reshape(sol[off .+ (1:T*nH)],    nH, T);  off += T*nH
+            dn_sol     = reshape(sol[off .+ (1:T*nH)],    nH, T);  off += T*nH
+            delta_sol  = dp_sol .- dn_sol
+        end
         return (va=va_sol, vm=vm_sol, pg=pg_sol, qg=qg_sol,
                 p_fr=p_fr_sol, q_fr=q_fr_sol, p_to=p_to_sol, q_to=q_to_sol,
                 deficit=def_sol, deficit_q=def_q_sol,

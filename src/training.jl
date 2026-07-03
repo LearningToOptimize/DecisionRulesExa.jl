@@ -6,7 +6,7 @@
 #   1. uncertainty_sampler() → flat w  (length T × nw_per_stage)
 #   2. Policy rollout: x̂_t = policy(vcat(w_t, x̂_{t-1}))  for t = 1..T
 #   3. ExaModels.set_parameter! for x0, uncertainty, targets → MadNLP.solve!
-#   4. λ = result.multipliers[target_con_range]   (∇_{x̂} Q, envelope theorem)
+#   4. λ = target_multipliers(de, result)          (∇_{x̂} Q, envelope theorem)
 #   5. Zygote: ∇_θ (1/n) Σ_s ⟨λ_s, x̂_s(θ)⟩  →  Flux.update!
 #
 # The user passes parameter objects (p_x0, p_target, p_uncertainty) exactly as
@@ -554,6 +554,7 @@ function simulate_tsddr(
     ExaModels.set_parameter!(core, p_x0,          initial_state)
     ExaModels.set_parameter!(core, p_uncertainty,  w_flat)
     ExaModels.set_parameter!(core, p_target,       Float64.(xhat_flat))  # NLP uses Float64
+    prepare_solve!(det_equivalent, initial_state, w_flat, xhat_flat)
 
     # Solve the deterministic equivalent (cold start for one-shot simulation).
     result = _solve!(state, nlp; warmstart = false, madnlp_kwargs = madnlp_kwargs)
@@ -562,8 +563,8 @@ function simulate_tsddr(
     solve_succeeded(result) || return nothing
     isfinite(result.objective) || return nothing
 
-    # Extract envelope-theorem multipliers λ = ∇_{x̂} Q from target constraints.
-    λ = result.multipliers[det_equivalent.target_con_range]
+    # Extract envelope-theorem multipliers λ = ∇_{x̂} Q.
+    λ = target_multipliers(det_equivalent, result)
     return (objective = result.objective, lambda = F.(λ))  # cast λ to match initial_state eltype
 end
 
@@ -901,7 +902,7 @@ function train_tsddr(
                     elseif !isfinite(result.objective)
                         failure = "nonfinite_objective"
                     elseif solve_succeeded(result) && isfinite(result.objective)
-                        λ = result.multipliers[de.target_con_range]
+                        λ = target_multipliers(de, result)
                         if all(isfinite, λ)
                             put!(out_ch, (s_idx, F.(w_flat), _adapt_array(F.(λ), w_flat),
                                           result.objective, result.status, nothing, retried))
@@ -980,7 +981,7 @@ function train_tsddr(
                     _inc_count!(failure_counts, "nonfinite_objective")
                     continue
                 end
-                λ = result.multipliers[de.target_con_range]
+                λ = target_multipliers(de, result)
                 if !all(isfinite, λ)
                     _inc_count!(failure_counts, "nonfinite_lambda")
                     continue
@@ -1278,7 +1279,7 @@ function train_tsddr_embedded(
                 continue
             end
 
-            λ = result.multipliers[embedded_de.target_con_range]
+            λ = target_multipliers(embedded_de, result)
             if !all(isfinite, λ)
                 _inc_count!(failure_counts, "nonfinite_lambda")
                 continue

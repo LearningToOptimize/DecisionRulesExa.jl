@@ -231,6 +231,7 @@ xhat_mean = rollout_reachable_targets(policy, x0_init, w_mean, T, nHyd)
 ExaModels.set_parameter!(prob.core, prob.p_x0,     x0_init)
 ExaModels.set_parameter!(prob.core, prob.p_inflow,  w_mean)
 ExaModels.set_parameter!(prob.core, prob.p_target,  xhat_mean)
+prepare_solve!(prob, x0_init, w_mean, xhat_mean)
 @info "Smoke test: solving strict DE with mean inflows and reachable policy targets..."
 result0 = MadNLP.madnlp(prob.model; SOLVER_KWARGS..., print_level = MadNLP.WARN)
 @info "  Status: $(result0.status)   Objective: $(round(result0.objective; digits=4))"
@@ -309,6 +310,7 @@ function set_hydro_rollout_stage!(stage_prob, state_in, wt, target, stage)
         set_demand!(stage_prob, load_scaler .* demand_mat[stage:stage, :])
     end
     ExaModels.set_parameter!(stage_prob.core, stage_prob.p_target, target)
+    prepare_solve!(stage_prob, state_in, wt, target)
     return stage_prob
 end
 
