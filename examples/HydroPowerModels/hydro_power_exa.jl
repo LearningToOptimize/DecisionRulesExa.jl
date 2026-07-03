@@ -21,6 +21,7 @@
 using ExaModels
 using MadNLP
 using LinearAlgebra
+import DecisionRulesExa: prepare_solve!
 
 # ── Index helpers ─────────────────────────────────────────────────────────────
 # All arrays are flat, stage-major: index (t, i) → (t-1)*n + i
@@ -29,6 +30,15 @@ using LinearAlgebra
 @inline _gi(nG, t, g)    = (t-1)*nG + g   # generator
 @inline _bri(nBR, t, br) = (t-1)*nBR + br # branch / pf
 @inline _ri(nH, t, r)    = (t-1)*nH + r   # hydro: reservoir / outflow / spill / delta
+
+# ── Cascade link: upstream→downstream water-balance coupling ────────────────
+
+struct CascadeLink
+    downstream::Int      # array position of downstream unit
+    upstream::Int        # array position of upstream unit
+    turn_only::Bool      # true if only turbine outflow (not spill) reaches downstream
+    K_max_turn::Float32  # K × max_turn of the upstream unit
+end
 
 # ── Problem struct ────────────────────────────────────────────────────────────
 
@@ -65,9 +75,16 @@ struct HydroExaDEProblem
     horizon::Int
     # formulation
     formulation::Symbol   # :dc or :ac_polar
-    # range into result.multipliers for target constraints
+    # range into result.multipliers for target constraints (or water balance in strict mode)
     target_con_range::UnitRange{Int}
     strict_targets::Bool
+    # strict mode: reservoir is a parameter, not a variable (length (T+1)*nHyd)
+    p_reservoir           # nothing when !strict_targets
+    # cascade data for target clamping (empty if no upstream connections)
+    cascade::Vector{CascadeLink}
+    K::Float64
+    min_turn::Vector{Float64}
+    max_vol::Vector{Float64}
 end
 
 # ── AC branch coefficient helper ──────────────────────────────────────────────
@@ -211,6 +228,26 @@ function build_hydro_de(power_data::PowerData,
     end
 end
 
+function _build_cascade_links(hydro_data::HydroData)
+    K = Float64(hydro_data.K)
+    spill_dests = Dict{Int,Set{Int}}()
+    for conn in hydro_data.upstream_spills
+        push!(get!(spill_dests, conn.upstream_pos, Set{Int}()), conn.downstream_pos)
+    end
+    cascade = CascadeLink[]
+    for conn in hydro_data.upstream_turns
+        d, u = conn.downstream_pos, conn.upstream_pos
+        has_spill = haskey(spill_dests, u) && d in spill_dests[u]
+        push!(cascade, CascadeLink(d, u, !has_spill, Float32(K * hydro_data.units[u].max_turn)))
+    end
+    for conn in hydro_data.upstream_spills
+        d, u = conn.downstream_pos, conn.upstream_pos
+        already = any(c -> c.downstream == d && c.upstream == u, cascade)
+        already || push!(cascade, CascadeLink(d, u, false, Float32(K * hydro_data.units[u].max_turn)))
+    end
+    return cascade
+end
+
 # ── DC builder ────────────────────────────────────────────────────────────────
 
 function _build_dc_hydro_de(power_data::PowerData,
@@ -263,9 +300,17 @@ function _build_dc_hydro_de(power_data::PowerData,
     deficit = ExaModels.variable(core, T * nBus; lvar = float_type(0))
 
     # Reservoir levels: (T+1)*nHyd
-    res_lb = float_type.(repeat([h.min_vol  for h in hydro_data.units], T+1))
-    res_ub = float_type.(repeat([h.max_vol  for h in hydro_data.units], T+1))
-    reservoir = ExaModels.variable(core, (T+1) * nHyd; lvar = res_lb, uvar = res_ub)
+    # In strict mode, reservoir = [x0; targets] is predetermined → parameter.
+    # Eliminates (T+1)*nHyd variables and nHyd + T*nHyd constraints.
+    if strict_targets
+        p_reservoir = ExaModels.parameter(core, zeros(float_type, (T+1) * nHyd))
+        reservoir = p_reservoir
+    else
+        p_reservoir = nothing
+        res_lb = float_type.(repeat([h.min_vol  for h in hydro_data.units], T+1))
+        res_ub = float_type.(repeat([h.max_vol  for h in hydro_data.units], T+1))
+        reservoir = ExaModels.variable(core, (T+1) * nHyd; lvar = res_lb, uvar = res_ub)
+    end
 
     # Turbine outflow: T*nHyd
     out_lb = float_type.(repeat([h.min_turn for h in hydro_data.units], T))
@@ -276,10 +321,7 @@ function _build_dc_hydro_de(power_data::PowerData,
     spill = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
 
     # Target slack: δ = δ⁺ − δ⁻ with δ⁺,δ⁻ ≥ 0 (L1+L2 Lagrangian penalty)
-    if strict_targets
-        delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0), uvar = float_type(0))
-        delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0), uvar = float_type(0))
-    else
+    if !strict_targets
         delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
         delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
     end
@@ -316,9 +358,9 @@ function _build_dc_hydro_de(power_data::PowerData,
         for item in def_cost_items
     )
 
-    delta_items = [(idx = _ri(nHyd, t, r),) for t in 1:T for r in 1:nHyd]
-
     if !strict_targets
+        delta_items = [(idx = _ri(nHyd, t, r),) for t in 1:T for r in 1:nHyd]
+
         # L2 penalty: (ρ/2)·(δ⁺ − δ⁻)²
         ExaModels.objective(core,
             p_penalty_half[item.idx] * (delta_pos[item.idx] - delta_neg[item.idx])^2
@@ -404,15 +446,18 @@ function _build_dc_hydro_de(power_data::PowerData,
     )
     n_con += T * nBus
 
-    # 5. Initial reservoir condition
-    ic_items = [(r = r,) for r in 1:nHyd]
-    ExaModels.constraint(core,
-        reservoir[_ri(nHyd, 1, item.r)] - p_x0[item.r]
-        for item in ic_items
-    )
-    n_con += nHyd
+    # 5. Initial reservoir condition (skip in strict: reservoir is a parameter)
+    if !strict_targets
+        ic_items = [(r = r,) for r in 1:nHyd]
+        ExaModels.constraint(core,
+            reservoir[_ri(nHyd, 1, item.r)] - p_x0[item.r]
+            for item in ic_items
+        )
+        n_con += nHyd
+    end
 
-    # 6. Water balance
+    # 6. Water balance (reservoir is a parameter in strict mode — same expression)
+    wb_con_start = n_con + 1
     wb_items = [(res_next  = _ri(nHyd, t+1, r),
                  res_curr  = _ri(nHyd, t,   r),
                  out_idx   = _ri(nHyd, t,   r),
@@ -460,18 +505,25 @@ function _build_dc_hydro_de(power_data::PowerData,
     n_con += T * nHyd
 
     # ── TARGET CONSTRAINTS (ADDED LAST) ───────────────────────────────────────
-    # x̂ − x − (δ⁺ − δ⁻) = 0
-    target_items = [(param_idx = _ri(nHyd, t, r),
-                     res_idx   = _ri(nHyd, t+1, r),
-                     delta_idx = _ri(nHyd, t, r))
-                    for t in 1:T for r in 1:nHyd]
-    ExaModels.constraint(core,
-        p_target[item.param_idx] - reservoir[item.res_idx] - delta_pos[item.delta_idx] + delta_neg[item.delta_idx]
-        for item in target_items
-    )
-    target_con_range = (n_con + 1):(n_con + T * nHyd)
+    if strict_targets
+        # Strict: reservoir is a parameter → water balance duals give ∇_{x̂} Q.
+        target_con_range = wb_con_start:(wb_con_start + T * nHyd - 1)
+    else
+        # x̂ − x − (δ⁺ − δ⁻) = 0
+        target_items = [(param_idx = _ri(nHyd, t, r),
+                         res_idx   = _ri(nHyd, t+1, r),
+                         delta_idx = _ri(nHyd, t, r))
+                        for t in 1:T for r in 1:nHyd]
+        ExaModels.constraint(core,
+            p_target[item.param_idx] - reservoir[item.res_idx] - delta_pos[item.delta_idx] + delta_neg[item.delta_idx]
+            for item in target_items
+        )
+        target_con_range = (n_con + 1):(n_con + T * nHyd)
+    end
 
     model = ExaModels.ExaModel(core)
+
+    cascade = _build_cascade_links(hydro_data)
 
     return HydroExaDEProblem(
         core, model,
@@ -480,6 +532,10 @@ function _build_dc_hydro_de(power_data::PowerData,
         p_penalty_l1, Float64(ρ_l1),
         nHyd, nBus, nGen, nBranch, T,
         :dc, target_con_range, strict_targets,
+        p_reservoir,
+        cascade, Float64(K),
+        Float64.([h.min_turn for h in hydro_data.units]),
+        Float64.([h.max_vol for h in hydro_data.units]),
     )
 end
 
@@ -556,9 +612,15 @@ function _build_ac_hydro_de(power_data::PowerData,
     deficit_q = ExaModels.variable(core, T * nBus)
 
     # Reservoir levels: (T+1)*nHyd
-    res_lb = float_type.(repeat([h.min_vol  for h in hydro_data.units], T+1))
-    res_ub = float_type.(repeat([h.max_vol  for h in hydro_data.units], T+1))
-    reservoir = ExaModels.variable(core, (T+1) * nHyd; lvar = res_lb, uvar = res_ub)
+    if strict_targets
+        p_reservoir = ExaModels.parameter(core, zeros(float_type, (T+1) * nHyd))
+        reservoir = p_reservoir
+    else
+        p_reservoir = nothing
+        res_lb = float_type.(repeat([h.min_vol  for h in hydro_data.units], T+1))
+        res_ub = float_type.(repeat([h.max_vol  for h in hydro_data.units], T+1))
+        reservoir = ExaModels.variable(core, (T+1) * nHyd; lvar = res_lb, uvar = res_ub)
+    end
 
     # Turbine outflow: T*nHyd
     out_lb = float_type.(repeat([h.min_turn for h in hydro_data.units], T))
@@ -569,10 +631,7 @@ function _build_ac_hydro_de(power_data::PowerData,
     spill = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
 
     # Target slack: δ = δ⁺ − δ⁻ with δ⁺,δ⁻ ≥ 0 (L1+L2 Lagrangian penalty)
-    if strict_targets
-        delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0), uvar = float_type(0))
-        delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0), uvar = float_type(0))
-    else
+    if !strict_targets
         delta_pos = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
         delta_neg = ExaModels.variable(core, T * nHyd; lvar = float_type(0))
     end
@@ -620,9 +679,9 @@ function _build_ac_hydro_de(power_data::PowerData,
         for item in def_cost_items
     )
 
-    delta_items = [(idx = _ri(nHyd, t, r),) for t in 1:T for r in 1:nHyd]
-
     if !strict_targets
+        delta_items = [(idx = _ri(nHyd, t, r),) for t in 1:T for r in 1:nHyd]
+
         # L2 penalty: (ρ/2)·(δ⁺ − δ⁻)²
         ExaModels.objective(core,
             p_penalty_half[item.idx] * (delta_pos[item.idx] - delta_neg[item.idx])^2
@@ -792,15 +851,18 @@ function _build_ac_hydro_de(power_data::PowerData,
     )
     n_con += T * nBus
 
-    # 9. Initial reservoir condition
-    ic_items = [(r = r,) for r in 1:nHyd]
-    ExaModels.constraint(core,
-        reservoir[_ri(nHyd, 1, item.r)] - p_x0[item.r]
-        for item in ic_items
-    )
-    n_con += nHyd
+    # 9. Initial reservoir condition (skip in strict: reservoir is a parameter)
+    if !strict_targets
+        ic_items = [(r = r,) for r in 1:nHyd]
+        ExaModels.constraint(core,
+            reservoir[_ri(nHyd, 1, item.r)] - p_x0[item.r]
+            for item in ic_items
+        )
+        n_con += nHyd
+    end
 
-    # 10. Water balance
+    # 10. Water balance (reservoir is a parameter in strict mode — same expression)
+    wb_con_start = n_con + 1
     wb_items = [(res_next  = _ri(nHyd, t+1, r),
                  res_curr  = _ri(nHyd, t,   r),
                  out_idx   = _ri(nHyd, t,   r),
@@ -848,18 +910,24 @@ function _build_ac_hydro_de(power_data::PowerData,
     n_con += T * nHyd
 
     # ── TARGET CONSTRAINTS (ADDED LAST) ───────────────────────────────────────
-    # x̂ − x − (δ⁺ − δ⁻) = 0
-    target_items = [(param_idx = _ri(nHyd, t, r),
-                     res_idx   = _ri(nHyd, t+1, r),
-                     delta_idx = _ri(nHyd, t, r))
-                    for t in 1:T for r in 1:nHyd]
-    ExaModels.constraint(core,
-        p_target[item.param_idx] - reservoir[item.res_idx] - delta_pos[item.delta_idx] + delta_neg[item.delta_idx]
-        for item in target_items
-    )
-    target_con_range = (n_con + 1):(n_con + T * nHyd)
+    if strict_targets
+        target_con_range = wb_con_start:(wb_con_start + T * nHyd - 1)
+    else
+        # x̂ − x − (δ⁺ − δ⁻) = 0
+        target_items = [(param_idx = _ri(nHyd, t, r),
+                         res_idx   = _ri(nHyd, t+1, r),
+                         delta_idx = _ri(nHyd, t, r))
+                        for t in 1:T for r in 1:nHyd]
+        ExaModels.constraint(core,
+            p_target[item.param_idx] - reservoir[item.res_idx] - delta_pos[item.delta_idx] + delta_neg[item.delta_idx]
+            for item in target_items
+        )
+        target_con_range = (n_con + 1):(n_con + T * nHyd)
+    end
 
     model = ExaModels.ExaModel(core)
+
+    cascade = _build_cascade_links(hydro_data)
 
     return HydroExaDEProblem(
         core, model,
@@ -868,6 +936,10 @@ function _build_ac_hydro_de(power_data::PowerData,
         p_penalty_l1, Float64(ρ_l1),
         nHyd, nBus, nGen, nBranch, T,
         :ac_polar, target_con_range, strict_targets,
+        p_reservoir,
+        cascade, Float64(K),
+        Float64.([h.min_turn for h in hydro_data.units]),
+        Float64.([h.max_vol for h in hydro_data.units]),
     )
 end
 
@@ -897,6 +969,37 @@ function set_inflows!(prob::HydroExaDEProblem, w::AbstractVector)
     length(w) == expected || error("w must have length T*nHyd=$expected")
     ExaModels.set_parameter!(prob.core, prob.p_inflow, w)
     return prob
+end
+
+function prepare_solve!(prob::HydroExaDEProblem, init_state, w_flat, xhat_flat)
+    if prob.p_reservoir !== nothing
+        nH = prob.nHyd
+        T  = prob.horizon
+        xhat = collect(Float64, xhat_flat)
+        if !isempty(prob.cascade)
+            K = prob.K
+            for t in 1:T
+                x_prev = t == 1 ? Float64.(init_state) : view(xhat, (t-2)*nH+1:(t-1)*nH)
+                targets_t = view(xhat, (t-1)*nH+1:t*nH)
+                inflow_t = view(w_flat, (t-1)*nH+1:t*nH)
+                for conn in prob.cascade
+                    u, d = conn.upstream, conn.downstream
+                    R_u = K * inflow_t[u] + x_prev[u] - targets_t[u]
+                    if conn.turn_only
+                        max_contrib = min(Float64(conn.K_max_turn), max(0.0, R_u))
+                    else
+                        max_contrib = max(0.0, R_u)
+                    end
+                    true_upper = x_prev[d] + K * inflow_t[d] - K * prob.min_turn[d] + max_contrib
+                    true_upper = min(prob.max_vol[d], true_upper)
+                    targets_t[d] = min(targets_t[d], true_upper)
+                end
+            end
+        end
+        reservoir_vals = vcat(Float64.(init_state), xhat)
+        ExaModels.set_parameter!(prob.core, prob.p_reservoir, reservoir_vals)
+    end
+    return nothing
 end
 
 # ── Post-processing ───────────────────────────────────────────────────────────

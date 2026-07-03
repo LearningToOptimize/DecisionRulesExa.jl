@@ -70,6 +70,7 @@ export
 
     # Training
     solve_succeeded,
+    prepare_solve!,
     materialize_tangent,
     _all_finite_gradient,
     AbstractCriticControlVariate,

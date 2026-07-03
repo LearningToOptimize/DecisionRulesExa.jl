@@ -242,6 +242,18 @@ function solve_succeeded(result)
     return s == MadNLP.SOLVE_SUCCEEDED || s == MadNLP.SOLVED_TO_ACCEPTABLE_LEVEL  # accept both convergence levels
 end
 
+"""
+    prepare_solve!(de, init_state, w_flat, xhat_flat)
+
+Hook called after setting the standard parameters (x0, inflow, target) and
+before each NLP solve. Override for problem types that need additional
+parameter updates — e.g. setting a reservoir parameter from x0 + targets
+when the reservoir is not a decision variable.
+
+Default: no-op.
+"""
+prepare_solve!(de, init_state, w_flat, xhat_flat) = nothing
+
 # ── Internal: one MadNLP solve with cascade-failure prevention ────────────────
 #
 # After a failed solve the duals (y, zl, zu) are corrupted.  Instead of cold-
@@ -443,6 +455,12 @@ function _solve_with_retry!(state::_SolverState, nlp; warmstart::Bool, madnlp_kw
         retry_state = _make_solver(nlp, madnlp_kwargs)                                   # fresh solver, clean factorization
         result = _solve!(retry_state, nlp; warmstart = false, madnlp_kwargs = madnlp_kwargs)  # cold-start retry
         retried = true
+        if solve_succeeded(result)
+            state.last_good_x       = copy(retry_state.solver.x.x)
+            state.last_good_y       = copy(retry_state.solver.y)
+            state.last_good_zl_vals = copy(retry_state.solver.zl.values)
+            state.last_good_zu_vals = copy(retry_state.solver.zu.values)
+        end
     end
     return result, retried
 end
@@ -766,6 +784,11 @@ Keyword arguments (mirror `train_multistage`):
 - `external_critic_samples`  : mutable vector; `record_loss` can push
                               `CriticSample`s (e.g. from `critic_samples_from_evaluation`)
                               to feed the critic replay buffer without extra solves
+- `reuse_solver`            : override `has_fixed_vars` detection to force solver
+                              reuse with warm-starting. Use when fixed variables
+                              have constant bounds across solves (e.g., strict
+                              mode delta variables with `lvar == uvar == 0`).
+                              Default `false`.
 """
 function train_tsddr(
     model,
@@ -804,6 +827,7 @@ function train_tsddr(
     critic_optimizer         = Flux.Adam(1f-3),
     external_critic_samples  = nothing,
     batch_diagnostics        = (iter, stats) -> nothing,
+    reuse_solver::Bool       = false,
 )
     T    = det_equivalent.horizon
     F    = eltype(initial_state)
@@ -835,6 +859,9 @@ function train_tsddr(
 
     # Single-worker: create solver on main task (no threading needed)
     single_state = nworkers == 1 ? _make_solver(_pool[1][1].model, madnlp_kwargs) : nothing
+    if reuse_solver && single_state !== nothing
+        single_state.has_fixed_vars = false
+    end
 
     # Multi-worker: persistent worker threads via channels.
     # Each worker creates its own MadNLP solver on its own thread so that
@@ -847,8 +874,12 @@ function train_tsddr(
             (de, px, pt, pu) = _pool[wi]
             in_ch  = in_channels[wi]
             out_ch = out_channels[wi]
+            _reuse_solver = reuse_solver
             t = Threads.@spawn begin
                 st = _make_solver(de.model, madnlp_kwargs)
+                if _reuse_solver
+                    st.has_fixed_vars = false
+                end
                 while true
                     msg = take!(in_ch)
                     msg === nothing && break
@@ -856,6 +887,7 @@ function train_tsddr(
                     ExaModels.set_parameter!(de.core, px, init_state)
                     ExaModels.set_parameter!(de.core, pu, w_flat)
                     ExaModels.set_parameter!(de.core, pt, Float64.(xhat_flat))
+                    prepare_solve!(de, init_state, w_flat, xhat_flat)
                     result, retried = _solve_with_retry!(
                         st,
                         de.model;
@@ -930,6 +962,7 @@ function train_tsddr(
                 ExaModels.set_parameter!(de.core, px, initial_state)
                 ExaModels.set_parameter!(de.core, pu, w_flat)
                 ExaModels.set_parameter!(de.core, pt, Float64.(xhat_flat))
+                prepare_solve!(de, initial_state, w_flat, xhat_flat)
                 result, retried = _solve_with_retry!(
                     st,
                     de.model;

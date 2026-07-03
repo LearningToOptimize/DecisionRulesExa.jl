@@ -44,6 +44,10 @@ state. Since every emitted target is one-stage reachable from the previous
 target, the whole target trajectory is feasible by induction. Embedded strict
 DEs use the same policy with realized reservoir states inside the NLP; their
 manual oracle currently supports the default single Dense head only.
+
+Cascade connections (upstream→downstream water flows) are handled by clamping
+downstream targets to the actual reachable upper bound implied by the upstream
+unit's target at the same stage.
 """
 struct HydroReachablePolicy{E,C,V,S}
     encoder::E
@@ -59,6 +63,7 @@ struct HydroReachablePolicy{E,C,V,S}
     K::Float64
     output_lower::Nothing
     output_scale::Nothing
+    cascade::Vector{CascadeLink}
 end
 
 Flux.@layer HydroReachablePolicy trainable=(encoder, combiner)
@@ -94,13 +99,41 @@ function _hydro_reachable_bounds(policy::HydroReachablePolicy, inflow, x_prev, r
 end
 Zygote.@nograd _hydro_reachable_bounds
 
+function _cascade_upper_bounds(policy::HydroReachablePolicy, target, inflow, x_prev)
+    cascade = policy.cascade
+    T = eltype(target)
+    K = T(policy.K)
+    n = length(target)
+    upper = fill(T(Inf), n)
+    for conn in cascade
+        u = conn.upstream
+        d = conn.downstream
+        R_u = K * inflow[u] + x_prev[u] - target[u]
+        if conn.turn_only
+            max_contrib = min(T(conn.K_max_turn), max(zero(T), R_u))
+        else
+            max_contrib = max(zero(T), R_u)
+        end
+        true_upper = x_prev[d] + K * inflow[d] - K * T(policy.min_turn[d]) + max_contrib
+        true_upper = min(T(policy.max_vol[d]), true_upper)
+        upper[d] = min(upper[d], true_upper)
+    end
+    return upper
+end
+Zygote.@nograd _cascade_upper_bounds
+
 function (m::HydroReachablePolicy)(input)
     inflow = input[1:m.n_uncertainty]
     x_prev = input[m.n_uncertainty+1:end]
     h = vec(m.encoder(reshape(inflow, :, 1)))
     y = m.combiner(vcat(h, x_prev))
     lower, upper = _hydro_reachable_bounds(m, inflow, x_prev, y)
-    return lower .+ (upper .- lower) .* y
+    raw_target = lower .+ (upper .- lower) .* y
+    if !isempty(m.cascade)
+        cascade_upper = _cascade_upper_bounds(m, raw_target, inflow, x_prev)
+        return min.(raw_target, cascade_upper)
+    end
+    return raw_target
 end
 
 Flux.reset!(m::HydroReachablePolicy) = Flux.reset!(m.encoder)
@@ -150,6 +183,22 @@ function hydro_reachable_policy(
         upstream_max[conn.downstream_pos] += Float32(K * hydro_data.units[conn.upstream_pos].max_turn)
     end
 
+    spill_dests = Dict{Int,Set{Int}}()
+    for conn in hydro_data.upstream_spills
+        push!(get!(spill_dests, conn.upstream_pos, Set{Int}()), conn.downstream_pos)
+    end
+    cascade = CascadeLink[]
+    for conn in hydro_data.upstream_turns
+        d, u = conn.downstream_pos, conn.upstream_pos
+        has_spill = haskey(spill_dests, u) && d in spill_dests[u]
+        push!(cascade, CascadeLink(d, u, !has_spill, Float32(K * hydro_data.units[u].max_turn)))
+    end
+    for conn in hydro_data.upstream_spills
+        d, u = conn.downstream_pos, conn.upstream_pos
+        already = any(c -> c.downstream == d && c.upstream == u, cascade)
+        already || push!(cascade, CascadeLink(d, u, false, Float32(K * hydro_data.units[u].max_turn)))
+    end
+
     return HydroReachablePolicy(
         encoder, combiner, nHyd, nHyd,
         Float32.([h.min_vol for h in hydro_data.units]),
@@ -160,6 +209,7 @@ function hydro_reachable_policy(
         upstream_max,
         K,
         nothing, nothing,
+        cascade,
     )
 end
 
