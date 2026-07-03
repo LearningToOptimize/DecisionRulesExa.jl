@@ -27,9 +27,9 @@ equivalent subproblem.
 The subproblem has the form
 
 ```math
-Q(w, \hat{x}) =
-    \min_{x,u,\delta}
-        \sum_t c_t(x_t, u_t, w_t) + \frac{\rho}{2}\|\delta\|^2
+Q(w, \\hat{x}) =
+    \\min_{x,u,\\delta}
+        \\sum_t c_t(x_t, u_t, w_t) + \\frac{\\rho}{2}\\|\\delta\\|^2
 ```
 
 subject to the initial condition, dynamics constraints, and target constraints
