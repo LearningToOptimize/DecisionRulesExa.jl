@@ -95,6 +95,11 @@ struct HydroExaDEProblem
     K::Float64
     min_turn::Vector{Float64}
     max_vol::Vector{Float64}
+    # Reactive-slack mode of the AC builder (:none for DC):
+    #   :free      — single FREE zero-cost deficit_q variable per bus/stage
+    #   :penalized — deficit_q = δq⁺ − δq⁻ (δq± ≥ 0) with linear cost c·Σ(δq⁺+δq⁻)
+    #   :hard      — no reactive slack (hard reactive balance, MAIN-faithful)
+    reactive_deficit_mode::Symbol
 end
 
 # ── AC branch coefficient helper ──────────────────────────────────────────────
@@ -174,7 +179,9 @@ end
                    backend=nothing, float_type=Float64, formulation=:dc,
                    target_penalty=:auto, target_penalty_l1=:auto,
                    demand_matrix=nothing,
-                   reactive_demand_matrix=nothing, deficit_cost=nothing)
+                   reactive_demand_matrix=nothing, deficit_cost=nothing,
+                   load_scaler=1.0, strict_targets=false,
+                   reactive_deficit_cost=nothing)
               -> HydroExaDEProblem
 
 Build the T-stage hydro-power deterministic equivalent.
@@ -198,6 +205,22 @@ Pass `:auto` (default) to use `2 × max_gen_cost`, matching JuMP's `penalty_l2 =
 `target_penalty_l1` sets the L1 coefficient for the `λ·|δ|` target slack penalty.
 Pass `:auto` (default) to use the same value as L2 ρ.  Pass `nothing` to disable L1.
 The L1 term is reformulated as `λ·(δ⁺ + δ⁻)` with `δ = δ⁺ − δ⁻`, `δ⁺,δ⁻ ≥ 0`.
+
+`reactive_deficit_cost` (AC only) controls the reactive slack `deficit_q` in the
+reactive KCL:
+- `nothing` (default) — current behavior: one FREE, zero-cost `deficit_q`
+  variable per bus/stage (relaxes the reactive balance; model is byte-identical
+  to builds preceding this kwarg).
+- finite `c ≥ 0` — `|deficit_q|` is penalized linearly: the slack is split into
+  `deficit_q = δq⁺ − δq⁻` with `δq⁺, δq⁻ ≥ 0` and objective `c·Σ(δq⁺ + δq⁻)`.
+  Constraint count and ORDER are unchanged (the split variables enter the same
+  reactive-KCL rows), so `target_con_range` is unaffected in both strict and
+  non-strict modes; only variable count changes (+T·nBus vs the default).
+- `Inf` — omit `deficit_q` entirely: hard reactive balance, matching MAIN's
+  ACPPowerModel.mof.json (−T·nBus variables vs the default; constraint
+  count/order again unchanged).
+Passing a non-`nothing` value with `formulation = :dc` throws (DC has no
+reactive balance).
 """
 function build_hydro_de(power_data::PowerData,
                          hydro_data::HydroData,
@@ -211,12 +234,15 @@ function build_hydro_de(power_data::PowerData,
                          reactive_demand_matrix = nothing,
                          deficit_cost::Union{Nothing,Real} = nothing,
                          load_scaler::Real = 1.0,
-                         strict_targets::Bool = false)
+                         strict_targets::Bool = false,
+                         reactive_deficit_cost::Union{Nothing,Real} = nothing)
 
     formulation in (:dc, :ac_polar) ||
         error("formulation must be :dc or :ac_polar, got :$formulation")
 
     if formulation === :dc
+        reactive_deficit_cost === nothing ||
+            error("reactive_deficit_cost applies only to formulation = :ac_polar (DC has no reactive balance)")
         return _build_dc_hydro_de(power_data, hydro_data, T;
                                    backend=backend, float_type=float_type,
                                    target_penalty=target_penalty,
@@ -234,7 +260,8 @@ function build_hydro_de(power_data::PowerData,
                                    reactive_demand_matrix=reactive_demand_matrix,
                                    deficit_cost=deficit_cost,
                                    load_scaler=load_scaler,
-                                   strict_targets=strict_targets)
+                                   strict_targets=strict_targets,
+                                   reactive_deficit_cost=reactive_deficit_cost)
     end
 end
 
@@ -551,6 +578,7 @@ function _build_dc_hydro_de(power_data::PowerData,
         cascade, Float64(K),
         Float64.([h.min_turn for h in hydro_data.units]),
         Float64.([h.max_vol for h in hydro_data.units]),
+        :none,   # DC has no reactive balance, hence no reactive slack
     )
 end
 
@@ -567,7 +595,8 @@ function _build_ac_hydro_de(power_data::PowerData,
                               reactive_demand_matrix = nothing,
                               deficit_cost::Union{Nothing,Real} = nothing,
                               load_scaler::Real = 1.0,
-                              strict_targets::Bool = false)
+                              strict_targets::Bool = false,
+                              reactive_deficit_cost::Union{Nothing,Real} = nothing)
 
     nBus    = power_data.nBus
     nGen    = power_data.nGen
@@ -585,6 +614,20 @@ function _build_ac_hydro_de(power_data::PowerData,
     use_l1  = ρ_l1 > 0
     baseMVA = float_type(power_data.baseMVA)
     cd      = float_type(deficit_cost !== nothing ? deficit_cost : power_data.cost_deficit)
+
+    # Reactive-slack mode (see build_hydro_de docstring):
+    #   nothing → :free (default; byte-identical to builds preceding the kwarg),
+    #   finite c ≥ 0 → :penalized (|deficit_q| costed linearly via δq⁺/δq⁻),
+    #   Inf → :hard (no reactive slack — MAIN-faithful hard reactive balance).
+    rq_mode = if reactive_deficit_cost === nothing
+        :free
+    elseif isinf(Float64(reactive_deficit_cost))
+        :hard
+    else
+        (isnan(Float64(reactive_deficit_cost)) || reactive_deficit_cost < 0) &&
+            error("reactive_deficit_cost must be nothing, a finite cost ≥ 0, or Inf; got $reactive_deficit_cost")
+        :penalized
+    end
 
     core = ExaModels.ExaCore(float_type; backend = backend)
 
@@ -623,8 +666,17 @@ function _build_ac_hydro_de(power_data::PowerData,
     # Active deficit (load shedding): T*nBus  (non-negative)
     deficit = ExaModels.variable(core, T * nBus; lvar = float_type(0))
 
-    # Reactive deficit (free; allows reactive balance at zero cost)
-    deficit_q = ExaModels.variable(core, T * nBus)
+    # Reactive deficit — declared in place of the historical free variable so
+    # the variable ORDER of the :free mode is byte-identical to older builds.
+    if rq_mode === :free
+        # Free, zero-cost slack (relaxes the reactive balance).
+        deficit_q = ExaModels.variable(core, T * nBus)
+    elseif rq_mode === :penalized
+        # Split slack deficit_q = δq⁺ − δq⁻ with δq⁺, δq⁻ ≥ 0; the linear cost
+        # c·Σ(δq⁺ + δq⁻) is added in the objective section below.
+        deficit_q_pos = ExaModels.variable(core, T * nBus; lvar = float_type(0))
+        deficit_q_neg = ExaModels.variable(core, T * nBus; lvar = float_type(0))
+    end  # :hard → no reactive slack variable at all
 
     # Reservoir levels: (T+1)*nHyd
     if strict_targets
@@ -694,6 +746,18 @@ function _build_ac_hydro_de(power_data::PowerData,
         for item in def_cost_items
     )
 
+    # Linear reactive-slack penalty c·Σ(δq⁺ + δq⁻) = c·Σ|deficit_q| (only in
+    # :penalized mode; :free and :hard add no objective term here, keeping the
+    # default model byte-identical).
+    if rq_mode === :penalized
+        cq = float_type(reactive_deficit_cost)
+        rq_cost_items = [(idx = _bi(nBus, t, b), c = cq) for t in 1:T for b in 1:nBus]
+        ExaModels.objective(core,
+            item.c * (deficit_q_pos[item.idx] + deficit_q_neg[item.idx])
+            for item in rq_cost_items
+        )
+    end
+
     if !strict_targets
         delta_items = [(idx = _ri(nHyd, t, r),) for t in 1:T for r in 1:nHyd]
 
@@ -713,6 +777,12 @@ function _build_ac_hydro_de(power_data::PowerData,
     end
 
     # ── Constraints ───────────────────────────────────────────────────────────
+    # NOTE (target_con_range audit): the reactive-slack modes differ ONLY in
+    # variables and objective terms. Constraint COUNT and ORDER are identical
+    # in all three modes (:penalized adds constraint! terms to EXISTING
+    # reactive-KCL rows; :hard omits the slack term from those same rows), so
+    # the n_con accounting below and the resulting target_con_range are
+    # unaffected in both strict and non-strict modes.
     n_con = 0
 
     # 1. Reference angle: va[t, ref] = 0
@@ -860,10 +930,24 @@ function _build_ac_hydro_de(power_data::PowerData,
         item.brow => q_to[item.bcol]
         for item in kcl_qto_items
     )
-    ExaModels.constraint!(core, c_kcl_q,
-        item.brow => -deficit_q[item.dcol]
-        for item in kcl_def_items
-    )
+    # Reactive slack term: modifies the EXISTING reactive-KCL rows only —
+    # constraint count/order identical across all rq_mode values.
+    if rq_mode === :free
+        ExaModels.constraint!(core, c_kcl_q,
+            item.brow => -deficit_q[item.dcol]
+            for item in kcl_def_items
+        )
+    elseif rq_mode === :penalized
+        # deficit_q = δq⁺ − δq⁻ enters the KCL as −δq⁺ + δq⁻.
+        ExaModels.constraint!(core, c_kcl_q,
+            item.brow => -deficit_q_pos[item.dcol]
+            for item in kcl_def_items
+        )
+        ExaModels.constraint!(core, c_kcl_q,
+            item.brow => deficit_q_neg[item.dcol]
+            for item in kcl_def_items
+        )
+    end  # :hard → no slack term: hard reactive balance
     n_con += T * nBus
 
     # 9. Initial reservoir condition (skip in strict: reservoir is a parameter,
@@ -961,6 +1045,7 @@ function _build_ac_hydro_de(power_data::PowerData,
         cascade, Float64(K),
         Float64.([h.min_turn for h in hydro_data.units]),
         Float64.([h.max_vol for h in hydro_data.units]),
+        rq_mode,
     )
 end
 
@@ -1095,7 +1180,19 @@ function hydro_solution(prob::HydroExaDEProblem, result)
         p_to_sol   = reshape(sol[off .+ (1:T*nBR)],       nBR, T); off += T*nBR
         q_to_sol   = reshape(sol[off .+ (1:T*nBR)],       nBR, T); off += T*nBR
         def_sol    = reshape(sol[off .+ (1:T*nB)],        nB, T);  off += T*nB
-        def_q_sol  = reshape(sol[off .+ (1:T*nB)],        nB, T);  off += T*nB
+        # Reactive slack layout depends on the builder's reactive_deficit_mode:
+        #   :free      — one free deficit_q block
+        #   :penalized — δq⁺ then δq⁻ blocks; deficit_q = δq⁺ − δq⁻
+        #   :hard      — no slack variable; report exact zeros
+        if prob.reactive_deficit_mode === :penalized
+            dqp_sol   = reshape(sol[off .+ (1:T*nB)],     nB, T);  off += T*nB
+            dqn_sol   = reshape(sol[off .+ (1:T*nB)],     nB, T);  off += T*nB
+            def_q_sol = dqp_sol .- dqn_sol
+        elseif prob.reactive_deficit_mode === :hard
+            def_q_sol = zeros(eltype(sol), nB, T)
+        else
+            def_q_sol = reshape(sol[off .+ (1:T*nB)],     nB, T);  off += T*nB
+        end
         if prob.strict_targets
             res_sol = reshape(copy(prob.strict_reservoir_values), nH, T+1)
         else

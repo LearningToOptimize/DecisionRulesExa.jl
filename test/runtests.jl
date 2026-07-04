@@ -7,6 +7,11 @@ using Random
 using Zygote
 
 include(joinpath(@__DIR__, "..", "examples", "HydroPowerModels", "hydro_training_utils.jl"))
+# Hydro example files (data structs, ExaModels builders, reachable policy) used
+# by the reactive-deficit and recurrent-threading testsets below.
+include(joinpath(@__DIR__, "..", "examples", "HydroPowerModels", "hydro_power_data.jl"))
+include(joinpath(@__DIR__, "..", "examples", "HydroPowerModels", "hydro_power_exa.jl"))
+include(joinpath(@__DIR__, "..", "examples", "HydroPowerModels", "hydro_reachable_policy.jl"))
 
 @testset "HydroPowerModels training utilities" begin
     @test parse_layers("128, 64") == [128, 64]
@@ -527,4 +532,227 @@ end
     @test length(losses) == 2
     @test all(isfinite, losses)
     @test _state_vector(policy) != params_before
+end
+
+@testset "StateConditionedPolicy recurrent-state threading" begin
+    Random.seed!(42)
+    policy = StateConditionedPolicy(2, 1, 1, [4, 3]; activation = tanh)
+    x = Float32[0.3, -0.2, 0.5]
+
+    # Memory: the same input twice WITHOUT reset must give different outputs
+    # (the recurrent state advanced between calls). A memoryless (per-call
+    # restart) encoder would reproduce the first output exactly.
+    Flux.reset!(policy)
+    y1 = policy(x)
+    y2 = policy(x)
+    @test y1 != y2
+
+    # Reset restores the exact initial recurrent state: identical output.
+    Flux.reset!(policy)
+    @test policy(x) == y1
+
+    # Manual LSTMCell recursion with the same weights reproduces the policy's
+    # stage outputs EXACTLY over a 3-stage open-loop sequence.
+    ws = [Float32[0.3, -0.2], Float32[0.1, 0.4], Float32[-0.5, 0.2]]
+    Flux.reset!(policy)
+    prev = Float32[0.5]
+    outs = Vector{Vector{Float32}}()
+    for t in 1:3
+        y = policy(vcat(ws[t], prev))
+        push!(outs, Float32.(y))
+        prev = Float32.(y)
+    end
+
+    cells = [l.cell for l in policy.encoder.layers]
+    states = Any[Flux.initialstates(c) for c in cells]
+    prev = Float32[0.5]
+    for t in 1:3
+        h = ws[t]
+        for (i, c) in enumerate(cells)
+            h, states[i] = c(h, states[i])
+        end
+        y = policy.combiner(vcat(h, prev))
+        @test Float32.(y) == outs[t]
+        prev = Float32.(y)
+    end
+end
+
+@testset "Zygote gradient through threaded 3-stage rollout" begin
+    Random.seed!(43)
+    policy = StateConditionedPolicy(2, 1, 1, [4]; activation = tanh)
+    ws = [Float32[0.3, -0.2], Float32[0.1, 0.4], Float32[-0.5, 0.2]]
+    x0 = Float32[0.5]
+
+    # Same pattern as the training loops: reset inside the gradient block,
+    # thread the recurrent state through all stages via the policy forward.
+    gs = Zygote.gradient(policy) do m
+        Flux.reset!(m)
+        total = 0.0f0
+        prev = x0
+        for t in 1:3
+            y = m(vcat(ws[t], prev))
+            total = total + sum(y)
+            prev = y
+        end
+        total
+    end
+    g = materialize_tangent(gs[1])
+    @test g !== nothing
+    @test DecisionRulesExa._all_finite_gradient(g)
+
+    # Encoder gradients must be finite AND nonzero (the LSTM parameters
+    # participate in every stage of the threaded rollout).
+    enc_leaves = Float64[]
+    function _collect_leaves(x)
+        if x isa AbstractArray && eltype(x) <: Number
+            append!(enc_leaves, vec(Float64.(x)))
+        elseif x isa NamedTuple
+            foreach(_collect_leaves, values(x))
+        elseif x isa Tuple
+            foreach(_collect_leaves, x)
+        end
+        return nothing
+    end
+    _collect_leaves(g.encoder)
+    @test !isempty(enc_leaves)
+    @test any(!=(0.0), enc_leaves)
+end
+
+# ── Synthetic 2-bus fixture for the hydro AC builder ──────────────────────────
+# One thermal generator at the reference bus, one hydro generator at the load
+# bus, a single branch, and one reservoir. Small enough for fast MadNLP solves.
+function _tiny_ac_case()
+    buses = [
+        PowerBusData(1, 3, 0.0, 0.0, 0.9, 1.1),
+        PowerBusData(2, 1, 0.0, 0.0, 0.9, 1.1),
+    ]
+    gens = [
+        PowerGenData(1, 1, 0.0, 2.0, -1.0, 1.0, 10.0, 0.0),   # thermal at bus 1
+        PowerGenData(2, 2, 0.0, 1.0, -1.0, 1.0, 0.0, 0.0),    # hydro at bus 2
+    ]
+    b_dc = -0.1 / (0.01^2 + 0.1^2)
+    branches = [
+        PowerBranchData(1, 1, 2, b_dc, 2.0, -0.5, 0.5,
+                        0.01, 0.1, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+    ]
+    loads = [PowerLoadData(1, 2)]
+    power_data = PowerData(
+        2, 2, 1, 1, buses, gens, branches, loads,
+        [1], 100.0, 60.0, [0.0, 0.5], [0.0, 0.1],
+    )
+    units = [HydroUnitData(1, 2, 100.0, 0.0, 10.0, 0.0, 10.0, 0.001, 0.0, 0.0)]
+    hydro_data = HydroData(
+        1, units, UpstreamTurn[], UpstreamSpill[],
+        2.6, [50.0], [ones(2, 1)], 1, 2,
+    )
+    return power_data, hydro_data
+end
+
+@testset "AC reactive-deficit modes (nothing / finite / Inf)" begin
+    power_data, hydro_data = _tiny_ac_case()
+    T = 2
+    nBus = power_data.nBus
+
+    _build(cost; strict = false) = build_hydro_de(power_data, hydro_data, T;
+        formulation = :ac_polar,
+        deficit_cost = 1e4,
+        strict_targets = strict,
+        reactive_deficit_cost = cost,
+    )
+
+    prob_free = _build(nothing)
+    prob_pen  = _build(10.0)
+    prob_hard = _build(Inf)
+
+    @test prob_free.reactive_deficit_mode === :free
+    @test prob_pen.reactive_deficit_mode  === :penalized
+    @test prob_hard.reactive_deficit_mode === :hard
+
+    # Variable counts: penalized splits the slack (+T*nBus vs free); hard
+    # removes it (−T*nBus vs free). Constraint counts are identical.
+    @test prob_pen.model.meta.nvar  == prob_free.model.meta.nvar + T * nBus
+    @test prob_hard.model.meta.nvar == prob_free.model.meta.nvar - T * nBus
+    @test prob_pen.model.meta.ncon  == prob_free.model.meta.ncon
+    @test prob_hard.model.meta.ncon == prob_free.model.meta.ncon
+
+    # target_con_range bookkeeping is unaffected in both non-strict and strict.
+    @test prob_pen.target_con_range  == prob_free.target_con_range
+    @test prob_hard.target_con_range == prob_free.target_con_range
+    strict_free = _build(nothing; strict = true)
+    strict_pen  = _build(10.0;    strict = true)
+    strict_hard = _build(Inf;     strict = true)
+    @test strict_pen.target_con_range  == strict_free.target_con_range
+    @test strict_hard.target_con_range == strict_free.target_con_range
+
+    # DC path rejects the kwarg (and is otherwise unaffected by it).
+    @test_throws ErrorException build_hydro_de(power_data, hydro_data, T;
+        formulation = :dc, reactive_deficit_cost = 10.0)
+
+    # All three AC modes must solve.
+    x0 = [50.0]
+    w  = [2.0, 2.0]
+    xhat = [50.0, 50.0]
+    for prob in (prob_free, prob_pen, prob_hard)
+        ExaModels.set_parameter!(prob.core, prob.p_x0, x0)
+        ExaModels.set_parameter!(prob.core, prob.p_inflow, w)
+        ExaModels.set_parameter!(prob.core, prob.p_target, xhat)
+        prepare_solve!(prob, x0, w, xhat)
+        res = MadNLP.madnlp(prob.model; tol = 1e-6, max_iter = 500,
+                            print_level = MadNLP.ERROR)
+        @test solve_succeeded(res)
+        @test isfinite(res.objective)
+        sol = hydro_solution(prob, res)
+        @test size(sol.deficit_q) == (nBus, T)
+        @test all(isfinite, sol.deficit_q)
+        if prob.reactive_deficit_mode === :hard
+            @test all(iszero, sol.deficit_q)
+        end
+    end
+end
+
+@testset "HydroReachablePolicy threading matches manual cell recursion" begin
+    power_data, hydro_data = _tiny_ac_case()
+    Random.seed!(44)
+    policy = hydro_reachable_policy(hydro_data, [4, 3])
+
+    # Memory across stages: identical inputs without reset differ; reset
+    # restores the exact first output.
+    xin = vcat(Float32[2.0], Float32[50.0])
+    Flux.reset!(policy)
+    a = policy(xin)
+    b = policy(xin)
+    @test a != b
+    Flux.reset!(policy)
+    @test policy(xin) == a
+
+    # As-is open loop vs manual LSTMCell threading (the verified diagnostic
+    # pattern from eval_paired_exa_strict.jl) — must agree EXACTLY.
+    T = 3
+    w_stages = Float32[2.0, 1.5, 2.5]
+    Flux.reset!(policy)
+    prev = Float32[50.0]
+    asis = Vector{Vector{Float32}}()
+    for t in 1:T
+        y = policy(vcat(Float32[w_stages[t]], prev))
+        push!(asis, Float32.(y))
+        prev = Float32.(y)
+    end
+
+    cells = [l.cell for l in policy.encoder.layers]
+    states = Any[Flux.initialstates(c) for c in cells]
+    prev = Float32[50.0]
+    for t in 1:T
+        wt = Float32[w_stages[t]]
+        h = wt
+        for (i, c) in enumerate(cells)
+            h, states[i] = c(h, states[i])
+        end
+        y = policy.combiner(vcat(h, prev))
+        lower, upper = _hydro_reachable_bounds(policy, wt, prev, y)
+        raw = lower .+ (upper .- lower) .* y
+        target = isempty(policy.cascade) ? raw :
+                 min.(raw, _cascade_upper_bounds(policy, raw, wt, prev))
+        @test Float32.(target) == asis[t]
+        prev = Float32.(target)
+    end
 end

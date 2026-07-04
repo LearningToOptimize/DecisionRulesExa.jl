@@ -129,8 +129,107 @@ function _dense_policy_head(
     return Flux.Chain(layers...)
 end
 
+# ── Recurrent-state threading helpers (Flux ≥ 0.16 stateless cells) ──────────
+#
+# In Flux 0.16 recurrent layers are stateless: `(l::LSTM)(x)` restarts from
+# `Flux.initialstates(l)` on EVERY call and `Flux.reset!` on Flux layers is a
+# deprecated no-op. A policy that needs cross-stage memory must therefore carry
+# the recurrent state itself and advance it with one stateful cell call per
+# stage. The helpers below mirror DecisionRules.jl's `_as_cell`,
+# `_init_recurrent_state`, `_step_encoder`, and `_state_eltype`
+# (src/dense_multilayer_nn.jl) so both packages thread recurrent encoders with
+# identical semantics. Unlike DecisionRules.jl, which stores BARE cells, EXA
+# encoders keep the `Flux.LSTM` wrapper layers (preserving the weight
+# structure of existing checkpoints); `_as_cell` unwraps to the underlying
+# cell for the stateful `(x, state) -> (output, new_state)` call.
+
 """
-    StateConditionedPolicy{E,C}
+    _as_cell(layer)
+
+Return the underlying recurrent cell of `layer`. `Flux.LSTM`/`GRU`/`RNN` wrap a
+cell (`LSTMCell`/`GRUCell`/`RNNCell`) in a `.cell` field; if `layer` has no such
+field it is already a cell and is returned unchanged.
+"""
+# Unwrap the .cell field if present (LSTM → LSTMCell); return unchanged otherwise.
+_as_cell(layer) = hasfield(typeof(layer), :cell) ? layer.cell : layer
+
+"""
+    _init_recurrent_state(encoder)
+
+Return the initial recurrent state for `encoder`: `Flux.initialstates` of the
+underlying cell for a single layer, or a tuple of per-layer initial states for
+a `Chain`.
+
+# Notes
+`Flux.initialstates` builds zero states with `zeros_like` on the cell weights,
+so the returned state inherits the encoder's device and element type — call
+[`Flux.reset!`](@ref) after moving a policy between devices to re-derive the
+state on the new device.
+"""
+# Single layer: initial state of the underlying cell (zeros for LSTM h/c).
+_init_recurrent_state(layer) = Flux.initialstates(_as_cell(layer))
+# Chain: one initial state per layer, returned as a tuple.
+_init_recurrent_state(chain::Flux.Chain) = map(_init_recurrent_state, chain.layers)
+
+"""
+    _step_encoder(encoder, x, state) -> (output, new_state)
+
+Advance `encoder` by one step on input `x` from recurrent `state`, returning
+the output and the updated state. For a `Chain`, each layer's output feeds the
+next layer and each layer's state is threaded independently.
+"""
+# Single layer: one stateful cell call returns (output, new_state).
+_step_encoder(layer, x, state) = _as_cell(layer)(x, state)
+function _step_encoder(chain::Flux.Chain, x, states::Tuple)
+    # Delegate to the recursive tuple-based implementation.
+    return _step_encoder_layers(chain.layers, x, states)
+end
+
+"""
+    _step_encoder_layers(layers, x, states) -> (output, new_states)
+
+Recursively advance a tuple of recurrent layers by one time step.
+
+Each layer receives the output of the previous layer as input and its own
+independent recurrent state. The base case (`layers == ()`) returns the input
+unchanged with an empty state tuple.
+
+# Arguments
+- `layers::Tuple`: remaining recurrent layers to evaluate.
+- `x`: current input (or output of the prior layer).
+- `states::Tuple`: per-layer recurrent states, same length as `layers`.
+
+# Returns
+- `output`: output of the last layer in `layers`.
+- `new_states::Tuple`: updated recurrent states, one per layer.
+"""
+_step_encoder_layers(::Tuple{}, x, ::Tuple{}) = x, ()
+function _step_encoder_layers(layers::Tuple, x, states::Tuple)
+    # Advance the first layer with its own recurrent state.
+    out, new_state = _step_encoder(first(layers), x, first(states))
+
+    # Recurse on remaining layers, feeding this layer's output as input.
+    rest_out, rest_states = _step_encoder_layers(Base.tail(layers), out, Base.tail(states))
+
+    # Reassemble the full state tuple: this layer's state followed by the rest.
+    return rest_out, (new_state, rest_states...)
+end
+
+"""
+    _state_eltype(state) -> Type
+
+Return the scalar element type of a recurrent state.
+
+For nested tuple states (e.g. LSTM's `(h, c)` or a `Chain`'s tuple of per-layer
+states) this recurses into the first element until it reaches an
+`AbstractVector`, then returns `eltype(v)`. The result is used to cast inputs
+to the encoder's precision before each step.
+"""
+_state_eltype(state::Tuple) = _state_eltype(first(state))
+_state_eltype(v::AbstractVector) = eltype(v)
+
+"""
+    StateConditionedPolicy{E,C,S}
 
 Flux-compatible state-conditioned policy for sequential target rollout.
 
@@ -143,26 +242,39 @@ xhat_t = policy(vcat(w_t, x_prev))
 where the recurrent encoder reads only `w_t` and the combiner reads
 `[encoded_uncertainty; x_prev]`.
 
+Flux's recurrent cells are stateless (Flux ≥ 0.16): each call returns
+`(output, new_state)` instead of mutating internal state, and calling the
+`LSTM` wrapper directly would restart from `initialstates` on every call.
+`StateConditionedPolicy` therefore carries the encoder's recurrent state itself
+in `state`, threading it through one cell call per stage — the same semantics
+as DecisionRules.jl's `StateConditionedPolicy`. Call `Flux.reset!(policy)` to
+restore it to `Flux.initialstates` at the start of a scenario.
+
 # Fields
-- `encoder`: recurrent uncertainty encoder.
+- `encoder`: recurrent uncertainty encoder (`Chain` of `Flux.LSTM`-style layers).
 - `combiner`: nonrecurrent target head.
+- `state`: current recurrent state ``s_t``, carried across calls (not trainable).
 - `n_uncertainty::Int`: number of uncertainty features at each stage.
 - `n_state::Int`: number of previous-state features.
 - `output_lower`: optional lower bounds for affine output scaling.
 - `output_scale`: optional `upper - lower` scale for affine output scaling.
 
 # Notes
-Call `Flux.reset!(policy)` before each scenario. Recurrent Flux layers require
-two-dimensional input, so the forward pass reshapes the one-dimensional
-uncertainty slice to `(n_uncertainty, 1)` before encoding.
+Call `Flux.reset!(policy)` before each scenario — the reset is REAL (it
+restores the initial recurrent state), unlike the deprecated Flux-layer
+`reset!` no-op. Within a differentiated rollout the threaded state is treated
+as data: gradients flow into encoder/combiner parameters through each stage's
+forward pass, and the state stored between calls is refreshed by mutation
+(mirroring DecisionRules.jl's training semantics).
 """
-struct StateConditionedPolicy{E,C,L,U}
-    encoder::E
-    combiner::C
-    n_uncertainty::Int
-    n_state::Int
-    output_lower::L
-    output_scale::U
+mutable struct StateConditionedPolicy{E,C,S,L,U}
+    encoder::E          # Recurrent uncertainty encoder (Chain of LSTM-style layers)
+    combiner::C         # Nonrecurrent target head
+    state::S            # Encoder recurrent state, carried across calls
+    n_uncertainty::Int  # Number of uncertainty features per stage
+    n_state::Int        # Number of previous-state features
+    output_lower::L     # Optional affine output lower bounds
+    output_scale::U     # Optional affine output scale (upper - lower)
 end
 
 Flux.@layer StateConditionedPolicy trainable=(encoder, combiner)
@@ -170,7 +282,18 @@ Flux.@layer StateConditionedPolicy trainable=(encoder, combiner)
 """
     (policy::StateConditionedPolicy)(input) -> AbstractVector
 
-Evaluate one stage of a state-conditioned policy.
+Evaluate one stage of a state-conditioned policy, threading recurrent state.
+
+The input is split into the uncertainty portion ``w_t`` and the previous state
+``x_{t-1}``, and the forward pass computes
+
+```math
+h_t, s_t = \\text{encoder}(w_t, s_{t-1}), \\qquad
+\\hat{x}_t = f_{\\text{combine}}([h_t;\\; x_{t-1}]),
+```
+
+where ``s_t`` is the updated recurrent state (stored in `policy.state` for the
+next call).
 
 # Arguments
 - `input`: concatenated vector `[w_t; x_prev]`.
@@ -180,9 +303,20 @@ Evaluate one stage of a state-conditioned policy.
   supplied at construction.
 """
 function (m::StateConditionedPolicy)(input)
-    w = reshape(input[1:m.n_uncertainty], :, 1)   # (n_unc, 1) for LSTM
+    # Split the concatenated input into uncertainty w_t and previous state x_{t-1}.
+    w = input[1:m.n_uncertainty]
     s = input[m.n_uncertainty+1:end]
-    h = vec(m.encoder(w))                          # (hidden,)
+
+    # Cast the uncertainty to the encoder precision (taken from the recurrent
+    # state), matching DecisionRules.jl's forward pass exactly.
+    T = _state_eltype(m.state)
+
+    # Advance the recurrent encoder by one step: h_t, s_t = encoder(w_t, s_{t-1}).
+    h, new_state = _step_encoder(m.encoder, T.(w), m.state)
+
+    # Persist the new recurrent state so the next call starts from s_t.
+    m.state = new_state
+
     y = m.combiner(vcat(h, s))
     if m.output_lower === nothing
         return y
@@ -193,14 +327,21 @@ function (m::StateConditionedPolicy)(input)
 end
 
 """
-    Flux.reset!(policy::StateConditionedPolicy)
+    Flux.reset!(policy::StateConditionedPolicy) -> Nothing
 
-Reset the recurrent uncertainty encoder.
+Reset the encoder's recurrent state to `Flux.initialstates`, e.g. at the start
+of a scenario rollout.
 
-# Returns
-- The result of `Flux.reset!(policy.encoder)`.
+# Notes
+The state is re-derived from the (possibly device-moved) encoder weights on
+every reset, so calling `Flux.reset!` after `gpu(policy)`/`cpu(policy)` places
+the state on the correct device with the correct element type.
 """
-Flux.reset!(m::StateConditionedPolicy) = Flux.reset!(m.encoder)
+function Flux.reset!(m::StateConditionedPolicy)
+    # Reinitialize s_0 to the cell defaults (zeros for LSTM h/c).
+    m.state = _init_recurrent_state(m.encoder)
+    return nothing
+end
 
 """
     _adapt_policy_bound(x, ref)
@@ -225,6 +366,54 @@ function _adapt_policy_bound(x::AbstractVector, ref::AbstractVector)
 end
 
 """
+    _load_encoder_state!(encoder, enc_state) -> encoder
+
+Load a checkpoint `encoder` state into a recurrent encoder, accepting BOTH
+weight structures in use across the two packages:
+
+1. EXA structure — `Chain` of `Flux.LSTM` wrapper layers, so each layer state
+   is `(cell = (Wi, Wh, bias),)`. Loaded by the stock `Flux.loadmodel!`.
+2. DecisionRules.jl (MAIN) structure — `Chain` of BARE `LSTMCell`s (MAIN's
+   `_as_cell` strips the wrapper at construction), so each layer state is
+   `(Wi, Wh, bias)` directly. `Flux.loadmodel!` matches children by key, so
+   loading a bare-cell layer state into an `LSTM` wrapper (children `(cell,)`)
+   throws; this helper falls back to cell-by-cell injection, loading each
+   layer state into `_as_cell(layer)` — the mathematically identical weight
+   assignment (the wrapper's `cell` has exactly the fields `(Wi, Wh, bias)`
+   MAIN saved).
+
+# Arguments
+- `encoder`: destination encoder (typically a `Chain` of `Flux.LSTM` layers).
+- `enc_state`: the checkpoint's encoder state (from `Flux.state`).
+
+# Returns
+- `encoder`, mutated in place.
+
+# Throws
+- Rethrows the stock `Flux.loadmodel!` error when the fallback does not apply
+  (non-`Chain` encoder, missing `layers`, or depth mismatch).
+"""
+function _load_encoder_state!(encoder, enc_state)
+    try
+        # Stock path: same weight structure (EXA wrapper layers).
+        Flux.loadmodel!(encoder, enc_state)
+        return encoder
+    catch err
+        # Fallback applies only to Chain encoders with a per-layer state list.
+        (encoder isa Flux.Chain && hasproperty(enc_state, :layers)) || rethrow(err)
+        layer_states = getproperty(enc_state, :layers)
+        length(layer_states) == length(encoder.layers) || rethrow(err)
+        for (layer, lstate) in zip(encoder.layers, layer_states)
+            # Wrapper-style layer state loads into the wrapper; bare-cell
+            # (MAIN) layer state loads into the unwrapped cell.
+            dest = hasproperty(lstate, :cell) ? layer : _as_cell(layer)
+            Flux.loadmodel!(dest, lstate)
+        end
+        return encoder
+    end
+end
+
+"""
     load_stateconditioned_policy!(policy, state)
 
 Load a Flux checkpoint into a [`StateConditionedPolicy`](@ref).
@@ -237,19 +426,30 @@ Load a Flux checkpoint into a [`StateConditionedPolicy`](@ref).
 - `policy`.
 
 # Notes
-Checkpoints saved before output bounds were added contain only the trainable
-encoder and combiner state. In that case, this method restores those trainable
-components and keeps the current policy's case-defined output bounds.
+- Checkpoints saved before output bounds were added contain only the trainable
+  encoder and combiner state. In that case, this method restores those
+  trainable components and keeps the current policy's case-defined output
+  bounds.
+- Checkpoints trained BEFORE recurrent-state threading (memoryless-encoder
+  era) have the SAME weight structure and load unchanged — only the runtime
+  semantics differ (the encoder now carries memory across stages).
+- DecisionRules.jl (MAIN) checkpoints, whose encoders are `Chain`s of bare
+  `LSTMCell`s, load through the documented cell-by-cell fallback in
+  [`_load_encoder_state!`](@ref).
+- The loaded policy's recurrent state is reset afterwards so the next rollout
+  starts from `Flux.initialstates` of the loaded weights.
 """
 function load_stateconditioned_policy!(policy::StateConditionedPolicy, state)
     try
         Flux.loadmodel!(policy, state)
+        Flux.reset!(policy)
         return policy
     catch err
         hasproperty(state, :encoder) && hasproperty(state, :combiner) || rethrow(err)
         @warn "Full StateConditionedPolicy checkpoint load failed; loading encoder/combiner only and keeping current output bounds" exception=(err, catch_backtrace())
-        Flux.loadmodel!(policy.encoder, getproperty(state, :encoder))
+        _load_encoder_state!(policy.encoder, getproperty(state, :encoder))
         Flux.loadmodel!(policy.combiner, getproperty(state, :combiner))
+        Flux.reset!(policy)
         return policy
     end
 end
@@ -330,7 +530,11 @@ function StateConditionedPolicy(
         activation = activation,
     )
     if output_bounds === nothing
-        return StateConditionedPolicy(encoder, combiner, n_uncertainty, n_state, nothing, nothing)
+        # Initialize the recurrent state to Flux.initialstates for the encoder.
+        return StateConditionedPolicy(
+            encoder, combiner, _init_recurrent_state(encoder),
+            n_uncertainty, n_state, nothing, nothing,
+        )
     end
     lower, upper = output_bounds
     length(lower) == n_out || throw(ArgumentError("output lower bound length must be n_out=$n_out"))
@@ -339,7 +543,8 @@ function StateConditionedPolicy(
     any(<(zero(eltype(scale))), scale) &&
         throw(ArgumentError("output upper bounds must be >= lower bounds"))
     return StateConditionedPolicy(
-        encoder, combiner, n_uncertainty, n_state,
+        encoder, combiner, _init_recurrent_state(encoder),
+        n_uncertainty, n_state,
         collect(lower), collect(scale),
     )
 end

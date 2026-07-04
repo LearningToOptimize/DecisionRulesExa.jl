@@ -43,10 +43,17 @@ initial state and feeding each previous target into the next policy call gives a
 feasible target path by induction. Embedded strict DEs use realized reservoir
 states inside the NLP. Cascade links are handled by clamping downstream targets
 to the upper bound implied by same-stage upstream targets.
+
+The recurrent encoder state is threaded across stages explicitly (Flux ≥ 0.16
+cells are stateless, so calling the `LSTM` wrapper directly would restart from
+`initialstates` every stage): the forward pass advances `state` by one cell
+step per call, mirroring DecisionRules.jl's `HydroReachablePolicy` exactly.
+Call `Flux.reset!(policy)` at scenario boundaries to restore the initial state.
 """
-struct HydroReachablePolicy{E,C,V,S,I}
+mutable struct HydroReachablePolicy{E,C,RS,V,S,I}
     encoder::E
     combiner::C
+    state::RS            # Encoder recurrent state, threaded across stages
     n_uncertainty::Int
     n_state::Int
     min_vol::V
@@ -269,9 +276,11 @@ Evaluate the reachable hydro policy.
 - A reservoir target vector in the one-stage reachable set.
 
 # Notes
-The encoder reads only the inflow. The combiner reads both encoded inflow and
-previous reservoir state, emits normalized targets, and those targets are mapped
-into the reachability interval before cascade clamping.
+The encoder reads only the inflow, threading its recurrent state across calls
+(one cell step per stage, stored in `policy.state` — DecisionRules.jl
+semantics). The combiner reads both encoded inflow and previous reservoir
+state, emits normalized targets, and those targets are mapped into the
+reachability interval before cascade clamping.
 
 The cascade clamp inherits the assumptions documented on
 [`_cascade_upper_bounds`](@ref):
@@ -290,9 +299,18 @@ The cascade clamp inherits the assumptions documented on
   the stage is genuinely infeasible and no policy-level remedy exists.
 """
 function (m::HydroReachablePolicy)(input)
+    # Split input: first n_uncertainty elements are inflow, rest is previous state.
     inflow = input[1:m.n_uncertainty]
     x_prev = input[m.n_uncertainty+1:end]
-    h = vec(m.encoder(reshape(inflow, :, 1)))
+
+    # Encode inflow through the recurrent encoder, threading state across calls
+    # (mirrors DecisionRules.jl: encoded, s_t = _step_encoder(enc, T.(w_t), s_{t-1})).
+    # Cast to encoder precision for type stability (avoids Zygote codegen bugs).
+    T = DecisionRulesExa._state_eltype(m.state)
+    h, new_state = DecisionRulesExa._step_encoder(m.encoder, T.(inflow), m.state)
+    # Thread the recurrent state to the next call.
+    m.state = new_state
+
     y = m.combiner(vcat(h, x_prev))
     lower, upper = _hydro_reachable_bounds(m, inflow, x_prev, y)
     # Because `y` is sigmoid-bounded, this affine map stays in [lower, upper].
@@ -305,17 +323,21 @@ function (m::HydroReachablePolicy)(input)
 end
 
 """
-    Flux.reset!(policy::HydroReachablePolicy)
+    Flux.reset!(policy::HydroReachablePolicy) -> Nothing
 
-Reset recurrent state in the inflow encoder.
-
-# Returns
-- The result of `Flux.reset!(policy.encoder)`.
+Reset the inflow encoder's recurrent state to `Flux.initialstates`, e.g. at
+scenario boundaries.
 
 # Notes
-The combiner is feed-forward and does not carry recurrent state.
+The combiner is feed-forward and does not carry recurrent state. The recurrent
+state is re-derived from the (possibly device-moved) encoder weights on every
+reset, so the state always matches the encoder's device and element type.
 """
-Flux.reset!(m::HydroReachablePolicy) = Flux.reset!(m.encoder)
+function Flux.reset!(m::HydroReachablePolicy)
+    # Reinitialize the recurrent state from the encoder's initial states.
+    m.state = DecisionRulesExa._init_recurrent_state(m.encoder)
+    return nothing
+end
 
 """
     load_stateconditioned_policy!(policy::HydroReachablePolicy, state)
@@ -330,19 +352,30 @@ Load Flux parameters into a reachable hydro policy.
 - `policy`.
 
 # Notes
-If the checkpoint contains only `encoder` and `combiner` fields, those trainable
-parts are loaded while hydro reachability metadata from the current case is
-preserved.
+- If the checkpoint contains only `encoder` and `combiner` fields, those
+  trainable parts are loaded while hydro reachability metadata from the current
+  case is preserved.
+- Checkpoints trained BEFORE recurrent-state threading (memoryless-encoder era)
+  have the SAME weight structure and load unchanged — only the runtime
+  semantics differ (the encoder now carries memory across stages).
+- DecisionRules.jl (MAIN) checkpoints save the encoder as a `Chain` of BARE
+  `LSTMCell`s (layer state `(Wi, Wh, bias)` instead of `(cell = …,)`); those
+  load through the documented cell-by-cell fallback in
+  `DecisionRulesExa._load_encoder_state!`.
+- The recurrent state is reset after loading so the next rollout starts from
+  `Flux.initialstates` of the loaded weights.
 """
 function load_stateconditioned_policy!(policy::HydroReachablePolicy, state)
     try
         Flux.loadmodel!(policy, state)
+        Flux.reset!(policy)
         return policy
     catch err
         hasproperty(state, :encoder) && hasproperty(state, :combiner) || rethrow(err)
         @warn "Full HydroReachablePolicy checkpoint load failed; loading encoder/combiner only and keeping hydro reachability bounds" exception=(err, catch_backtrace())
-        Flux.loadmodel!(policy.encoder, getproperty(state, :encoder))
+        DecisionRulesExa._load_encoder_state!(policy.encoder, getproperty(state, :encoder))
         Flux.loadmodel!(policy.combiner, getproperty(state, :combiner))
+        Flux.reset!(policy)
         return policy
     end
 end
@@ -397,7 +430,9 @@ function hydro_reachable_policy(
     end
 
     return HydroReachablePolicy(
-        encoder, combiner, nHyd, nHyd,
+        encoder, combiner,
+        DecisionRulesExa._init_recurrent_state(encoder),   # initial recurrent state
+        nHyd, nHyd,
         Float32.([h.min_vol for h in hydro_data.units]),
         Float32.([h.max_vol for h in hydro_data.units]),
         Float32.([h.min_turn for h in hydro_data.units]),
@@ -407,10 +442,14 @@ function hydro_reachable_policy(
         K,
         nothing, nothing,
         cascade,
-        getfield.(cascade, :upstream),
-        getfield.(cascade, :downstream),
-        Float32.(getfield.(cascade, :turn_only)),
-        Float32.(getfield.(cascade, :K_max_turn)),
+        # Typed comprehensions guarantee concrete Vector{Int}/Vector{Float32}
+        # element types: `getfield.(links, :field)` can infer as Vector{Real}
+        # (the field symbol does not always constant-propagate through fused
+        # broadcast), which breaks the struct's I/V type-parameter binding.
+        Int[c.upstream for c in cascade],
+        Int[c.downstream for c in cascade],
+        Float32[c.turn_only for c in cascade],
+        Float32[c.K_max_turn for c in cascade],
         collect(1:nHyd),
     )
 end

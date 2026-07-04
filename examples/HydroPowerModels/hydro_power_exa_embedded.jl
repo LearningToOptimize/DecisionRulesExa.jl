@@ -10,6 +10,16 @@
 # Strict target constraint:
 #     π_θ(inflow_t, reservoir_t) − reservoir_{t+1,r} = 0
 #
+# Recurrent encoder handling: the per-stage encoder outputs h_t are cached in
+# h_cache, computed by threading the recurrent state across stages
+# (DecisionRulesExa._step_encoder — DecisionRules.jl semantics; Flux ≥ 0.16
+# cells are stateless so the Chain cannot be called directly per stage). Since
+# the encoder reads only inflows, h_t depends on w_{1..t} and never on
+# reservoir states; the cache is invalidated when inflows or policy parameters
+# change (invalidate_policy_cache!/set_inflows!) and the oracle's analytic
+# per-stage Jacobian ∂π_t/∂x_t through the combiner remains the FULL
+# derivative — state threading adds no ∂h_t/∂x dependence.
+#
 # Depends on: hydro_power_data.jl, hydro_power_exa.jl, hydro_reachable_policy.jl
 
 using Flux
@@ -479,10 +489,20 @@ function _build_hydro_oracle(policy, T, nHyd, res_start, dp_start, dn_start,
     end
 
     function _populate_h_cache!()
-        Flux.reset!(encoder)
+        # Thread the recurrent encoder state across stages explicitly. Flux
+        # ≥ 0.16 cells are stateless — calling the Chain of LSTM wrappers
+        # directly (`encoder(x)`) would restart from `initialstates` on every
+        # stage, making the encoder memoryless. `_step_encoder` advances the
+        # underlying cells one stage at a time from a fresh initial state,
+        # exactly like DecisionRules.jl's `_step_encoder` and the threaded
+        # policy forward pass. h_t therefore depends on the inflow history
+        # w_{1..t} only (never on reservoir states), which is what makes this
+        # per-stage cache — and the oracle's per-stage direct Jacobian —
+        # exact for the embedded policy.
+        enc_state = DecisionRulesExa._init_recurrent_state(encoder)
         for t in 1:T
             infl_f32 .= view(inflow_buf, _inflow(t))
-            h = vec(encoder(reshape(infl_f32, :, 1)))
+            h, enc_state = DecisionRulesExa._step_encoder(encoder, infl_f32, enc_state)
             view(h_cache, :, t) .= h
         end
         h_cache_dirty[] = false

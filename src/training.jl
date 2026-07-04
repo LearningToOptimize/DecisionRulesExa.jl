@@ -44,6 +44,10 @@ step.
 - For `OneElement`: returns `collect(x)`, a dense array.
 - For `Tangent`/`MutableTangent`: returns a `NamedTuple` with recursively
   materialized fields.
+- For `Base.RefValue` (Zygote's wrapper for tangents of mutated mutable
+  structs, such as the state-threading policies): unwraps and recurses.
+- For plain `NamedTuple`/`Tuple`: recurses so nested wrappers are stripped.
+- For `NoTangent`/`ZeroTangent`: returns `nothing`.
 """
 _mat(x) = x                                          # plain value — no conversion needed
 _mat(x::Zygote.OneElement) = collect(x)               # sparse one-hot → dense array
@@ -55,6 +59,19 @@ function _mat(x::ChainRulesCore.MutableTangent{<:Any})
     nt = ChainRulesCore.backing(x)                    # extract underlying named tuple
     return NamedTuple{keys(nt)}(map(_mat, values(nt)))  # recursively materialize each field
 end
+# Structural-zero tangents (non-differentiable fields) map to nothing so
+# Flux.update! skips them.
+_mat(::ChainRulesCore.NoTangent)   = nothing
+_mat(::ChainRulesCore.ZeroTangent) = nothing
+# Zygote wraps tangents of MUTATED mutable structs (e.g. the state-threading
+# policies, whose forward pass stores the new recurrent state via setfield!) in
+# Base.RefValue and MutableTangent containers, potentially nested inside plain
+# NamedTuples/Tuples. Recurse through those containers so every wrapper is
+# stripped before the gradient reaches Flux.update!.
+_mat(ref::Base.RefValue) = _mat(ref[])                # unwrap Ref and recurse
+_mat(nt::NamedTuple{K}) where {K} =
+    NamedTuple{K}(map(_mat, values(nt)))              # recurse plain named tuples
+_mat(t::Tuple) = map(_mat, t)                          # recurse plain tuples
 
 """
     materialize_tangent(g) -> Union{Nothing, Any}

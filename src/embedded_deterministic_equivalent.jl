@@ -10,7 +10,15 @@
 #     π_θ(w_t, x_{t-1}) − x_t − δ_t = 0    ∀t = 1…T
 #
 # One oracle for all T stages guarantees sequential LSTM evaluation with
-# Flux.reset! at the top of each callback invocation.
+# Flux.reset! at the top of each callback invocation. Flux.reset! on the
+# threaded policies is a REAL reset (it restores Flux.initialstates), and each
+# stage's policy forward advances the recurrent state exactly once, so within
+# every callback the policy sees the stage sequence t = 1…T from a fresh
+# initial state. Audit of per-stage advancement: oracle_f! calls the policy
+# once per stage; oracle_jac!/oracle_vjp! call it inside Zygote.pullback for
+# t > 1 (the pullback CONSTRUCTION runs the forward exactly once; calling the
+# returned back(·) does not re-run it) and as a bare call for t = 1 — one
+# forward, hence one state advance, per stage in all three callbacks.
 #
 # Jacobian exactness caveat: the oracle callbacks (oracle_jac!, oracle_vjp!)
 # compute only the DIRECT partial ∂π_t/∂x_{t-1} via a per-stage Zygote pullback.
@@ -21,7 +29,11 @@
 # approximation for such recurrent ones. When the recurrent encoder reads only
 # the uncertainty w_t (as in StateConditionedPolicy and HydroReachablePolicy,
 # where the combiner over [h_t; x_{t-1}] is feedforward in x), the hidden state
-# does not depend on x and the direct partial IS the full derivative.
+# does not depend on x and the direct partial IS the full derivative. This
+# exactness claim SURVIVES recurrent-state threading: with the encoder reading
+# only w_t, the threaded hidden state depends only on the inflow history
+# w_{1..t}, never on x, so threading changes the VALUE of h_t but adds no
+# ∂h_t/∂x dependence — ∂π_t/∂x_{t-1} remains the full derivative.
 
 """
     EmbeddedDeterministicEquivalentProblem
@@ -248,7 +260,15 @@ and those cross-stage Jacobian entries are omitted — the reported Jacobian is
 then a structural approximation. The Jacobian is exact whenever the recurrent
 part of the policy reads only ``w_t`` and the state enters through a
 feedforward head (the [`StateConditionedPolicy`](@ref) architecture), because
-then the hidden state carries no dependence on ``x``.
+then the hidden state carries no dependence on ``x``. This holds unchanged
+with recurrent-state threading: the threaded hidden state is a function of
+``w_{1..t}`` only, so it changes the value of ``h_t`` but introduces no
+``\\partial h_t / \\partial x`` term.
+
+Every callback resets the policy's recurrent state at its top and evaluates
+the stages in order, advancing the state exactly once per stage (for
+``t > 1`` the forward runs during `Zygote.pullback` construction; the
+returned pullback does not re-run it).
 """
 function build_embedded_deterministic_equivalent(
     policy;
@@ -365,6 +385,8 @@ function build_embedded_deterministic_equivalent(
     # ── Oracle callbacks ─────────────────────────────────────────────────
 
     function oracle_f!(c, xv)
+        # Real reset: the stage loop below starts from the initial recurrent
+        # state and each policy call advances it exactly once.
         Flux.reset!(policy)
         for t in 1:T
             _fill_input!(t, xv)
@@ -384,6 +406,9 @@ function build_embedded_deterministic_equivalent(
     # not represented (see file-top comment); exact when the recurrent encoder
     # reads only w_t, as in StateConditionedPolicy / HydroReachablePolicy.
     function oracle_jac!(vals, xv)
+        # Real reset; each stage advances the recurrent state exactly once:
+        # for t > 1 the forward runs during Zygote.pullback construction, and
+        # calling back(·) repeatedly does NOT re-run it; t = 1 is a bare call.
         Flux.reset!(policy)
         k = 0
         for t in 1:T
@@ -403,6 +428,8 @@ function build_embedded_deterministic_equivalent(
                 end
                 _J
             else
+                # t = 1: no x-Jacobian block, but the forward must still run
+                # once so the recurrent state advances to stage 2.
                 policy(vcat(_w_t, _x_prev))
                 nothing
             end
@@ -422,6 +449,7 @@ function build_embedded_deterministic_equivalent(
 
     function oracle_vjp!(Jtv, xv, λ)
         fill!(Jtv, 0.0)
+        # Real reset; same one-advance-per-stage discipline as oracle_jac!.
         Flux.reset!(policy)
         for t in 1:T
             _fill_x_prev!(t, xv)
@@ -445,6 +473,8 @@ function build_embedded_deterministic_equivalent(
                     end
                 end
             else
+                # t = 1: no x_prev contribution, but run the forward once so
+                # the recurrent state advances to stage 2.
                 policy(vcat(_w_t, _x_prev))
             end
         end
