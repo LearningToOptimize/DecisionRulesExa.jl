@@ -62,6 +62,23 @@
 #   DR_REACTIVE_DEFICIT = "hard"  ("hard" → Inf = no reactive slack (MAIN-faithful);
 #                                  "free" → nothing = historical free slack;
 #                                  a number → linear |deficit_q| cost)
+#   DR_CHECKPOINT       = <abs path .jld2>  (checkpoint to evaluate; default: the
+#                                  MAIN reference checkpoint hardcoded below)
+#   DR_CHECKPOINT_KIND  = "main"  ("main" → apply ALL MAIN-reference parity gates;
+#                                  "exa" → EXA-trained checkpoint: SKIP the
+#                                  probe-parity and open-loop-trajectory gates
+#                                  (only meaningful for the exact reference
+#                                  weights) but KEEP the policy-independent
+#                                  inflow-indexing gate; scenario inflow values
+#                                  still come from the reference JLD2)
+#   DR_ENCODER_LAYERS   = "128,128" (LSTM encoder widths; must match checkpoint;
+#                                  DR_LAYERS is the legacy alias, as in
+#                                  train_hydro_exa_strict.jl)
+#   DR_HEAD_LAYERS      = ""      (state-conditioned head hidden widths; must
+#                                  match checkpoint; "" → linear head)
+#   DR_OUTPUT_TAG       = ""      ("" → save to results/paired_exa_strict.jld2;
+#                                  "<tag>" → results/paired_exa_strict_<tag>.jld2
+#                                  with checkpoint path + all knobs recorded)
 #
 # Usage:
 #   julia --project -t auto eval_paired_exa_strict.jl
@@ -74,6 +91,7 @@ using Statistics, Random
 using JLD2
 
 const SCRIPT_DIR = dirname(@__FILE__)
+include(joinpath(SCRIPT_DIR, "hydro_training_utils.jl"))   # parse_layers
 include(joinpath(SCRIPT_DIR, "hydro_power_data.jl"))
 include(joinpath(SCRIPT_DIR, "hydro_power_exa.jl"))
 include(joinpath(SCRIPT_DIR, "hydro_reachable_policy.jl"))
@@ -94,12 +112,42 @@ const MAIN_HPM_DIR = "/storage/scratch1/9/arosemberg3/DecisionRules.jl/examples/
 const REFERENCE_FILE = joinpath(
     MAIN_HPM_DIR, CASE_NAME, FORM_LABEL, "results", "paired_policy_reference.jld2"
 )
-const MODEL_PATH = joinpath(
+# Default checkpoint: the MAIN reference checkpoint against which the parity
+# gates below were designed. DR_CHECKPOINT overrides it with any other
+# checkpoint (MAIN- or EXA-trained).
+const DEFAULT_MODEL_PATH = joinpath(
     MAIN_HPM_DIR, CASE_NAME, FORM_LABEL, "models",
     "bolivia-ACPPowerModel-h126-r96-subproblems-strict-2026-07-01T09:41:53.026.jld2",
 )
+const MODEL_PATH = get(ENV, "DR_CHECKPOINT", DEFAULT_MODEL_PATH)
+# Checkpoint kind: "main" (DecisionRules.jl-trained; MAIN-reference parity
+# gates apply) or "exa" (train_hydro_exa_strict.jl-trained; the probe-parity
+# and open-loop-trajectory gates are SKIPPED because the reference probe
+# outputs / trajectories were produced by the specific reference checkpoint —
+# comparing independently trained weights against them is meaningless. The
+# inflow-indexing gate is policy-independent and is KEPT, and scenario inflow
+# values are still sourced from the reference JLD2 as authoritative data).
+const CHECKPOINT_KIND = lowercase(strip(get(ENV, "DR_CHECKPOINT_KIND", "main")))
+CHECKPOINT_KIND in ("main", "exa") ||
+    error("DR_CHECKPOINT_KIND must be \"main\" or \"exa\", got \"$CHECKPOINT_KIND\"")
+const MAIN_PARITY_GATES = CHECKPOINT_KIND == "main"
 
-const ENCODER_LAYERS = Int[128, 128]
+# Architecture knobs — parsed exactly as train_hydro_exa_strict.jl parses them
+# (including the DR_LAYERS legacy alias); they MUST match the checkpoint.
+const ENCODER_LAYERS = parse_layers(get(ENV, "DR_ENCODER_LAYERS", get(ENV, "DR_LAYERS", "128,128")))
+const HEAD_LAYERS    = parse_layers(get(ENV, "DR_HEAD_LAYERS", ""))
+
+# Output tag: "" keeps the historical filename results/paired_exa_strict.jld2;
+# a non-empty tag saves to results/paired_exa_strict_<tag>.jld2 so evaluating a
+# new checkpoint never clobbers the reference results.
+const OUTPUT_TAG = String(strip(get(ENV, "DR_OUTPUT_TAG", "")))
+const OUT_SUFFIX = isempty(OUTPUT_TAG) ? "" : "_$(OUTPUT_TAG)"
+# Record the new provenance knobs in the JLD2 whenever any of them was
+# explicitly set; with all of them unset the saved file keeps exactly the
+# historical key set (byte-identical default behavior).
+const RECORD_KNOBS = any(haskey.(Ref(ENV),
+    ("DR_CHECKPOINT", "DR_CHECKPOINT_KIND", "DR_ENCODER_LAYERS", "DR_LAYERS",
+     "DR_HEAD_LAYERS", "DR_OUTPUT_TAG")))
 # mof.json demand = 0.6 × PowerModels.json pd/qd (export_subproblem_mof.jl).
 const LOAD_SCALER = 0.6
 const NUM_DE_SCENARIOS = parse(Int, get(ENV, "DR_DE_SCENARIOS", "10"))
@@ -156,10 +204,15 @@ probe_out_ref = ref["probe_outputs"]        # [nHyd × 3]
 @assert size(inflow_ref) == (T_EVAL, nHyd, NUM_SCEN)
 @assert length(x0_ref) == nHyd
 
-# ── Build the EXA policy and load the SAME checkpoint ─────────────────────────
+# ── Build the EXA policy and load the requested checkpoint ────────────────────
+# Constructor call mirrors train_hydro_exa_strict.jl exactly (sigmoid activation
+# and Flux.LSTM encoder are the constructor defaults); combiner_layers must
+# match the checkpoint's head architecture.
 
 Random.seed!(42)
-policy = hydro_reachable_policy(hydro_data, ENCODER_LAYERS)
+policy = hydro_reachable_policy(hydro_data, ENCODER_LAYERS; combiner_layers = HEAD_LAYERS)
+@info "Policy built" encoder_layers = ENCODER_LAYERS head_layers = HEAD_LAYERS checkpoint_kind = CHECKPOINT_KIND
+isfile(MODEL_PATH) || error("Checkpoint not found: $MODEL_PATH (set DR_CHECKPOINT)")
 
 """
     load_main_checkpoint!(policy, model_state) -> String
@@ -182,7 +235,10 @@ returning a string describing which loading path succeeded.
 # Notes
 `load_stateconditioned_policy!` now includes the cell-by-cell MAIN-checkpoint
 fallback natively (`DecisionRulesExa._load_encoder_state!`), so the stock path
-is expected to SUCCEED and report `"stock"`. This wrapper's own cell-by-cell
+is expected to SUCCEED and report `"stock"`. EXA-trained checkpoints
+(train_hydro_exa_strict.jl saves `Flux.state(cpu(m))` of the same
+`HydroReachablePolicy` type, encoder stored as `Flux.LSTM` wrappers) also load
+through the stock path. This wrapper's own cell-by-cell
 branch is retained as belt-and-braces; reaching it would indicate a loader
 regression and is recorded in the output. The cell-by-cell path performs the
 mathematically identical weight injection: the wrapper's `cell` has exactly
@@ -233,19 +289,31 @@ gate["dev_upstream_max"] = _max_abs_dev(policy.upstream_max_inflow, ref["policy_
 @info "Metadata deviations" gate["dev_K"] gate["dev_min_vol"] gate["dev_max_vol"] gate["dev_min_turn"] gate["dev_max_turn"] gate["dev_upstream_max"]
 
 # (1) Probe parity: single policy calls from the reset state. Tests weight
-# loading independent of any recurrence-threading semantics.
-probe_out_exa = zeros(Float64, nHyd, 3)
-for p in 1:3
-    Flux.reset!(policy)          # REAL reset: each probe starts from initialstates
-    probe_out_exa[:, p] = Float64.(policy(probe_in[:, p]))
+# loading independent of any recurrence-threading semantics. ONLY meaningful
+# when evaluating the exact MAIN reference checkpoint the probe outputs were
+# generated from — SKIPPED for EXA-trained checkpoints.
+probe_out_exa = fill(NaN, nHyd, 3)
+if MAIN_PARITY_GATES
+    for p in 1:3
+        Flux.reset!(policy)      # REAL reset: each probe starts from initialstates
+        probe_out_exa[:, p] = Float64.(policy(probe_in[:, p]))
+    end
+    gate["probe_outputs_exa"] = probe_out_exa
+    gate["probe_max_dev"] = _max_abs_dev(probe_out_exa, probe_out_ref)
+    # Float32 tolerance: relative to the target scale (max_vol up to ~138).
+    probe_pass = gate["probe_max_dev"] <= 1e-5 * max(1.0, maximum(abs.(probe_out_ref)))
+    gate["probe_pass"] = probe_pass
+    println(probe_pass ? "GATE probe parity: PASS" : "GATE probe parity: FAIL",
+            "  (max abs dev = $(gate["probe_max_dev"]))")
+else
+    # The reference probe outputs are the REFERENCE checkpoint's responses;
+    # an independently trained EXA checkpoint has different weights, so a
+    # weight-parity comparison would fail by construction and prove nothing.
+    gate["probe_max_dev"] = NaN
+    gate["probe_pass"] = "skipped"
+    println("GATE probe parity: SKIPPED (DR_CHECKPOINT_KIND=exa — reference " *
+            "probe outputs only characterize the MAIN reference checkpoint)")
 end
-gate["probe_outputs_exa"] = probe_out_exa
-gate["probe_max_dev"] = _max_abs_dev(probe_out_exa, probe_out_ref)
-# Float32 tolerance: relative to the target scale (max_vol up to ~138).
-probe_pass = gate["probe_max_dev"] <= 1e-5 * max(1.0, maximum(abs.(probe_out_ref)))
-gate["probe_pass"] = probe_pass
-println(probe_pass ? "GATE probe parity: PASS" : "GATE probe parity: FAIL",
-        "  (max abs dev = $(gate["probe_max_dev"]))")
 
 # (2) Inflow reconstruction: rebuild w[t, r, s] from the EXA loader's
 # scenario_inflows and the reference scenario indices; compare against the
@@ -374,21 +442,37 @@ function open_loop_targets_threaded(policy, x0, w_mat)
     return out
 end
 
-w_s1 = inflow_ref[:, :, 1]                                   # scenario 1 inflows [T × nHyd]
-xhat_s1_ref = xhat_ref[:, :, 1]                              # MAIN open-loop trajectory
-xhat_s1_asis = open_loop_targets_asis(policy, x0_ref, w_s1)
-xhat_s1_threaded = open_loop_targets_threaded(policy, x0_ref, w_s1)
-gate["openloop_asis_max_dev"]     = _max_abs_dev(xhat_s1_asis, xhat_s1_ref)
-gate["openloop_threaded_max_dev"] = _max_abs_dev(xhat_s1_threaded, xhat_s1_ref)
-tol_traj = 1e-5 * max(1.0, maximum(abs.(xhat_s1_ref)))
-gate["openloop_asis_pass"]     = gate["openloop_asis_max_dev"] <= tol_traj
-gate["openloop_threaded_pass"] = gate["openloop_threaded_max_dev"] <= tol_traj
-println("GATE open-loop (EXA policy as-is):   ",
-        gate["openloop_asis_pass"] ? "PASS" : "FAIL",
-        "  (max abs dev = $(gate["openloop_asis_max_dev"]))")
-println("GATE open-loop (state-threaded diag): ",
-        gate["openloop_threaded_pass"] ? "PASS" : "FAIL",
-        "  (max abs dev = $(gate["openloop_threaded_max_dev"]))")
+if MAIN_PARITY_GATES
+    w_s1 = inflow_ref[:, :, 1]                               # scenario 1 inflows [T × nHyd]
+    xhat_s1_ref = xhat_ref[:, :, 1]                          # MAIN open-loop trajectory
+    global xhat_s1_asis = open_loop_targets_asis(policy, x0_ref, w_s1)
+    global xhat_s1_threaded = open_loop_targets_threaded(policy, x0_ref, w_s1)
+    gate["openloop_asis_max_dev"]     = _max_abs_dev(xhat_s1_asis, xhat_s1_ref)
+    gate["openloop_threaded_max_dev"] = _max_abs_dev(xhat_s1_threaded, xhat_s1_ref)
+    tol_traj = 1e-5 * max(1.0, maximum(abs.(xhat_s1_ref)))
+    gate["openloop_asis_pass"]     = gate["openloop_asis_max_dev"] <= tol_traj
+    gate["openloop_threaded_pass"] = gate["openloop_threaded_max_dev"] <= tol_traj
+    println("GATE open-loop (EXA policy as-is):   ",
+            gate["openloop_asis_pass"] ? "PASS" : "FAIL",
+            "  (max abs dev = $(gate["openloop_asis_max_dev"]))")
+    println("GATE open-loop (state-threaded diag): ",
+            gate["openloop_threaded_pass"] ? "PASS" : "FAIL",
+            "  (max abs dev = $(gate["openloop_threaded_max_dev"]))")
+else
+    # The reference open-loop trajectories (`xhat_trajectories`) were rolled
+    # out by the MAIN reference checkpoint; comparing an independently trained
+    # EXA checkpoint's trajectory against them is meaningless (its targets
+    # SHOULD differ). Its own open-loop targets are still saved via the DE
+    # leg's de_target_trajectories.
+    global xhat_s1_asis = zeros(Float64, 0, 0)
+    global xhat_s1_threaded = zeros(Float64, 0, 0)
+    gate["openloop_asis_max_dev"]     = NaN
+    gate["openloop_threaded_max_dev"] = NaN
+    gate["openloop_asis_pass"]     = "skipped"
+    gate["openloop_threaded_pass"] = "skipped"
+    println("GATE open-loop trajectories: SKIPPED (DR_CHECKPOINT_KIND=exa — " *
+            "reference trajectories only characterize the MAIN reference checkpoint)")
+end
 
 # ── Stage problem and callbacks (copied from train_hydro_exa_strict.jl) ───────
 # demand_matrix = nothing: the builder bakes in load_scaler × default demand for
@@ -702,8 +786,21 @@ end
 # ── Save everything ────────────────────────────────────────────────────────────
 out_dir = joinpath(SCRIPT_DIR, CASE_NAME, FORM_LABEL, "results")
 mkpath(out_dir)
-out_file = joinpath(out_dir, "paired_exa_strict.jld2")
+# DR_OUTPUT_TAG suffixes the filename so non-reference evaluations never
+# clobber the untagged reference results file.
+out_file = joinpath(out_dir, "paired_exa_strict$(OUT_SUFFIX).jld2")
+# Provenance knobs, recorded whenever any of the new env vars was set (the
+# all-defaults run keeps exactly the historical key set).
+knob_extras = RECORD_KNOBS ? (
+    checkpoint_path = MODEL_PATH,
+    checkpoint_kind = CHECKPOINT_KIND,
+    encoder_layers = ENCODER_LAYERS,
+    head_layers = HEAD_LAYERS,
+    output_tag = OUTPUT_TAG,
+    main_parity_gates_applied = MAIN_PARITY_GATES,
+) : (;)
 jldsave(out_file;
+    knob_extras...,
     # Gate results (policy parity, inflow indexing, metadata)
     gate_loader_mode = loader_mode,
     gate_probe_max_dev = gate["probe_max_dev"],
@@ -766,3 +863,83 @@ jldsave(out_file;
     num_de_scenarios = NUM_DE_SCENARIOS,
 )
 println("Saved: $out_file")
+
+# ── Final summary ─────────────────────────────────────────────────────────────
+
+"""
+    _split_csv_line(line) -> Vector{String}
+
+Split one CSV line into fields with minimal double-quote awareness: commas
+inside `"…"` do not delimit (needed for the MAIN header column
+`"TS-DDR (strict, paired)"`). No escape handling beyond quote toggling.
+"""
+function _split_csv_line(line::AbstractString)
+    fields = String[]                       # accumulated fields
+    buf = IOBuffer()                        # current field characters
+    inq = false                             # inside a quoted region?
+    for c in line
+        if c == '"'
+            inq = !inq                      # toggle quoting; quotes are dropped
+        elseif c == ',' && !inq
+            push!(fields, String(take!(buf)))  # unquoted comma ends the field
+        else
+            write(buf, c)
+        end
+    end
+    push!(fields, String(take!(buf)))       # trailing field
+    return fields
+end
+
+"""
+    _mean_csv_column(path, needle) -> Float64
+
+Mean of the numeric column whose header contains `needle` in the CSV at
+`path`:
+
+```math
+\\bar{c} = \\frac{1}{n} \\sum_{i=1}^{n} c_i
+```
+
+Returns `NaN` when the file is missing, the column is not found, or no row
+parses — the summary then simply reports `NaN` for that baseline.
+"""
+function _mean_csv_column(path::AbstractString, needle::AbstractString)
+    isfile(path) || return NaN                            # ground truth absent
+    lines = readlines(path)
+    length(lines) >= 2 || return NaN                      # header + ≥1 data row
+    header = _split_csv_line(lines[1])                    # quote-aware header parse
+    col = findfirst(h -> occursin(needle, h), header)     # column by substring
+    col === nothing && return NaN
+    vals = Float64[]
+    for ln in lines[2:end]
+        fs = split(ln, ',')                               # data rows are plain numeric
+        length(fs) == length(header) || continue          # skip malformed rows
+        v = tryparse(Float64, strip(fs[col]))
+        v === nothing || push!(vals, v)
+    end
+    return isempty(vals) ? NaN : mean(vals)
+end
+
+# Successful-scenario cost vectors for the two legs of THIS evaluation.
+ok_costs    = costs_stagewise[collect(scenario_ok)]
+de_ok_costs = de_costs[collect(de_ok)]
+
+# Untagged ground-truth baselines from the MAIN repo (comparability anchors):
+# the .026 reference checkpoint's stage-wise mean (results/paired_strict_rollout.jld2)
+# and the SDDP paired mean (SDDP-SOC column of paired_costs.csv). NaN if absent.
+main_gt_file = joinpath(MAIN_HPM_DIR, CASE_NAME, FORM_LABEL, "results", "paired_strict_rollout.jld2")
+main_gt_mean = isfile(main_gt_file) ? mean(Float64.(JLD2.load(main_gt_file, "costs"))) : NaN
+sddp_mean = _mean_csv_column(
+    joinpath(MAIN_HPM_DIR, CASE_NAME, FORM_LABEL, "paired_costs.csv"), "SDDP")
+
+println("\n" * "=" ^ 64)
+println("SUMMARY — paired EXA strict evaluation")
+println("  Checkpoint:          $MODEL_PATH")
+println("  Kind:                $CHECKPOINT_KIND  (encoder=$(ENCODER_LAYERS), head=$(HEAD_LAYERS))")
+println("  Output tag:          $(isempty(OUTPUT_TAG) ? "(none)" : OUTPUT_TAG)")
+println("  Stage-wise mean:     $(round(mean(ok_costs); digits=1))  over $(length(ok_costs))/$NUM_SCEN scenarios")
+println("  Stage-wise std:      $(round(std(ok_costs); digits=1))")
+println("  DE-leg mean:         $(round(mean(de_ok_costs); digits=1))  over $(length(de_ok_costs))/$NUM_DE_SCENARIOS scenarios")
+println("  MAIN .026 mean (GT): $(round(main_gt_mean; digits=1))")
+println("  SDDP mean (GT):      $(round(sddp_mean; digits=1))")
+println("=" ^ 64)
