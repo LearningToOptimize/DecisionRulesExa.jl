@@ -68,6 +68,7 @@
 #   julia --project -t auto train_hydro_exa_strict.jl
 
 using DecisionRulesExa
+using StableRNGs
 using ExaModels
 using Flux
 using Statistics, Random, Dates
@@ -489,8 +490,58 @@ const _max_vols_dev = USE_GPU ? CUDA.cu(_max_vols) : _max_vols
 
 hydro_objective_no_target_penalty(stage_prob, result) = result.objective
 
-Random.seed!(8789)
-eval_scenarios = [sample_scenario(hydro_data, T_ROLLOUT) for _ in 1:NUM_EVAL_SCENARIOS]
+# Held-out evaluation scenarios. Two modes:
+#
+# 1. DR_EVAL_PROTOCOL_IDS set (comma-separated column ids of the seeded paired
+#    protocol): the eval set is those exact columns of the 126×500 protocol
+#    matrix (StableRNG seed 20260706 — identical generation to the paired
+#    evaluation scripts). With the representative subset found by searching
+#    300k candidate subsets against 7 evaluated policies —
+#    ids 2,39,81,119,130,156,200,206,378,493 (subset seed 77142) — the
+#    10-scenario training-time evaluation tracks the full 500-scenario paired
+#    mean within ~75 cost units and preserves paired differences vs SDDP
+#    within ~35, so SaveBest selects on (a faithful proxy of) the deployment
+#    metric.
+# 2. Unset (historical): random draws from the inflow process, seed 8789.
+#    NOTE: arbitrary small draws carry offsets of hundreds-to-thousands of
+#    cost units vs the paired protocol; never compare their values across
+#    runs with different eval sets.
+const EVAL_PROTOCOL_IDS = let raw = strip(get(ENV, "DR_EVAL_PROTOCOL_IDS", ""))
+    isempty(raw) ? Int[] : [parse(Int, strip(x)) for x in split(raw, ",")]
+end
+
+"""
+    protocol_eval_scenario(hydro_data, T, protocol_indices, s) -> Vector{Float64}
+
+Flat `T × nHyd` inflow vector for paired-protocol scenario column `s`:
+stage `t` realizes joint inflow scenario `protocol_indices[t, s]`, with the
+cyclic raw-row mapping shared by every paired evaluation script.
+"""
+function protocol_eval_scenario(hydro_data::HydroData, T::Int, protocol_indices, s::Int)
+    nHyd = hydro_data.nHyd
+    w = Vector{Float64}(undef, T * nHyd)
+    for t in 1:T
+        t_row = mod1(t, hydro_data.nStagesSample)
+        j = protocol_indices[t, s]
+        for r in 1:nHyd
+            w[(t-1)*nHyd + r] = hydro_data.scenario_inflows[r][t_row, j]
+        end
+    end
+    return w
+end
+
+eval_scenarios = if isempty(EVAL_PROTOCOL_IDS)
+    Random.seed!(8789)
+    [sample_scenario(hydro_data, T_ROLLOUT) for _ in 1:NUM_EVAL_SCENARIOS]
+else
+    # Same fixed-shape generation as the paired protocol (126 rows × 500
+    # columns; see load_hydropowermodels.jl in the MAIN repo).
+    protocol_indices = rand(StableRNG(20260706), 1:hydro_data.nScenarios, 126, 500)
+    @assert T_ROLLOUT <= 126 && all(1 .<= EVAL_PROTOCOL_IDS .<= 500)
+    @assert length(EVAL_PROTOCOL_IDS) == NUM_EVAL_SCENARIOS "DR_NUM_EVAL_SCENARIOS must match the id count"
+    @info "Eval set = paired-protocol columns $(EVAL_PROTOCOL_IDS)"
+    [protocol_eval_scenario(hydro_data, T_ROLLOUT, protocol_indices, s) for s in EVAL_PROTOCOL_IDS]
+end
 rollout_evaluation = RolloutEvaluation(
     rollout_prob,
     x0_init,
