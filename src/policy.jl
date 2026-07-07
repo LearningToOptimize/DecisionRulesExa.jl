@@ -76,6 +76,92 @@ function MLPPolicy(input_dim::Int, output_dim::Int;
     return MLPPolicy(Flux.Chain(layers...), output_dim)
 end
 
+# ── ContextualPolicy ──────────────────────────────────────────────────────────
+
+"""
+    ContextualPolicy(policy, context)
+
+Wrap a stage policy so each call receives known exogenous context before the
+usual policy input.  The wrapped policy is called as
+`policy(vcat(context_at(context, t), input))`, with `t` advanced once per call
+and reset by `Flux.reset!`.
+
+This keeps training and rollout loops unchanged: they still pass `[w_t; x_prev]`
+to the policy, while the wrapper prepends known stage features such as seasonal
+phase or forecast covariates.  Only the inner policy is trainable.
+"""
+mutable struct ContextualPolicy{P,C}
+    policy::P
+    context::C
+    t::Int
+end
+
+ContextualPolicy(policy, context) = ContextualPolicy(policy, context, 0)
+
+Flux.@layer ContextualPolicy trainable=(policy,)
+
+"""
+    context_at(context, t)
+
+Return the context vector for one-based stage `t`.
+"""
+function context_at(context::AbstractMatrix, t::Integer)
+    1 <= t <= size(context, 2) ||
+        throw(BoundsError(context, (:, t)))
+    return view(context, :, t)
+end
+
+context_at(context::Function, t::Integer) = context(t)
+
+function (m::ContextualPolicy)(input)
+    m.t += 1
+    return m.policy(vcat(context_at(m.context, m.t), input))
+end
+
+function Flux.reset!(m::ContextualPolicy)
+    m.t = 0
+    Flux.reset!(m.policy)
+    return nothing
+end
+
+"""
+    stage_phase_context(T; period, include_progress=true)
+
+Build a `d x T` context matrix with `sin(2*pi*t/period)`,
+`cos(2*pi*t/period)`, and optionally normalized horizon progress `t/T`.
+The sine/cosine pair preserves cyclic adjacency between the last and first
+seasonal positions while using only two bounded input features.
+"""
+function stage_phase_context(T::Integer; period::Integer, include_progress::Bool=true)
+    T >= 1 || throw(ArgumentError("T must be positive"))
+    period >= 1 || throw(ArgumentError("period must be positive"))
+    nrows = include_progress ? 3 : 2
+    ctx = Matrix{Float32}(undef, nrows, T)
+    for t in 1:T
+        θ = 2f0 * Float32(pi) * Float32(t) / Float32(period)
+        ctx[1, t] = sin(θ)
+        ctx[2, t] = cos(θ)
+        if include_progress
+            ctx[3, t] = Float32(t) / Float32(T)
+        end
+    end
+    return ctx
+end
+
+"""
+    vcat_contexts(a, b, ...)
+
+Vertically concatenate context matrices after checking that they cover the
+same number of stages.
+"""
+function vcat_contexts(contexts::AbstractMatrix...)
+    isempty(contexts) && return Matrix{Float32}(undef, 0, 0)
+    T = size(first(contexts), 2)
+    all(size(c, 2) == T for c in contexts) ||
+        throw(ArgumentError("all contexts must have the same number of columns"))
+    return vcat(contexts...)
+end
+
 raw"""
     _dense_policy_head(input_dim, output_dim, hidden; activation=tanh)
 
@@ -452,6 +538,13 @@ function load_stateconditioned_policy!(policy::StateConditionedPolicy, state)
         Flux.reset!(policy)
         return policy
     end
+end
+
+function load_stateconditioned_policy!(policy::ContextualPolicy, state)
+    inner_state = hasproperty(state, :policy) ? getproperty(state, :policy) : state
+    load_stateconditioned_policy!(policy.policy, inner_state)
+    Flux.reset!(policy)
+    return policy
 end
 
 raw"""

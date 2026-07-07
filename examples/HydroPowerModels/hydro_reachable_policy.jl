@@ -54,6 +54,7 @@ mutable struct HydroReachablePolicy{E,C,RS,V,S,I}
     encoder::E
     combiner::C
     state::RS            # Encoder recurrent state, threaded across stages
+    n_context::Int       # Number of context dimensions prepended before inflow
     n_uncertainty::Int
     n_state::Int
     min_vol::V
@@ -270,17 +271,19 @@ Zygote.@nograd _cascade_upper_bounds
 Evaluate the reachable hydro policy.
 
 # Arguments
-- `input`: concatenated vector `[inflow_t; x_{t-1}]`.
+- `input`: concatenated vector `[context_t; inflow_t; x_{t-1}]`.
 
 # Returns
 - A reservoir target vector in the one-stage reachable set.
 
 # Notes
-The encoder reads only the inflow, threading its recurrent state across calls
-(one cell step per stage, stored in `policy.state` — DecisionRules.jl
-semantics). The combiner reads both encoded inflow and previous reservoir
-state, emits normalized targets, and those targets are mapped into the
-reachability interval before cascade clamping.
+The encoder reads `[context_t; inflow_t]`, threading its recurrent state across
+calls (one cell step per stage, stored in `policy.state` — DecisionRules.jl
+semantics). Reachability bounds and cascade clamps slice out only the true
+inflow entries, so prepended context never changes physical feasibility logic.
+The combiner reads both encoded inflow/context and previous reservoir state,
+emits normalized targets, and those targets are mapped into the reachability
+interval before cascade clamping.
 
 The cascade clamp inherits the assumptions documented on
 [`_cascade_upper_bounds`](@ref):
@@ -299,15 +302,24 @@ The cascade clamp inherits the assumptions documented on
   the stage is genuinely infeasible and no policy-level remedy exists.
 """
 function (m::HydroReachablePolicy)(input)
-    # Split input: first n_uncertainty elements are inflow, rest is previous state.
-    inflow = input[1:m.n_uncertainty]
-    x_prev = input[m.n_uncertainty+1:end]
+    # Split input: optional context first, then true inflow, then previous state.
+    # Physical reachability bounds must use only the true inflow slice.
+    c_end = m.n_context
+    w_start = c_end + 1
+    w_end = c_end + m.n_uncertainty
+    inflow = input[w_start:w_end]
+    x_prev = input[w_end+1:end]
+    encoder_input = if c_end == 0
+        inflow
+    else
+        vcat(input[1:c_end], inflow)
+    end
 
     # Encode inflow through the recurrent encoder, threading state across calls
     # (mirrors DecisionRules.jl: encoded, s_t = _step_encoder(enc, T.(w_t), s_{t-1})).
     # Cast to encoder precision for type stability (avoids Zygote codegen bugs).
     T = DecisionRulesExa._state_eltype(m.state)
-    h, new_state = DecisionRulesExa._step_encoder(m.encoder, T.(inflow), m.state)
+    h, new_state = DecisionRulesExa._step_encoder(m.encoder, T.(encoder_input), m.state)
     # Thread the recurrent state to the next call.
     m.state = new_state
 
@@ -387,15 +399,17 @@ function hydro_reachable_policy(
     encoder_type = Flux.LSTM,
     spill_max = nothing,
     combiner_layers = Int[],
+    n_context::Int = 0,
 )
     (activation === sigmoid || activation === NNlib.sigmoid || activation === NNlib.sigmoid_fast) ||
         throw(ArgumentError("hydro_reachable_policy requires a sigmoid-style activation so normalized targets stay in [0, 1]"))
     nHyd = hydro_data.nHyd
-    enc_sizes  = vcat(nHyd, layers)
+    n_context >= 0 || throw(ArgumentError("n_context must be nonnegative"))
+    enc_sizes  = vcat(nHyd + n_context, layers)
     enc_layers = [encoder_type(enc_sizes[i] => enc_sizes[i+1])
                   for i in 1:length(layers)]
     encoder  = Flux.Chain(enc_layers...)
-    encoder_width = isempty(layers) ? nHyd : layers[end]
+    encoder_width = isempty(layers) ? nHyd + n_context : layers[end]
     combiner = DecisionRulesExa._dense_policy_head(
         encoder_width + nHyd,
         nHyd,
@@ -432,7 +446,7 @@ function hydro_reachable_policy(
     return HydroReachablePolicy(
         encoder, combiner,
         DecisionRulesExa._init_recurrent_state(encoder),   # initial recurrent state
-        nHyd, nHyd,
+        n_context, nHyd, nHyd,
         Float32.([h.min_vol for h in hydro_data.units]),
         Float32.([h.max_vol for h in hydro_data.units]),
         Float32.([h.min_turn for h in hydro_data.units]),

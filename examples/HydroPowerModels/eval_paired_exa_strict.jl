@@ -76,6 +76,12 @@
 #                                  train_hydro_exa_strict.jl)
 #   DR_HEAD_LAYERS      = ""      (state-conditioned head hidden widths; must
 #                                  match checkpoint; "" → linear head)
+#   DR_CONTEXT          = ""      (""/"none", "phase", or "phase+progress";
+#                                  defaults to the reference file metadata
+#                                  when present)
+#   DR_CONTEXT_HORIZON  = "126"   (denominator/horizon used for progress
+#                                  context; defaults to reference metadata)
+#   DR_REFERENCE_FILE   = <path>  (paired_policy_reference*.jld2 from MAIN)
 #   DR_OUTPUT_TAG       = ""      ("" → save to results/paired_exa_strict.jld2;
 #                                  "<tag>" → results/paired_exa_strict_<tag>.jld2
 #                                  with checkpoint path + all knobs recorded)
@@ -109,9 +115,10 @@ const INFLOW_FILE = joinpath(CASE_DIR, "inflows.csv")
 
 # Absolute paths into the MAIN (DecisionRules.jl) repository.
 const MAIN_HPM_DIR = "/storage/scratch1/9/arosemberg3/DecisionRules.jl/examples/HydroPowerModels"
-const REFERENCE_FILE = joinpath(
+const DEFAULT_REFERENCE_FILE = joinpath(
     MAIN_HPM_DIR, CASE_NAME, FORM_LABEL, "results", "paired_policy_reference.jld2"
 )
+const REFERENCE_FILE = get(ENV, "DR_REFERENCE_FILE", DEFAULT_REFERENCE_FILE)
 # Default checkpoint: the MAIN reference checkpoint against which the parity
 # gates below were designed. DR_CHECKPOINT overrides it with any other
 # checkpoint (MAIN- or EXA-trained).
@@ -147,7 +154,8 @@ const OUT_SUFFIX = isempty(OUTPUT_TAG) ? "" : "_$(OUTPUT_TAG)"
 # historical key set (byte-identical default behavior).
 const RECORD_KNOBS = any(haskey.(Ref(ENV),
     ("DR_CHECKPOINT", "DR_CHECKPOINT_KIND", "DR_ENCODER_LAYERS", "DR_LAYERS",
-     "DR_HEAD_LAYERS", "DR_OUTPUT_TAG")))
+     "DR_HEAD_LAYERS", "DR_CONTEXT", "DR_CONTEXT_HORIZON", "DR_REFERENCE_FILE",
+     "DR_OUTPUT_TAG")))
 # mof.json demand = 0.6 × PowerModels.json pd/qd (export_subproblem_mof.jl).
 const LOAD_SCALER = 0.6
 const NUM_DE_SCENARIOS = parse(Int, get(ENV, "DR_DE_SCENARIOS", "10"))
@@ -204,14 +212,42 @@ probe_out_ref = ref["probe_outputs"]        # [nHyd × 3]
 @assert size(inflow_ref) == (T_EVAL, nHyd, NUM_SCEN)
 @assert length(x0_ref) == nHyd
 
+ref_string(key::AbstractString, default::AbstractString) =
+    haskey(ref, key) ? string(ref[key]) : default
+ref_int(key::AbstractString, default::Int) =
+    haskey(ref, key) ? Int(ref[key]) : default
+
+const CONTEXT_MODE = canonical_context_mode(
+    get(ENV, "DR_CONTEXT", ref_string("context_mode", ""))
+)
+const CONTEXT_PERIOD = ref_int("context_period", countlines(INFLOW_FILE))
+const CONTEXT_HORIZON = parse(
+    Int,
+    get(ENV, "DR_CONTEXT_HORIZON", string(ref_int("context_horizon", 126))),
+)
+CONTEXT_HORIZON >= T_EVAL ||
+    error("DR_CONTEXT_HORIZON=$CONTEXT_HORIZON must cover reference T_EVAL=$T_EVAL")
+const STAGE_CONTEXT = build_stage_context(CONTEXT_MODE, CONTEXT_HORIZON, CONTEXT_PERIOD)
+const N_CONTEXT = isnothing(STAGE_CONTEXT) ? 0 : size(STAGE_CONTEXT, 1)
+@info "Policy context" context_mode=(isempty(CONTEXT_MODE) ? "none" : CONTEXT_MODE) CONTEXT_PERIOD CONTEXT_HORIZON N_CONTEXT
+
 # ── Build the EXA policy and load the requested checkpoint ────────────────────
 # Constructor call mirrors train_hydro_exa_strict.jl exactly (sigmoid activation
 # and Flux.LSTM encoder are the constructor defaults); combiner_layers must
 # match the checkpoint's head architecture.
 
 Random.seed!(42)
-policy = hydro_reachable_policy(hydro_data, ENCODER_LAYERS; combiner_layers = HEAD_LAYERS)
-@info "Policy built" encoder_layers = ENCODER_LAYERS head_layers = HEAD_LAYERS checkpoint_kind = CHECKPOINT_KIND
+base_policy = hydro_reachable_policy(
+    hydro_data,
+    ENCODER_LAYERS;
+    combiner_layers = HEAD_LAYERS,
+    n_context = N_CONTEXT,
+)
+policy = isnothing(STAGE_CONTEXT) ? base_policy : ContextualPolicy(base_policy, STAGE_CONTEXT)
+policy_core(policy) = policy isa ContextualPolicy ? policy.policy : policy
+stage_encoder_input(policy, t::Int, w) =
+    policy isa ContextualPolicy ? vcat(Float32.(context_at(policy.context, t)), w) : w
+@info "Policy built" encoder_layers = ENCODER_LAYERS head_layers = HEAD_LAYERS checkpoint_kind = CHECKPOINT_KIND context_mode=(isempty(CONTEXT_MODE) ? "none" : CONTEXT_MODE)
 isfile(MODEL_PATH) || error("Checkpoint not found: $MODEL_PATH (set DR_CHECKPOINT)")
 
 """
@@ -250,15 +286,18 @@ function load_main_checkpoint!(policy, model_state)
         return "stock"
     catch err
         @warn "Stock EXA loader failed on the MAIN checkpoint (expected: MAIN saves bare LSTMCell states, EXA wraps cells in Flux.LSTM). Falling back to cell-by-cell injection." exception = err
-        enc_state = getproperty(model_state, :encoder)
+        core = policy_core(policy)
+        inner_state = hasproperty(model_state, :policy) ? getproperty(model_state, :policy) : model_state
+        enc_state = getproperty(inner_state, :encoder)
         layer_states = getproperty(enc_state, :layers)
-        length(layer_states) == length(policy.encoder.layers) ||
-            error("Encoder depth mismatch: checkpoint has $(length(layer_states)) layers, policy has $(length(policy.encoder.layers))")
-        for (layer, lstate) in zip(policy.encoder.layers, layer_states)
+        length(layer_states) == length(core.encoder.layers) ||
+            error("Encoder depth mismatch: checkpoint has $(length(layer_states)) layers, policy has $(length(core.encoder.layers))")
+        for (layer, lstate) in zip(core.encoder.layers, layer_states)
             # MAIN layer state keys (Wi, Wh, bias) match LSTMCell's fields.
             Flux.loadmodel!(layer.cell, lstate)
         end
-        Flux.loadmodel!(policy.combiner, getproperty(model_state, :combiner))
+        Flux.loadmodel!(core.combiner, getproperty(inner_state, :combiner))
+        Flux.reset!(policy)
         return "cell-by-cell"
     end
 end
@@ -278,14 +317,15 @@ of equal size.
 _max_abs_dev(a, b) = maximum(abs.(Float64.(a) .- Float64.(b)))
 
 gate = Dict{String, Any}("loader_mode" => loader_mode)
+core_policy = policy_core(policy)
 
 # (0) Frozen hydro-metadata parity: the bounds the two policies scale into.
-gate["dev_K"]            = abs(policy.K - Float64(ref["policy_K"]))
-gate["dev_min_vol"]      = _max_abs_dev(policy.min_vol,  ref["policy_min_vol"])
-gate["dev_max_vol"]      = _max_abs_dev(policy.max_vol,  ref["policy_max_vol"])
-gate["dev_min_turn"]     = _max_abs_dev(policy.min_turn, ref["policy_min_turn"])
-gate["dev_max_turn"]     = _max_abs_dev(policy.max_turn, ref["policy_max_turn"])
-gate["dev_upstream_max"] = _max_abs_dev(policy.upstream_max_inflow, ref["policy_upstream_max"])
+gate["dev_K"]            = abs(core_policy.K - Float64(ref["policy_K"]))
+gate["dev_min_vol"]      = _max_abs_dev(core_policy.min_vol,  ref["policy_min_vol"])
+gate["dev_max_vol"]      = _max_abs_dev(core_policy.max_vol,  ref["policy_max_vol"])
+gate["dev_min_turn"]     = _max_abs_dev(core_policy.min_turn, ref["policy_min_turn"])
+gate["dev_max_turn"]     = _max_abs_dev(core_policy.max_turn, ref["policy_max_turn"])
+gate["dev_upstream_max"] = _max_abs_dev(core_policy.upstream_max_inflow, ref["policy_upstream_max"])
 @info "Metadata deviations" gate["dev_K"] gate["dev_min_vol"] gate["dev_max_vol"] gate["dev_min_turn"] gate["dev_max_turn"] gate["dev_upstream_max"]
 
 # (1) Probe parity: single policy calls from the reset state. Tests weight
@@ -416,7 +456,8 @@ followed by the same cascade clamp as the EXA forward pass. Uses
 - `[T × nHyd]` matrix of open-loop targets under MAIN's recurrence semantics.
 """
 function open_loop_targets_threaded(policy, x0, w_mat)
-    cells = [layer.cell for layer in policy.encoder.layers]
+    core = policy_core(policy)
+    cells = [layer.cell for layer in core.encoder.layers]
     # Zero initial recurrent state per layer, as Flux.initialstates gives.
     states = Any[Flux.initialstates(c) for c in cells]
     T, nH = size(w_mat)
@@ -425,17 +466,17 @@ function open_loop_targets_threaded(policy, x0, w_mat)
     for t in 1:T
         w = Float32.(w_mat[t, :])
         # Thread the recurrent state layer by layer across stages.
-        h = w
+        h = stage_encoder_input(policy, t, w)
         for (i, c) in enumerate(cells)
             h, states[i] = c(h, states[i])
         end
         # Same head + reachable-bounds scaling + cascade clamp as the EXA
         # forward pass (these helpers come from hydro_reachable_policy.jl).
-        y = policy.combiner(vcat(h, prev))
-        lower, upper = _hydro_reachable_bounds(policy, w, prev, y)
+        y = core.combiner(vcat(h, prev))
+        lower, upper = _hydro_reachable_bounds(core, w, prev, y)
         raw = lower .+ (upper .- lower) .* y
-        target = isempty(policy.cascade) ? raw :
-                 min.(raw, _cascade_upper_bounds(policy, raw, w, prev))
+        target = isempty(core.cascade) ? raw :
+                 min.(raw, _cascade_upper_bounds(core, raw, w, prev))
         out[t, :] = Float64.(target)
         prev = Float32.(target)
     end
@@ -796,6 +837,10 @@ knob_extras = RECORD_KNOBS ? (
     checkpoint_kind = CHECKPOINT_KIND,
     encoder_layers = ENCODER_LAYERS,
     head_layers = HEAD_LAYERS,
+    context_mode = isempty(CONTEXT_MODE) ? "none" : CONTEXT_MODE,
+    context_period = CONTEXT_PERIOD,
+    context_horizon = CONTEXT_HORIZON,
+    n_context = N_CONTEXT,
     output_tag = OUTPUT_TAG,
     main_parity_gates_applied = MAIN_PARITY_GATES,
 ) : (;)
@@ -936,6 +981,8 @@ println("\n" * "=" ^ 64)
 println("SUMMARY — paired EXA strict evaluation")
 println("  Checkpoint:          $MODEL_PATH")
 println("  Kind:                $CHECKPOINT_KIND  (encoder=$(ENCODER_LAYERS), head=$(HEAD_LAYERS))")
+println("  Context:             $(isempty(CONTEXT_MODE) ? "none" : CONTEXT_MODE)  (period=$CONTEXT_PERIOD, horizon=$CONTEXT_HORIZON)")
+println("  Reference:           $REFERENCE_FILE")
 println("  Output tag:          $(isempty(OUTPUT_TAG) ? "(none)" : OUTPUT_TAG)")
 println("  Stage-wise mean:     $(round(mean(ok_costs); digits=1))  over $(length(ok_costs))/$NUM_SCEN scenarios")
 println("  Stage-wise std:      $(round(std(ok_costs); digits=1))")

@@ -71,6 +71,10 @@ export
     # Policies
     MLPPolicy,
     StateConditionedPolicy,
+    ContextualPolicy,
+    context_at,
+    stage_phase_context,
+    vcat_contexts,
     ConstantStatePolicy,
     FixedOutputPolicy,
     bounded_state_policy,
