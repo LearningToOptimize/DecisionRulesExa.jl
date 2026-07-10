@@ -956,6 +956,8 @@ function train_tsddr(
     external_critic_samples  = nothing,
     batch_diagnostics        = (iter, stats) -> nothing,
     reuse_solver::Bool       = false,
+    worker_devices           = nothing,
+    worker_problem_builder   = nothing,
 )
     T    = det_equivalent.horizon
     F    = eltype(initial_state)
@@ -978,15 +980,35 @@ function train_tsddr(
     )
 
     # ── Build worker pool ────────────────────────────────────────────────────
-    if problem_pool === nothing
-        _pool = [(det_equivalent, p_x0, p_target, p_uncertainty)]
+    # Two modes:
+    #  - `worker_problem_builder === nothing` (default): the caller supplies a
+    #    `problem_pool` of already-built DEs (single-device / CPU).
+    #  - `worker_problem_builder = (wi) -> (de, p_x0, p_target, p_uncertainty)`:
+    #    each worker builds its OWN DE INSIDE its task, after binding its GPU.
+    #    Required for multi-GPU: a DE built in the main task and solved from a
+    #    worker task deadlocks on the first cross-task solve (CUDSS/stream/event
+    #    ownership); building in-task keeps DE, solver, stream and events in one
+    #    task/device context. nworkers then comes from `worker_devices`.
+    _build_in_worker = worker_problem_builder !== nothing
+    if _build_in_worker
+        worker_devices !== nothing ||
+            throw(ArgumentError("worker_problem_builder requires worker_devices"))
+        _pool = nothing
+        nworkers = length(worker_devices)
     else
-        _pool = problem_pool
+        _pool = problem_pool === nothing ?
+            [(det_equivalent, p_x0, p_target, p_uncertainty)] : problem_pool
+        nworkers = length(_pool)
+        if worker_devices !== nothing
+            length(worker_devices) == nworkers ||
+                throw(ArgumentError("worker_devices has length $(length(worker_devices)) but there are $nworkers workers"))
+        end
     end
-    nworkers = length(_pool)
+    _worker_device(wi) = worker_devices === nothing ? nothing : worker_devices[wi]
 
     # Single-worker: create solver on main task (no threading needed)
-    single_state = nworkers == 1 ? _make_solver(_pool[1][1].model, madnlp_kwargs) : nothing
+    single_state = (nworkers == 1 && !_build_in_worker) ?
+        _make_solver(_pool[1][1].model, madnlp_kwargs) : nothing
     if reuse_solver && single_state !== nothing
         single_state.has_fixed_vars = false
     end
@@ -999,12 +1021,35 @@ function train_tsddr(
     worker_tasks = Task[]
     if nworkers > 1
         for wi in 1:nworkers
-            (de, px, pt, pu) = _pool[wi]
+            _pooled = _build_in_worker ? nothing : _pool[wi]
+            _builder = worker_problem_builder
             in_ch  = in_channels[wi]
             out_ch = out_channels[wi]
             _reuse_solver = reuse_solver
-            t = Threads.@spawn begin
+            _dev = _worker_device(wi)
+            _wi = wi
+            t = Threads.@spawn try
+                # Bind this worker to its GPU (multi-GPU). Must precede DE/solver
+                # creation so CUDA handles + all CuArray ops on this task target
+                # `_dev`. Diagnostics go to stderr (flushed) so a hang is
+                # localizable in the SLURM log even under the WandbLogger.
+                # The whole body runs under try/catch: a Threads.@spawn task that
+                # throws dies SILENTLY (exceptions surface only on wait/fetch), so
+                # without this the main task blocks forever on take!(out_ch) — the
+                # exact multi-GPU "hang" signature. On error we report loudly and
+                # close out_ch so the main loop fails fast instead of deadlocking.
+                println(stderr, "[worker $_wi] task started (dev=$_dev, thread=$(Threads.threadid()))"); flush(stderr)
+                if _dev !== nothing
+                    CUDA.device!(_dev)
+                    println(stderr, "[worker $_wi] bound to CUDA device $_dev (current=$(CUDA.device()))"); flush(stderr)
+                end
+                # Build the DE IN-TASK for multi-GPU (see _build_in_worker note):
+                # a main-task-built DE deadlocks on the first cross-task solve.
+                (de, px, pt, pu) = _builder === nothing ? _pooled : _builder(_wi)
+                _builder === nothing ||
+                    (println(stderr, "[worker $_wi] DE built in-task on device $_dev"); flush(stderr))
                 st = _make_solver(de.model, madnlp_kwargs)
+                _dev === nothing || (println(stderr, "[worker $_wi] solver ready on device $_dev"); flush(stderr))
                 if _reuse_solver
                     st.has_fixed_vars = false
                 end
@@ -1012,6 +1057,18 @@ function train_tsddr(
                     msg = take!(in_ch)
                     msg === nothing && break
                     (s_idx, init_state, w_flat, xhat_flat) = msg
+                    # Multi-GPU: the main task marshals msg arrays through CPU;
+                    # upload them to THIS worker's device for the solve, but keep
+                    # the CPU w for the reply below — anything sent back must be
+                    # device-neutral (CPU), because the main task consumes it in
+                    # the device-0 gradient (a device-N CuArray there is the
+                    # CUDA-700 illegal access localized by job 10910905).
+                    w_reply = w_flat
+                    if _dev !== nothing
+                        init_state = CUDA.cu(init_state)
+                        w_flat = CUDA.cu(w_flat)
+                        xhat_flat = CUDA.cu(xhat_flat)
+                    end
                     ExaModels.set_parameter!(de.core, px, init_state)
                     ExaModels.set_parameter!(de.core, pu, w_flat)
                     ExaModels.set_parameter!(de.core, pt, Float64.(xhat_flat))
@@ -1033,7 +1090,9 @@ function train_tsddr(
                         # were tested above); only the multipliers remain to check.
                         λ = target_multipliers(de, result)
                         if all(isfinite, λ)
-                            put!(out_ch, (s_idx, F.(w_flat), _adapt_array(F.(λ), w_flat),
+                            # Reply with the CPU w (same types the single-GPU
+                            # worker path produces); λ adapts to it → CPU too.
+                            put!(out_ch, (s_idx, F.(w_reply), _adapt_array(F.(λ), w_reply),
                                           result.objective, result.status, nothing, retried))
                             continue
                         end
@@ -1041,6 +1100,12 @@ function train_tsddr(
                     end
                     put!(out_ch, (s_idx, nothing, nothing, NaN, result.status, failure, retried))
                 end
+            catch err
+                # Loud failure + closed channel: the main task's take!(out_ch)
+                # throws immediately instead of blocking forever on a dead worker.
+                println(stderr, "[worker $_wi] FATAL: "); showerror(stderr, err, catch_backtrace()); println(stderr); flush(stderr)
+                close(out_ch)
+                rethrow()
             end
             push!(worker_tasks, t)
         end
@@ -1132,7 +1197,15 @@ function train_tsddr(
                 for s in round_start:round_end
                     wi = s - round_start + 1
                     w_flat, xhat_flat = sample_data[s]
-                    put!(in_channels[wi], (s, initial_state, w_flat, xhat_flat))
+                    if worker_devices === nothing
+                        put!(in_channels[wi], (s, initial_state, w_flat, xhat_flat))
+                    else
+                        # Multi-GPU workers run with different current devices.
+                        # Never send a CuArray allocated on device 0 to a worker
+                        # bound to device 1/2; materialize through CPU and let
+                        # the worker copy onto its own device.
+                        put!(in_channels[wi], (s, Array(initial_state), Array(w_flat), Array(xhat_flat)))
+                    end
                 end
                 for wi in 1:round_size
                     msg = take!(out_channels[wi])
@@ -1149,7 +1222,15 @@ function train_tsddr(
                         (s_idx, w_out, λ_out, obj_out) = msg
                     end
                     if w_out !== nothing
-                        solve_ok[s_idx] = (w_out, λ_out, obj_out)
+                        # Workers reply device-neutral (CPU) arrays; the actor
+                        # gradient below mixes them with `initial_state`-device
+                        # arrays (vcat/broadcast), so land them on that device
+                        # here — the exact analogue of the single-worker path's
+                        # `_adapt_array(F.(λ), initial_state)`. No-op when the
+                        # types already match (single-GPU pool replies GPU w).
+                        solve_ok[s_idx] = (_adapt_array(w_out, initial_state),
+                                           _adapt_array(λ_out, initial_state),
+                                           obj_out)
                     end
                 end
             end

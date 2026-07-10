@@ -33,6 +33,7 @@ module DecisionRulesExa
 
 using ExaModels
 using MadNLP
+using CUDA
 using NLPModels
 using LinearAlgebra
 using Random

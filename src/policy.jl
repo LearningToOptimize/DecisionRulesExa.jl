@@ -312,7 +312,7 @@ states) this recurses into the first element until it reaches an
 to the encoder's precision before each step.
 """
 _state_eltype(state::Tuple) = _state_eltype(first(state))
-_state_eltype(v::AbstractVector) = eltype(v)
+_state_eltype(v::AbstractArray) = eltype(v)   # AbstractArray (not just Vector) so batched matrix states work
 
 """
     StateConditionedPolicy{E,C,S}

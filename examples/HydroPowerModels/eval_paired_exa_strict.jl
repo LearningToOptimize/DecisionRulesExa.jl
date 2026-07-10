@@ -155,7 +155,7 @@ const OUT_SUFFIX = isempty(OUTPUT_TAG) ? "" : "_$(OUTPUT_TAG)"
 const RECORD_KNOBS = any(haskey.(Ref(ENV),
     ("DR_CHECKPOINT", "DR_CHECKPOINT_KIND", "DR_ENCODER_LAYERS", "DR_LAYERS",
      "DR_HEAD_LAYERS", "DR_CONTEXT", "DR_CONTEXT_HORIZON", "DR_REFERENCE_FILE",
-     "DR_OUTPUT_TAG")))
+     "DR_OUTPUT_TAG", "DR_SNAP_EPS", "DR_ACTIVATION")))
 # mof.json demand = 0.6 × PowerModels.json pd/qd (export_subproblem_mof.jl).
 const LOAD_SCALER = 0.6
 const NUM_DE_SCENARIOS = parse(Int, get(ENV, "DR_DE_SCENARIOS", "10"))
@@ -236,10 +236,28 @@ const N_CONTEXT = isnothing(STAGE_CONTEXT) ? 0 : size(STAGE_CONTEXT, 1)
 # and Flux.LSTM encoder are the constructor defaults); combiner_layers must
 # match the checkpoint's head architecture.
 
+# Target-head activation must match the checkpoint's training activation
+# (DR_ACTIVATION, same values as the trainer: sigmoid|hardsigmoid|stretched).
+const ACTIVATION = let raw = lowercase(strip(get(ENV, "DR_ACTIVATION", "sigmoid")))
+    raw in ("", "sigmoid") ? Flux.NNlib.sigmoid :
+    raw == "hardsigmoid"   ? hardsigmoidsafe :
+    raw == "stretched"     ? stretchedsigmoid :
+    error("DR_ACTIVATION must be sigmoid, hardsigmoid, or stretched; got $raw")
+end
+# Diagnostic eval-time snap-to-boundary for sigmoid-trained checkpoints
+# (DR_SNAP_EPS > 0): normalized targets within ε of 0/1 become exact boundary
+# points — measures the cost of sigmoid's asymptotic boundary gap without any
+# retraining. See TARGET_SNAP_EPS in hydro_reachable_policy.jl.
+const SNAP_EPS = parse(Float32, get(ENV, "DR_SNAP_EPS", "0"))
+0 <= SNAP_EPS < 0.5f0 || error("DR_SNAP_EPS must be in [0, 0.5); got $SNAP_EPS")
+TARGET_SNAP_EPS[] = SNAP_EPS
+SNAP_EPS > 0 && @info "Eval-time snap-to-boundary ACTIVE" SNAP_EPS
+
 Random.seed!(42)
 base_policy = hydro_reachable_policy(
     hydro_data,
     ENCODER_LAYERS;
+    activation = ACTIVATION,
     combiner_layers = HEAD_LAYERS,
     n_context = N_CONTEXT,
 )
@@ -984,6 +1002,7 @@ println("  Kind:                $CHECKPOINT_KIND  (encoder=$(ENCODER_LAYERS), he
 println("  Context:             $(isempty(CONTEXT_MODE) ? "none" : CONTEXT_MODE)  (period=$CONTEXT_PERIOD, horizon=$CONTEXT_HORIZON)")
 println("  Reference:           $REFERENCE_FILE")
 println("  Output tag:          $(isempty(OUTPUT_TAG) ? "(none)" : OUTPUT_TAG)")
+println("  Activation:          $(ACTIVATION)  snap_eps=$(SNAP_EPS)")
 println("  Stage-wise mean:     $(round(mean(ok_costs); digits=1))  over $(length(ok_costs))/$NUM_SCEN scenarios")
 println("  Stage-wise std:      $(round(std(ok_costs); digits=1))")
 println("  DE-leg mean:         $(round(mean(de_ok_costs); digits=1))  over $(length(de_ok_costs))/$NUM_DE_SCENARIOS scenarios")

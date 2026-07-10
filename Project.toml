@@ -30,7 +30,7 @@ JSON = "1.6.1"
 MadNLP = "0.10"
 MadNLPGPU = "0.10"
 NLPModels = "0.21"
-Tables = "1.13.0"
+Tables = "1.12.1"
 Zygote = "0.7"
 julia = "1.10, 1.11, 1.12"
 

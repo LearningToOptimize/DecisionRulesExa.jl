@@ -72,7 +72,7 @@ using StableRNGs
 using ExaModels
 using Flux
 using Statistics, Random, Dates
-using Wandb, Logging
+using Logging   # Wandb loaded conditionally below (DR_ENABLE_WANDB) — see note at ENABLE_WANDB
 using JLD2
 using MadNLP
 using MadNLPGPU, KernelAbstractions, CUDA
@@ -175,7 +175,16 @@ end
 
 const ENCODER_LAYERS = parse_layers(get(ENV, "DR_ENCODER_LAYERS", get(ENV, "DR_LAYERS", "128,128")))
 const HEAD_LAYERS    = parse_layers(get(ENV, "DR_HEAD_LAYERS", ""))
-const ACTIVATION  = sigmoid
+# Target-head activation. "sigmoid" is the historical default; it cannot
+# exactly attain reachable-interval boundaries (where SDDP places ~24% of its
+# realized states), so boundary-attaining alternatives are available:
+#   DR_ACTIVATION = "sigmoid" | "hardsigmoid" | "stretched"
+const ACTIVATION = let raw = lowercase(strip(get(ENV, "DR_ACTIVATION", "sigmoid")))
+    raw in ("", "sigmoid") ? sigmoid :
+    raw == "hardsigmoid"   ? hardsigmoidsafe :
+    raw == "stretched"     ? stretchedsigmoid :
+    throw(ArgumentError("DR_ACTIVATION must be sigmoid, hardsigmoid, or stretched; got $raw"))
+end
 const NUM_STAGES  = parse(Int, get(ENV, "DR_NUM_STAGES", "126"))
 const NUM_ROLLOUT_STAGES = parse(Int, get(ENV, "DR_NUM_ROLLOUT_STAGES", "96"))
 const NUM_EPOCHS  = parse(Int, get(ENV, "DR_NUM_EPOCHS", "80"))
@@ -196,6 +205,10 @@ const EVAL_EVERY  = parse(Int, get(ENV, "DR_EVAL_EVERY", "50"))
 const SAVE_METRIC = lowercase(strip(get(ENV, "DR_SAVE_METRIC", "training")))
 SAVE_METRIC in ("training", "rollout") ||
     throw(ArgumentError("DR_SAVE_METRIC must be training or rollout; got $SAVE_METRIC"))
+const ENABLE_WANDB = parse(Bool, get(ENV, "DR_ENABLE_WANDB", "true"))
+# Load Wandb (PythonCall/CondaPkg) ONLY when enabled. With W&B off this avoids the
+# CondaPkg "Downloading artifact: pixi" hang on compute nodes with no/slow internet.
+ENABLE_WANDB && @eval using Wandb
 const LR          = parse(Float32, get(ENV, "DR_LR", "0.001"))
 const LR_FINAL    = parse(Float32, get(ENV, "DR_LR_FINAL", string(LR)))
 const LR_WARMUP   = parse(Int, get(ENV, "DR_LR_WARMUP", "0"))
@@ -210,7 +223,19 @@ const HYDRO_TARGET_PENALTY_MULT = 8.0
 const DEFICIT_COST   = 1e5
 const USE_GPU        = true
 const load_scaler    = 0.6
-const NUM_WORKERS    = 1
+# Parallel-sample training: solve the `num_train_per_batch` per-gradient DEs
+# across worker threads, each with its own MadNLP solver bound to its own CUDA
+# stream (see train_tsddr! in src/training.jl). Requires JULIA_NUM_THREADS >=
+# DR_NUM_WORKERS. Default 1 = historical sequential path (byte-identical).
+const NUM_WORKERS    = let n = parse(Int, get(ENV, "DR_NUM_WORKERS", "1"))
+    n >= 1 || throw(ArgumentError("DR_NUM_WORKERS must be >= 1"))
+    if n > Threads.nthreads()
+        @warn "DR_NUM_WORKERS=$n exceeds JULIA_NUM_THREADS=$(Threads.nthreads()); capping"
+        Threads.nthreads()
+    else
+        n
+    end
+end
 
 const ROLLOUT_PARALLEL = parse(Bool, get(ENV, "DR_ROLLOUT_PARALLEL", "false"))
 
@@ -230,10 +255,19 @@ const _WARM_TAG  = HAS_PRETRAINED ? "-warm" : ""
 const _RQ_TAG    = REACTIVE_DEFICIT_COST === nothing ? "" :
                    isinf(Float64(REACTIVE_DEFICIT_COST)) ? "-rqhard" :
                    "-rq$(value_tag(REACTIVE_DEFICIT_COST))"
-const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-deteq-strict-gpu$(_CLIP_TAG)$(_ENC_TAG)$(_HEAD_TAG)$(_NT_TAG)$(_CTX_TAG)$(_EV_TAG)$(_SAVE_TAG)$(_WARM_TAG)$(_RQ_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
+const _ACT_TAG   = ACTIVATION === sigmoid ? "" :
+                   ACTIVATION === stretchedsigmoid ? "-actstretch" : "-acthardsig"
+const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-deteq-strict-gpu$(_CLIP_TAG)$(_ENC_TAG)$(_HEAD_TAG)$(_NT_TAG)$(_CTX_TAG)$(_EV_TAG)$(_SAVE_TAG)$(_WARM_TAG)$(_RQ_TAG)$(_ACT_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
 const MODEL_DIR = joinpath(CASE_DIR, FORM_LABEL, "models")
 mkpath(MODEL_DIR)
 const MODEL_PATH = joinpath(MODEL_DIR, RUN_NAME * ".jld2")
+# Crash-safety: independent of SaveBest (which only writes on improvement), the
+# LATEST policy is checkpointed every DR_SAVE_LATEST_EVERY gradient steps to a
+# separate "<run>_latest.jld2" file (overwritten each time). A crash then loses
+# at most that many steps, regardless of whether the run had improved. Set to 0
+# to disable. Default 25 keeps every expensive multi-worker run recoverable.
+const SAVE_LATEST_EVERY = parse(Int, get(ENV, "DR_SAVE_LATEST_EVERY", "25"))
+const LATEST_PATH = joinpath(MODEL_DIR, RUN_NAME * "_latest.jld2")
 const TOTAL_ITERS = NUM_EPOCHS * NUM_BATCHES
 
 function lr_schedule(iter::Int, total_iters::Int)
@@ -289,16 +323,55 @@ function _build_de()
     )
 end
 
-@info "Building strict $(T)-stage ExaModels DE (formulation=$FORMULATION)..."
-prob = _build_de()
+# Multi-GPU device assignment for the worker pool. With USE_GPU, distribute the
+# NUM_WORKERS solver DEs round-robin across the visible CUDA devices (SLURM sets
+# CUDA_VISIBLE_DEVICES, so ndevices() = the GPUs this job was granted). Worker wi
+# runs on device WORKER_DEVICES[wi], and its DE is BUILT on that device below so
+# the DE arrays and the worker's solver live together. Single GPU or CPU → all
+# zeros / nothing (unchanged behavior). Set DR_NUM_WORKERS = workers_per_gpu ×
+# n_gpus (e.g. 9 on a 3-GPU job packs 3 workers/GPU).
+const N_GPU = USE_GPU ? CUDA.ndevices() : 0
+const WORKER_DEVICES = (USE_GPU && N_GPU > 1) ?
+    [(i - 1) % N_GPU for i in 1:NUM_WORKERS] : nothing
+WORKER_DEVICES === nothing || @info "Multi-GPU worker→device map" N_GPU WORKER_DEVICES
 
-@info "Building $(NUM_WORKERS)-worker problem pool..."
-problem_pool = [(prob, prob.p_x0, prob.p_target, prob.p_inflow)]
-for i in 2:NUM_WORKERS
-    p = _build_de()
-    push!(problem_pool, (p, p.p_x0, p.p_target, p.p_inflow))
+# Build a DE on a specific CUDA device (arrays allocate on the active device).
+# Diagnostics to stderr (flushed) so a hang in the multi-GPU pool build is
+# localizable in the SLURM log.
+function _build_de_on(dev, i)
+    if dev === nothing
+        return _build_de()
+    end
+    println(stderr, "[pool $i] building DE on CUDA device $dev ..."); flush(stderr)
+    CUDA.device!(dev)
+    de = _build_de()
+    println(stderr, "[pool $i] DE ready on device $dev (current=$(CUDA.device()))"); flush(stderr)
+    return de
 end
-@info "  Pool ready: $(NUM_WORKERS) independent strict DE instances on GPU"
+
+@info "Building strict $(T)-stage ExaModels DE (formulation=$FORMULATION)..."
+prob = _build_de()   # metadata DE on the default device (device 0)
+
+# Multi-GPU: workers build their OWN DE in-task (a main-task-built DE deadlocks
+# on the first cross-task solve). `worker_de_builder(wi)` runs inside worker
+# `wi`'s task AFTER it has bound its device, so the DE lands on the right GPU.
+# Single-GPU / CPU: fall back to the pre-built pool (all on device 0).
+worker_de_builder = nothing
+problem_pool = nothing
+if WORKER_DEVICES !== nothing
+    worker_de_builder = function (wi)
+        de = _build_de()   # current device is set by the worker's CUDA.device!
+        (de, de.p_x0, de.p_target, de.p_inflow)
+    end
+    @info "  Multi-GPU: each of $NUM_WORKERS workers builds its DE in-task" n_gpu=N_GPU
+else
+    problem_pool = [(prob, prob.p_x0, prob.p_target, prob.p_inflow)]
+    for _ in 2:NUM_WORKERS
+        p = _build_de()
+        push!(problem_pool, (p, p.p_x0, p.p_target, p.p_inflow))
+    end
+    @info "  Pool ready: $(NUM_WORKERS) DE instances on the default device"
+end
 
 x0_init = Float32.([clamp(hydro_data.initial_volumes[r],
                            hydro_data.units[r].min_vol,
@@ -401,7 +474,7 @@ end
 
 # ── W&B logging ───────────────────────────────────────────────────────────────
 
-lg = WandbLogger(
+lg = ENABLE_WANDB ? WandbLogger(
     project = "RL",
     name    = RUN_NAME,
     save_code = false,
@@ -441,7 +514,8 @@ lg = WandbLogger(
         "policy_type"     => N_CONTEXT == 0 ? "HydroReachablePolicy" : "ContextualPolicy{HydroReachablePolicy}",
         "num_workers"     => NUM_WORKERS,
     ),
-)
+) : nothing
+ENABLE_WANDB || @info "W&B disabled (DR_ENABLE_WANDB=false)"
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
@@ -542,6 +616,26 @@ else
     @info "Eval set = paired-protocol columns $(EVAL_PROTOCOL_IDS)"
     [protocol_eval_scenario(hydro_data, T_ROLLOUT, protocol_indices, s) for s in EVAL_PROTOCOL_IDS]
 end
+# ── Training sampler ──────────────────────────────────────────────────────────
+# Default: fresh random inflow draws (genuine SAA). When DR_TRAIN_PROTOCOL_ALL
+# is set, the sampler instead cycles deterministically through the exact 500
+# paired-protocol columns (StableRNG(20260706), full T stages). With
+# num_train_per_batch=500 and num_batches a multiple of 1, every gradient step
+# is a full-batch step over ALL 500 evaluation scenarios — the "cheating" upper
+# bound: can gradient descent directly on the test set beat SDDP? If it can't,
+# the policy class is the wall.
+const TRAIN_PROTOCOL_ALL = lowercase(strip(get(ENV, "DR_TRAIN_PROTOCOL_ALL", ""))) in ("1", "true", "yes")
+train_sampler = if TRAIN_PROTOCOL_ALL
+    train_protocol_indices = rand(StableRNG(20260706), 1:hydro_data.nScenarios, 126, 500)
+    @assert T <= 126
+    protocol_cols = [protocol_eval_scenario(hydro_data, T, train_protocol_indices, s) for s in 1:500]
+    @info "TRAINING on the exact 500 paired-protocol scenarios (cheating upper-bound test)" NUM_TRAIN_PER_BATCH
+    cyc = Ref(0)
+    () -> (cyc[] = cyc[] % 500 + 1; protocol_cols[cyc[]])
+else
+    () -> sample_scenario(hydro_data, T)
+end
+
 rollout_evaluation = RolloutEvaluation(
     rollout_prob,
     x0_init,
@@ -561,14 +655,72 @@ rollout_evaluation = RolloutEvaluation(
     state_bounds = (_min_vols_dev, _max_vols_dev),
 )
 
+# ── Two-stage SaveBest verification (guards against overfitting the fixed eval
+# set). The fixed rep-10 eval is cheap but a policy can overfit to those exact
+# 10 scenarios, so SaveBest-on-10 may select an overfit iterate. When
+# DR_VERIFY_SCENARIOS > 0, a checkpoint that beats the best on the fixed set is
+# only ACCEPTED if it also beats the incumbent best on N FRESHLY-sampled random
+# scenarios — re-drawn every trigger, so a policy cannot overfit to them. The
+# incumbent is re-evaluated on the SAME fresh draw for a paired comparison.
+const VERIFY_SCENARIOS = parse(Int, get(ENV, "DR_VERIFY_SCENARIOS", "0"))
+verify_evaluation = if VERIFY_SCENARIOS > 0 && SAVE_METRIC == "rollout"
+    @info "Two-stage SaveBest: verify accepts on $VERIFY_SCENARIOS fresh random scenarios"
+    RolloutEvaluation(
+        _build_rollout_de(), x0_init,
+        [sample_scenario(hydro_data, T_ROLLOUT) for _ in 1:VERIFY_SCENARIOS];
+        horizon = T_ROLLOUT, n_uncertainty = nHyd,
+        set_stage_parameters! = set_hydro_rollout_stage!,
+        realized_state = hydro_realized_state,
+        objective_no_target_penalty = hydro_objective_no_target_penalty,
+        madnlp_kwargs = SOLVER_KWARGS, warmstart = false, stride = 1,
+        policy_state = :realized, stage_problem_pool = [], retry_on_failure = true,
+        active_scenarios = VERIFY_SCENARIOS,
+        state_bounds = (_min_vols_dev, _max_vols_dev),
+    )
+else
+    nothing
+end
+best_verify_snapshot = Ref{Any}(nothing)   # deepcopy of the accepted-best policy
+
+# Accept `model` as the new best? With verification off, the rep-10 gate that
+# already fired is sufficient (return true). With it on, draw fresh scenarios
+# and require `model` to beat the incumbent snapshot on them (all must solve).
+function verified_improvement(model)
+    verify_evaluation === nothing && return true
+    verify_evaluation.scenarios =
+        [sample_scenario(hydro_data, T_ROLLOUT) for _ in 1:VERIFY_SCENARIOS]
+    verify_evaluation(1, model)
+    verify_evaluation.last_n_ok == VERIFY_SCENARIOS || return false
+    cand = verify_evaluation.last_objective_no_target_penalty
+    inc = if best_verify_snapshot[] === nothing
+        Inf
+    else
+        verify_evaluation(1, best_verify_snapshot[])   # SAME fresh scenarios
+        verify_evaluation.last_n_ok == VERIFY_SCENARIOS ?
+            verify_evaluation.last_objective_no_target_penalty : Inf
+    end
+    accept = cand < inc
+    accept && (best_verify_snapshot[] = deepcopy(model))
+    @info "  verify on $VERIFY_SCENARIOS fresh: cand=$(round(cand; digits=1)) inc=$(inc == Inf ? "none" : round(inc; digits=1)) => $(accept ? "ACCEPT" : "reject (overfit to fixed set)")"
+    return accept
+end
+
 current_num_train = Ref(NUM_TRAIN_PER_BATCH)
 current_eval_scenarios = Ref(schedule_value(EVAL_SCHEDULE, 1, NUM_EVAL_SCENARIOS))
 rollout_evaluation.active_scenarios = current_eval_scenarios[]
 
-if SAVE_METRIC == "rollout"
+# The initial rollout eval only sets the checkpoint baseline, and it runs
+# SEQUENTIALLY on device 0 (a rollout is 96 dependent stages, one scenario at a
+# time) — so it blocks the multi-GPU training start with pure single-GPU work.
+# Skip it by default: best_obj stays Inf and the first periodic eval sets the
+# baseline, letting the 12 workers engage all GPUs immediately.
+const SKIP_INITIAL_EVAL = parse(Bool, get(ENV, "DR_SKIP_INITIAL_EVAL", "true"))
+if SAVE_METRIC == "rollout" && !SKIP_INITIAL_EVAL
     rollout_evaluation(EVAL_EVERY, policy)
     best_obj = rollout_evaluation.last_objective_no_target_penalty
     @info "Initial rollout evaluation (checkpoint baseline)" best_obj rollout_evaluation.last_violation_share rollout_evaluation.last_n_ok
+elseif SAVE_METRIC == "rollout"
+    @info "Skipping initial rollout eval (DR_SKIP_INITIAL_EVAL=true) — training starts immediately on all GPUs"
 end
 
 Random.seed!(8788)
@@ -600,7 +752,7 @@ train_tsddr(
     prob.p_x0,
     prob.p_target,
     prob.p_inflow,
-    () -> sample_scenario(hydro_data, T);
+    train_sampler;
     num_batches          = TOTAL_ITERS,
     num_train_per_batch  = NUM_TRAIN_PER_BATCH,
     optimizer            = GRAD_CLIP > 0 ?
@@ -610,7 +762,9 @@ train_tsddr(
                            ) : Flux.Adam(LR),
     madnlp_kwargs        = SOLVER_KWARGS,
     warmstart            = true,
-    problem_pool         = problem_pool,
+    problem_pool           = problem_pool,
+    worker_devices         = WORKER_DEVICES,
+    worker_problem_builder = worker_de_builder,
     batch_diagnostics    = (iter, stats) -> begin
         last_batch_stats[] = stats
         n_ok = get(stats, "n_ok", 0)
@@ -674,12 +828,25 @@ train_tsddr(
                 rollout_evaluation.last_n_ok
             if SAVE_METRIC == "rollout"
                 rollout_score = rollout_evaluation.last_objective_no_target_penalty
-                if isfinite(rollout_score) && rollout_score < best_obj
+                # Honest selection: the rollout mean is over the scenarios that
+                # SOLVED (total / n_ok), so a policy that fails one expensive
+                # scenario gets a fake bonus of hundreds of cost units. Only
+                # trust evals where every active scenario succeeded.
+                if rollout_evaluation.last_n_ok == current_eval_scenarios[] &&
+                   isfinite(rollout_score) && rollout_score < best_obj &&
+                   verified_improvement(m)   # second-stage fresh-scenario gate
                     global best_obj = rollout_score
                     jldsave(MODEL_PATH; model_state = checkpoint_policy_state(m))
                     @info "  -> New best rollout: $(round(rollout_score; digits=4)) -- saved $MODEL_PATH"
                 end
             end
+        end
+
+        # Crash-safety: overwrite the "_latest" checkpoint every N steps,
+        # independent of improvement, so a failure loses at most N steps.
+        if SAVE_LATEST_EVERY > 0 && iter % SAVE_LATEST_EVERY == 0
+            jldsave(LATEST_PATH; model_state = checkpoint_policy_state(m))
+            @info "  latest checkpoint @ iter $iter -> $LATEST_PATH"
         end
 
         batch_in_epoch = (iter - 1) % NUM_BATCHES + 1
@@ -688,7 +855,7 @@ train_tsddr(
             mean_loss = isempty(epoch_losses) ? NaN : mean(epoch_losses)
             n_ok      = length(epoch_losses)
             empty!(epoch_losses)
-            Wandb.log(lg, Dict("metrics/epoch_objective" => mean_loss, "epoch" => epoch))
+            lg === nothing || Wandb.log(lg, Dict("metrics/epoch_objective" => mean_loss, "epoch" => epoch))
             @info "Epoch $epoch/$NUM_EPOCHS  mean=$(round(mean_loss; digits=2))  ok=$n_ok/$NUM_BATCHES"
             if SAVE_METRIC == "training" && isfinite(mean_loss) && mean_loss < best_obj
                 global best_obj = mean_loss
@@ -696,10 +863,10 @@ train_tsddr(
                 @info "  → New best: $(round(mean_loss; digits=4)) — saved $MODEL_PATH"
             end
         end
-        Wandb.log(lg, metrics)
+        lg === nothing || Wandb.log(lg, metrics)
         return false
     end,
 )
 
-close(lg)
+lg === nothing || close(lg)
 @info "Done. Best model saved to: $(MODEL_PATH)"

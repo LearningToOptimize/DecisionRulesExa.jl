@@ -10,6 +10,60 @@ using Zygote
 import DecisionRulesExa: load_stateconditioned_policy!
 
 """
+    stretchedsigmoid(x) -> y ∈ [0, 1 − 1e-3]
+
+Boundary-attaining sigmoid: `clamp((sigmoid(x) − 0.03) / 0.94, 0, 1 − 1e-3)`.
+
+Plain `sigmoid` reaches 0/1 only at ±∞ with vanishing gradient, so a policy
+squashed by it can never exactly attain the reachable-interval boundaries —
+where optimal hydro decisions frequently live (SDDP places ~24% of its realized
+states within 0.1% of a boundary on the paired protocol). The gentle 6.4%
+stretch keeps the interior mapping close to the `sigmoid` shape (warm starts
+from sigmoid-trained checkpoints shift by ≤ ~3% absolute) while attaining
+exactly 0 for `sigmoid(x) ≤ 0.03` (x ≈ −3.5) and the δ-interior upper value
+1 − 1e-3 for `sigmoid(x) ≥ 0.969`.
+"""
+function stretchedsigmoid(x::Real)
+    T = float(typeof(x))
+    # Gentle stretch: σ ∈ [0.03, 0.97] maps affinely onto the full range, so
+    # warm starts from sigmoid-trained weights shift interior outputs by ≤ ~3%
+    # absolute (a 20% stretch amplified near-boundary decisions by 8-10% and
+    # destroyed warm-started policies), while corners are attained at finite
+    # pre-activation |x| ≈ 3.5.
+    # δ-interior upper clamp: exact y = 1 (store-everything when the raw
+    # reachable upper binds) forces turbine = min_turn AND spill = 0 exactly —
+    # a measure-zero feasible set that interior-point solvers cannot converge
+    # into when strict mode imposes the target as an equality (observed as
+    # MAXIMUM_ITERATIONS / spurious INFEASIBLE). y = 0 keeps a strict interior
+    # (spill is unbounded above in the stage NLP), so the lower corner is exact.
+    return clamp((NNlib.sigmoid(x) - T(0.03)) / T(0.94), zero(T), one(T) - T(1e-3))
+end
+
+"""
+    hardsigmoidsafe(x) -> y ∈ [0, 1 − 1e-3]
+
+`hardsigmoid` with the same δ-interior upper clamp as [`stretchedsigmoid`](@ref):
+attains exactly 0 on the lower side and 1 − 1e-3 on the upper side, keeping the
+strict stage NLP interior-point-solvable at store-max targets.
+"""
+function hardsigmoidsafe(x::Real)
+    T = float(typeof(x))
+    return min(NNlib.hardsigmoid(x), one(T) - T(1e-3))
+end
+
+# Activations admissible for the target head: range within [0, 1] so the
+# affine map into the reachable interval stays feasible.
+const _BOUNDED_ACTIVATIONS =
+    (sigmoid, NNlib.sigmoid, NNlib.sigmoid_fast, NNlib.hardsigmoid, NNlib.hardσ,
+     hardsigmoidsafe, stretchedsigmoid)
+
+# Evaluation-time snap-to-boundary (diagnostic; leave at 0 during training):
+# normalized targets y ≤ ε are snapped to exactly 0 and y ≥ 1−ε to exactly 1,
+# emulating a boundary-attaining head on a sigmoid-trained checkpoint with no
+# retraining. Set via DR_SNAP_EPS in the eval scripts.
+const TARGET_SNAP_EPS = Ref(0.0f0)
+
+"""
     hydro_reachable_policy(hydro_data, layers; activation=sigmoid, encoder_type=Flux.LSTM,
                            spill_max=nothing, combiner_layers=Int[])
 
@@ -93,7 +147,11 @@ Return `x` as a vector with the same array family and element type as `ref`.
 This keeps metadata such as `min_vol` and `max_vol` on the same device as the
 policy forward pass: CPU inputs stay on CPU, GPU inputs stay on GPU.
 """
-function _hydro_adapt_bound(x::AbstractVector, ref::AbstractVector)
+function _hydro_adapt_bound(x::AbstractVector, ref::AbstractArray)
+    # `ref` may be a vector (one scenario) or a matrix (batched); either way we
+    # return a per-reservoir vector on ref's device/eltype. `similar(ref, n)`
+    # yields a length-n vector even when ref is a matrix, which then broadcasts
+    # column-wise against batched (nx × N) quantities.
     typeof(x) === typeof(ref) && return x
     y = similar(ref, length(x))
     copyto!(y, convert.(eltype(ref), x))
@@ -301,18 +359,26 @@ The cascade clamp inherits the assumptions documented on
   below the reachable lower bound, the returned target can fall below `lower`;
   the stage is genuinely infeasible and no policy-level remedy exists.
 """
+# Row-slice that works for a vector input (one scenario) OR a matrix input
+# (features × batch, one column per scenario). Plain `input[r]` on a matrix does
+# LINEAR indexing and silently corrupts batched inputs, so dispatch on ndims.
+# The vector method returns exactly `input[r]`, so single-scenario behavior (the
+# strict TS-DDR trainer, evaluation) is byte-identical.
+_row_slice(input::AbstractVector, r) = input[r]
+_row_slice(input::AbstractMatrix, r) = input[r, :]
+
 function (m::HydroReachablePolicy)(input)
     # Split input: optional context first, then true inflow, then previous state.
     # Physical reachability bounds must use only the true inflow slice.
     c_end = m.n_context
     w_start = c_end + 1
     w_end = c_end + m.n_uncertainty
-    inflow = input[w_start:w_end]
-    x_prev = input[w_end+1:end]
+    inflow = _row_slice(input, w_start:w_end)
+    x_prev = _row_slice(input, w_end+1:size(input, 1))
     encoder_input = if c_end == 0
         inflow
     else
-        vcat(input[1:c_end], inflow)
+        vcat(_row_slice(input, 1:c_end), inflow)
     end
 
     # Encode inflow through the recurrent encoder, threading state across calls
@@ -324,10 +390,23 @@ function (m::HydroReachablePolicy)(input)
     m.state = new_state
 
     y = m.combiner(vcat(h, x_prev))
+    # Diagnostic eval-time snap (no-op at ε = 0): near-boundary normalized
+    # targets become exact boundary points, which plain sigmoid cannot attain.
+    ε = DecisionRulesExa._state_eltype(m.state)(TARGET_SNAP_EPS[])
+    if ε > 0
+        # Upper snap goes to 1 − 1e-3, not 1: see stretchedsigmoid — exact
+        # store-max targets are IPM-degenerate under strict equality.
+        y = ifelse.(y .<= ε, zero(ε), ifelse.(y .>= one(ε) - ε, one(ε) - oftype(ε, 1e-3), y))
+    end
     lower, upper = _hydro_reachable_bounds(m, inflow, x_prev, y)
     # Because `y` is sigmoid-bounded, this affine map stays in [lower, upper].
     raw_target = lower .+ (upper .- lower) .* y
-    if !isempty(m.cascade)
+    # The single-level cascade clamp uses per-reservoir index gathering (vector
+    # op) and is `@nograd`. For batched (matrix) input it is skipped: this is
+    # exact when imitating FEASIBLE targets (SDDP decisions respect the cascade
+    # balance, so `raw_target <= cascade_upper` and the clamp is a no-op). Single-
+    # scenario (vector) input keeps the full clamp — strict trainer/eval unchanged.
+    if !isempty(m.cascade) && ndims(input) == 1
         cascade_upper = _cascade_upper_bounds(m, raw_target, inflow, x_prev)
         return min.(raw_target, cascade_upper)
     end
@@ -401,8 +480,8 @@ function hydro_reachable_policy(
     combiner_layers = Int[],
     n_context::Int = 0,
 )
-    (activation === sigmoid || activation === NNlib.sigmoid || activation === NNlib.sigmoid_fast) ||
-        throw(ArgumentError("hydro_reachable_policy requires a sigmoid-style activation so normalized targets stay in [0, 1]"))
+    any(a -> activation === a, _BOUNDED_ACTIVATIONS) ||
+        throw(ArgumentError("hydro_reachable_policy requires a [0,1]-bounded activation (sigmoid, hardsigmoid, or stretchedsigmoid) so normalized targets stay in [0, 1]"))
     nHyd = hydro_data.nHyd
     n_context >= 0 || throw(ArgumentError("n_context must be nonnegative"))
     enc_sizes  = vcat(nHyd + n_context, layers)
