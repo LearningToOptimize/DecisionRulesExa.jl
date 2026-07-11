@@ -623,13 +623,20 @@ function _rollout_xhat_flat(model, initial_state, w_flat, T::Int, F)
     nw = length(w_flat) ÷ T                           # uncertainty dimension per stage
     Flux.reset!(model)                                 # reset LSTM hidden state
     prev = F.(initial_state)                           # cast initial state to element type F
-    stages = Vector{typeof(prev)}(undef, T)            # pre-allocate per-stage output vector
+    # This runs INSIDE the actor's Zygote closure (critic term), so the flat
+    # trajectory cannot be built with raw setindex! (Zygote mutation error) nor
+    # with a shape-growing vcat loop variable (pullback accum mismatch:
+    # accum(1375, 11) at the first phase-2 gradient). Zygote.Buffer is the
+    # sanctioned mutation-safe accumulator for exactly this unroll pattern.
+    nx = length(prev)                                  # state dimension
+    buf = Zygote.Buffer(prev, nx * T)                  # AD-safe writable buffer
     for t in 1:T
         wt = view(w_flat, (t-1)*nw+1 : t*nw)          # slice uncertainty for stage t
-        stages[t] = model(vcat(wt, prev))              # policy forward pass
-        prev = stages[t]                               # feed target to next stage
+        xt = model(vcat(wt, prev))                     # policy forward pass
+        buf[(t-1)*nx+1 : t*nx] = xt                    # write stage into buffer
+        prev = xt                                      # feed target to next stage
     end
-    return vcat(stages...)                             # flatten to single vector
+    return copy(buf)                                   # differentiable flat trajectory
 end
 
 """
