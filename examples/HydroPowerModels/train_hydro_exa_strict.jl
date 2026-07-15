@@ -265,6 +265,11 @@ const USE_GPU        = true
 # widen-SDDP-gap campaign. Applies to BOTH active and reactive demand, matching
 # SDDP's load_case_data (which now reads the same demand.csv).
 const load_scaler    = parse(Float64, get(ENV, "DR_LOAD_SCALER", "0.6"))
+# Reactive-demand scaler, INDEPENDENT of load_scaler. demand.csv covers ACTIVE
+# power only; nominal qd (1.67× the historical 0.6×) makes low-pd weeks
+# voltage-infeasible in stage ACP solves (SDDP node 5 LOCALLY_INFEASIBLE,
+# 2026-07-15). Matches DR_SDDP_QD_SCALER in sddp/run_sddp_inconsistent.jl.
+const qd_scaler      = parse(Float64, get(ENV, "DR_QD_SCALER", "0.6"))
 # Parallel-sample training: solve the `num_train_per_batch` per-gradient DEs
 # across worker threads, each with its own MadNLP solver bound to its own CUDA
 # stream (see train_tsddr! in src/training.jl). Requires JULIA_NUM_THREADS >=
@@ -347,6 +352,12 @@ else
     nothing
 end
 
+# Reactive demand at qd_scaler × nominal, independent of load_scaler: the
+# builder multiplies any given matrix by load_scaler, so divide it back out.
+reactive_mat = qd_scaler == load_scaler ? nothing :
+    repeat(reshape((qd_scaler / load_scaler) .* power_data.default_bus_reactive_demand,
+                   1, :), T, 1)
+
 # ── Build ExaModels DE (strict: delta variables fixed to zero) ────────────────
 
 resolved_pen = TARGET_PEN_ARG === :auto ?
@@ -365,6 +376,7 @@ function _build_de()
         target_penalty = TARGET_PEN_ARG,
         deficit_cost   = DEFICIT_COST,
         demand_matrix  = demand_mat,
+        reactive_demand_matrix = reactive_mat,
         load_scaler    = load_scaler,
         strict_targets = true,
         reactive_deficit_cost = REACTIVE_DEFICIT_COST,
@@ -603,6 +615,7 @@ function _build_rollout_de()
         target_penalty = TARGET_PEN_ARG,
         deficit_cost   = DEFICIT_COST,
         demand_matrix  = stage_demand,
+        reactive_demand_matrix = reactive_mat === nothing ? nothing : reactive_mat[1:1, :],
         load_scaler    = load_scaler,
         strict_targets = true,
         reactive_deficit_cost = REACTIVE_DEFICIT_COST,
