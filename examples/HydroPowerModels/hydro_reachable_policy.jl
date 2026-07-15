@@ -65,15 +65,19 @@ const TARGET_SNAP_EPS = Ref(0.0f0)
 
 """
     hydro_reachable_policy(hydro_data, layers; activation=sigmoid, encoder_type=Flux.LSTM,
-                           spill_max=nothing, combiner_layers=Int[])
+                           spill_max=nothing, combiner_layers=Int[], n_context=0,
+                           n_extra_uncertainty=0)
 
 Build a state-conditioned hydro policy whose outputs are one-stage reachable
 reservoir targets.
 
-The recurrent encoder reads inflows. The nonrecurrent combiner reads
-`[encoded_inflow; reservoir_state]`, emits normalized targets in `[0, 1]`, and
-the wrapper maps them into the reachability interval implied by the current
-inflow and previous reservoir state.
+The recurrent encoder reads the per-stage uncertainty block (inflows, plus any
+extra uncertainty entries such as the stochastic-demand factor ξ_t). The
+nonrecurrent combiner reads `[encoded_uncertainty; reservoir_state]`, emits
+normalized targets in `[0, 1]`, and the wrapper maps them into the
+reachability interval implied by the current inflow and previous reservoir
+state (reachability uses ONLY the physical inflow slice — extra uncertainty
+entries never change feasibility logic).
 
 # Arguments
 - `hydro_data::HydroData`: hydro limits, initial volumes, stage duration, and
@@ -86,6 +90,11 @@ inflow and previous reservoir state.
 - `encoder_type`: Flux recurrent layer constructor, usually `Flux.LSTM`.
 - `spill_max`: optional finite spill cap used to tighten lower bounds.
 - `combiner_layers`: hidden widths in the nonrecurrent state-conditioned head.
+- `n_context`: fixed per-stage context rows PREPENDED before the uncertainty.
+- `n_extra_uncertainty`: extra stochastic per-stage entries APPENDED after the
+  inflow inside the uncertainty block (demand noise ⇒ 1: the block is
+  `[w_t; ξ_t]`). Widens the encoder input by the same amount; checkpoints are
+  therefore only compatible across runs with the same value.
 
 # Returns
 - `HydroReachablePolicy`: a Flux-compatible policy with trainable encoder and
@@ -329,16 +338,19 @@ Zygote.@nograd _cascade_upper_bounds
 Evaluate the reachable hydro policy.
 
 # Arguments
-- `input`: concatenated vector `[context_t; inflow_t; x_{t-1}]`.
+- `input`: concatenated vector `[context_t; u_t; x_{t-1}]`, where the
+  uncertainty block `u_t` is `[inflow_t]` (historical) or `[inflow_t; ξ_t]`
+  (stochastic demand, `n_uncertainty = n_state + 1`).
 
 # Returns
 - A reservoir target vector in the one-stage reachable set.
 
 # Notes
-The encoder reads `[context_t; inflow_t]`, threading its recurrent state across
+The encoder reads `[context_t; u_t]`, threading its recurrent state across
 calls (one cell step per stage, stored in `policy.state` — DecisionRules.jl
 semantics). Reachability bounds and cascade clamps slice out only the true
-inflow entries, so prepended context never changes physical feasibility logic.
+inflow entries (the first `n_state` entries of `u_t`), so neither prepended
+context nor appended extra uncertainty changes physical feasibility logic.
 The combiner reads both encoded inflow/context and previous reservoir state,
 emits normalized targets, and those targets are mapped into the reachability
 interval before cascade clamping.
@@ -368,17 +380,26 @@ _row_slice(input::AbstractVector, r) = input[r]
 _row_slice(input::AbstractMatrix, r) = input[r, :]
 
 function (m::HydroReachablePolicy)(input)
-    # Split input: optional context first, then true inflow, then previous state.
-    # Physical reachability bounds must use only the true inflow slice.
+    # Split input: optional context first, then the per-stage uncertainty block
+    # (physical inflow, optionally followed by extra uncertainty entries such
+    # as the demand factor ξ_t), then the previous state. Physical reachability
+    # bounds must use ONLY the true inflow slice (first n_state uncertainty
+    # entries); the encoder reads the FULL uncertainty block. With
+    # n_uncertainty == n_state (no demand noise) `unc === inflow` and the
+    # behavior is bit-identical to the historical implementation.
     c_end = m.n_context
     w_start = c_end + 1
     w_end = c_end + m.n_uncertainty
-    inflow = _row_slice(input, w_start:w_end)
+    # Full uncertainty block [w_t; extras] — encoder input.
+    unc = _row_slice(input, w_start:w_end)
+    # Physical inflow slice (per-reservoir) — reachability/cascade input.
+    inflow = m.n_uncertainty == m.n_state ? unc :
+             _row_slice(input, w_start:(c_end + m.n_state))
     x_prev = _row_slice(input, w_end+1:size(input, 1))
     encoder_input = if c_end == 0
-        inflow
+        unc
     else
-        vcat(_row_slice(input, 1:c_end), inflow)
+        vcat(_row_slice(input, 1:c_end), unc)
     end
 
     # Encode inflow through the recurrent encoder, threading state across calls
@@ -479,16 +500,21 @@ function hydro_reachable_policy(
     spill_max = nothing,
     combiner_layers = Int[],
     n_context::Int = 0,
+    n_extra_uncertainty::Int = 0,
 )
     any(a -> activation === a, _BOUNDED_ACTIVATIONS) ||
         throw(ArgumentError("hydro_reachable_policy requires a [0,1]-bounded activation (sigmoid, hardsigmoid, or stretchedsigmoid) so normalized targets stay in [0, 1]"))
     nHyd = hydro_data.nHyd
     n_context >= 0 || throw(ArgumentError("n_context must be nonnegative"))
-    enc_sizes  = vcat(nHyd + n_context, layers)
+    # Extra per-stage uncertainty entries appended after the inflow (e.g. the
+    # stochastic-demand factor ξ_t: n_extra_uncertainty = 1). They widen the
+    # encoder input; reachability/cascade bounds keep using only the inflow.
+    n_extra_uncertainty >= 0 || throw(ArgumentError("n_extra_uncertainty must be nonnegative"))
+    enc_sizes  = vcat(nHyd + n_extra_uncertainty + n_context, layers)
     enc_layers = [encoder_type(enc_sizes[i] => enc_sizes[i+1])
                   for i in 1:length(layers)]
     encoder  = Flux.Chain(enc_layers...)
-    encoder_width = isempty(layers) ? nHyd + n_context : layers[end]
+    encoder_width = isempty(layers) ? nHyd + n_extra_uncertainty + n_context : layers[end]
     combiner = DecisionRulesExa._dense_policy_head(
         encoder_width + nHyd,
         nHyd,
@@ -525,7 +551,9 @@ function hydro_reachable_policy(
     return HydroReachablePolicy(
         encoder, combiner,
         DecisionRulesExa._init_recurrent_state(encoder),   # initial recurrent state
-        n_context, nHyd, nHyd,
+        # n_context; n_uncertainty = full per-stage uncertainty width (inflow +
+        # extras); n_state = nHyd (physical inflow/state width for bounds).
+        n_context, nHyd + n_extra_uncertainty, nHyd,
         Float32.([h.min_vol for h in hydro_data.units]),
         Float32.([h.max_vol for h in hydro_data.units]),
         Float32.([h.min_turn for h in hydro_data.units]),

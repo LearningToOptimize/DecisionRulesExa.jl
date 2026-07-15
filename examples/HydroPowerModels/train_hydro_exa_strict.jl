@@ -96,6 +96,20 @@ const HYDRO_FILE  = joinpath(CASE_DIR, "hydro.json")
 const INFLOW_FILE = joinpath(CASE_DIR, "inflows.csv")
 const DEMAND_FILE = joinpath(CASE_DIR, "demand.csv")
 
+# Stochastic demand (bolivia/demand_scenarios.csv, single line `s,<value>`):
+# i.i.d. per-stage multiplicative factor ξ_t ∈ {1−s, 1, 1+s} (P = 1/3 each) on
+# every bus's active demand, independent of the inflow noise — the same model
+# the SDDP baselines register via sddp/sddp_demand_noise.jl. When the file is
+# ABSENT every code path below is bit-identical to the historical trainer.
+# Mechanics: scenarios become augmented stage-major vectors [w_t; ξ_t]
+# (sample_scenario 3-arg method / augment_scenario), the DE is built with
+# demand_spread (p_inflow sized T·(nHyd+1)), the policy encoder observes ξ_t
+# (n_extra_uncertainty = 1), and prepare_solve! applies base_demand·ξ_t via
+# set_demand! before every solve (training, rollout, and multi-GPU workers).
+const DEMAND_SPREAD = load_demand_spread(joinpath(CASE_DIR, "demand_scenarios.csv"))
+const DEMAND_NOISE  = DEMAND_SPREAD !== nothing
+DEMAND_NOISE && @info "Stochastic demand ACTIVE" DEMAND_SPREAD
+
 function parse_reactive_deficit_cost(raw::AbstractString)
     s = lowercase(strip(raw))
     if s == "free"
@@ -194,7 +208,30 @@ const NUM_TRAIN_SCHEDULE  = parse_int_schedule(get(ENV, "DR_NUM_TRAIN_SCHEDULE",
 const CONTEXT_MODE = canonical_context_mode(get(ENV, "DR_CONTEXT", ""))
 const CONTEXT_PERIOD = countlines(INFLOW_FILE)
 const CONTEXT_HORIZON = NUM_STAGES
-const STAGE_CONTEXT = build_stage_context(CONTEXT_MODE, CONTEXT_HORIZON, CONTEXT_PERIOD)
+const _base_context = build_stage_context(CONTEXT_MODE, CONTEXT_HORIZON, CONTEXT_PERIOD)
+# Optional demand context (DR_DEMAND_CONTEXT): per-stage total system demand
+# read from bolivia/demand.csv (sum over loads), tiled cyclically to the horizon
+# (matching the DE/SDDP tiling) and z-normalized, appended as ONE extra context
+# row so the policy can condition on how heavy the stage's load is. Informative
+# only when demand.csv has >1 row (varying demand); with a single row the row is
+# all-zeros (constant) and the policy learns to ignore it. This is the demand
+# analogue of the seasonal stage-phase embedding.
+const DEMAND_CONTEXT = parse(Bool, get(ENV, "DR_DEMAND_CONTEXT", "false"))
+function _demand_context_row(T::Int)
+    df = joinpath(CASE_DIR, "demand.csv")
+    isfile(df) || return nothing
+    raw = CSV.read(df, Tables.matrix; header = false)
+    nrows = size(raw, 1)
+    tot = Float64[sum(@view raw[((t - 1) % nrows) + 1, :]) for t in 1:T]
+    μ, σ = Statistics.mean(tot), Statistics.std(tot)
+    z = σ > 1e-12 ? (tot .- μ) ./ σ : zeros(Float64, T)
+    return reshape(Float32.(z), 1, T)
+end
+const STAGE_CONTEXT = let dctx = DEMAND_CONTEXT ? _demand_context_row(CONTEXT_HORIZON) : nothing
+    _base_context === nothing ? dctx :
+    dctx === nothing ? _base_context :
+    vcat(_base_context, dctx)
+end
 const N_CONTEXT = isnothing(STAGE_CONTEXT) ? 0 : size(STAGE_CONTEXT, 1)
 const NUM_EVAL_SCENARIOS  = parse(Int, get(ENV, "DR_NUM_EVAL_SCENARIOS", "4"))
 const EVAL_SCHEDULE       = parse_int_schedule(get(ENV, "DR_EVAL_SCHEDULE", ""), "DR_EVAL_SCHEDULE")
@@ -222,7 +259,12 @@ const TARGET_PEN_ARG = :auto
 const HYDRO_TARGET_PENALTY_MULT = 8.0
 const DEFICIT_COST   = 1e5
 const USE_GPU        = true
-const load_scaler    = 0.6
+# Load scaling: historical 0.6 down-scaled demand to make the early problem
+# easy (before demand.csv + context existed). Set DR_LOAD_SCALER=1.0 to use the
+# real un-scaled demand (bolivia/demand.csv) — the harder problem for the
+# widen-SDDP-gap campaign. Applies to BOTH active and reactive demand, matching
+# SDDP's load_case_data (which now reads the same demand.csv).
+const load_scaler    = parse(Float64, get(ENV, "DR_LOAD_SCALER", "0.6"))
 # Parallel-sample training: solve the `num_train_per_batch` per-gradient DEs
 # across worker threads, each with its own MadNLP solver bound to its own CUDA
 # stream (see train_tsddr! in src/training.jl). Requires JULIA_NUM_THREADS >=
@@ -257,7 +299,10 @@ const _RQ_TAG    = REACTIVE_DEFICIT_COST === nothing ? "" :
                    "-rq$(value_tag(REACTIVE_DEFICIT_COST))"
 const _ACT_TAG   = ACTIVATION === sigmoid ? "" :
                    ACTIVATION === stretchedsigmoid ? "-actstretch" : "-acthardsig"
-const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-deteq-strict-gpu$(_CLIP_TAG)$(_ENC_TAG)$(_HEAD_TAG)$(_NT_TAG)$(_CTX_TAG)$(_EV_TAG)$(_SAVE_TAG)$(_WARM_TAG)$(_RQ_TAG)$(_ACT_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
+# Demand-noise tag: runs with stochastic demand are a different experiment
+# family (different SP and different policy input width) — mark them.
+const _DN_TAG    = DEMAND_NOISE ? "-dnoise$(value_tag(DEMAND_SPREAD))" : ""
+const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-deteq-strict-gpu$(_CLIP_TAG)$(_ENC_TAG)$(_HEAD_TAG)$(_NT_TAG)$(_CTX_TAG)$(_EV_TAG)$(_SAVE_TAG)$(_WARM_TAG)$(_RQ_TAG)$(_ACT_TAG)$(_DN_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
 const MODEL_DIR = joinpath(CASE_DIR, FORM_LABEL, "models")
 mkpath(MODEL_DIR)
 const MODEL_PATH = joinpath(MODEL_DIR, RUN_NAME * ".jld2")
@@ -290,7 +335,10 @@ hydro_data = load_hydro_data(HYDRO_FILE, INFLOW_FILE, power_data;
 nHyd = hydro_data.nHyd
 T    = NUM_STAGES
 T_ROLLOUT = NUM_ROLLOUT_STAGES
-@info "  nHyd=$(nHyd)  nScenarios=$(hydro_data.nScenarios)"
+# Per-stage uncertainty width fed to the policy/DE/rollout machinery:
+# nHyd inflows, plus the demand factor ξ_t when stochastic demand is active.
+N_UNC = nHyd + (DEMAND_NOISE ? 1 : 0)
+@info "  nHyd=$(nHyd)  nScenarios=$(hydro_data.nScenarios)  n_uncertainty=$(N_UNC)"
 
 demand_mat = if isfile(DEMAND_FILE)
     @info "Loading demand from $(DEMAND_FILE)..."
@@ -320,6 +368,10 @@ function _build_de()
         load_scaler    = load_scaler,
         strict_targets = true,
         reactive_deficit_cost = REACTIVE_DEFICIT_COST,
+        # Stochastic demand: sizes p_inflow for [w_t; ξ_t] blocks and stores
+        # the base demand for prepare_solve!'s ξ_t multiplication (nothing =
+        # deterministic, bit-identical legacy model).
+        demand_spread  = DEMAND_SPREAD,
     )
 end
 
@@ -387,7 +439,12 @@ base_policy = hydro_reachable_policy(hydro_data, ENCODER_LAYERS;
                                      activation       = ACTIVATION,
                                      encoder_type     = Flux.LSTM,
                                      combiner_layers  = HEAD_LAYERS,
-                                     n_context        = N_CONTEXT)
+                                     n_context        = N_CONTEXT,
+                                     # Demand noise: the encoder additionally
+                                     # observes ξ_t (stage-t revealed demand),
+                                     # matching SDDP whose stage subproblem
+                                     # sees the realized demand atom.
+                                     n_extra_uncertainty = DEMAND_NOISE ? 1 : 0)
 policy = isnothing(STAGE_CONTEXT) ? base_policy : ContextualPolicy(base_policy, STAGE_CONTEXT)
 
 if HAS_PRETRAINED
@@ -405,16 +462,20 @@ regular deterministic equivalent.
 The regular DE receives an external target vector, so it cannot query the policy
 inside the NLP. This helper constructs that vector in a way that preserves
 strict-mode feasibility: it starts from the known feasible initial state `x0`,
-feeds `[w_t; previous_target]` to the policy, and stores each reachable target as
+feeds `[u_t; previous_target]` to the policy, and stores each reachable target as
 the next previous state. By induction, every target in the returned trajectory is
 reachable from the prior target under the sampled inflow path.
 
 # Arguments
-- `policy`: reachable hydro policy with input `[inflow; previous_state]`.
+- `policy`: reachable hydro policy with input `[uncertainty; previous_state]`.
 - `x0`: initial reservoir state.
-- `w_flat`: stage-major flat inflow vector of length `T * nHyd`.
+- `w_flat`: stage-major flat uncertainty vector of length `T * n_uncertainty`
+  (`n_uncertainty = nHyd` historically, `nHyd + 1` with stochastic demand —
+  the per-stage stride is derived from `length(w_flat) ÷ T`, so both layouts
+  work; the policy slices the physical inflow internally).
 - `T::Int`: number of stages.
-- `nHyd::Int`: number of hydro reservoir state components.
+- `nHyd::Int`: number of hydro reservoir state components (kept for call-site
+  compatibility; the stride no longer depends on it).
 
 # Returns
 - `Vector{Float64}`: stage-major target trajectory suitable for
@@ -428,9 +489,13 @@ targets = rollout_reachable_targets(policy, x0_init, mean_inflow(hydro_data, T),
 function rollout_reachable_targets(policy, x0, w_flat, T, nHyd)
     Flux.reset!(policy)
     prev = x0
+    # Per-stage uncertainty stride derived from the vector itself (nHyd, or
+    # nHyd+1 when the demand factor ξ_t is appended to each stage block).
+    nu = length(w_flat) ÷ T
     targets = Vector{Vector{Float32}}(undef, T)
     for t in 1:T
-        wt = Float32.(view(w_flat, ((t - 1) * nHyd + 1):(t * nHyd)))
+        # Full stage-t uncertainty block [w_t] or [w_t; ξ_t].
+        wt = Float32.(view(w_flat, ((t - 1) * nu + 1):(t * nu)))
         target = policy(vcat(wt, prev))
         targets[t] = Float32.(target)
         prev = targets[t]
@@ -440,7 +505,10 @@ end
 
 # ── Smoke test ────────────────────────────────────────────────────────────────
 
-w_mean = mean_inflow(hydro_data, T)
+# Mean-inflow smoke scenario; with demand noise, append the neutral factor
+# ξ_t = 1 to every stage (base demand) so the augmented layout is exercised.
+w_mean = DEMAND_NOISE ? augment_scenario(mean_inflow(hydro_data, T), ones(T)) :
+                        mean_inflow(hydro_data, T)
 xhat_mean = rollout_reachable_targets(policy, x0_init, w_mean, T, nHyd)
 ExaModels.set_parameter!(prob.core, prob.p_x0,     x0_init)
 ExaModels.set_parameter!(prob.core, prob.p_inflow,  w_mean)
@@ -510,6 +578,8 @@ lg = ENABLE_WANDB ? WandbLogger(
         "grad_clip"       => GRAD_CLIP,
         "backend"         => USE_GPU ? "GPU" : "CPU",
         "load_scaler"     => load_scaler,
+        # Demand-noise provenance: "none" = deterministic demand.
+        "demand_spread"   => DEMAND_NOISE ? DEMAND_SPREAD : "none",
         "strict_targets"  => true,
         "policy_type"     => N_CONTEXT == 0 ? "HydroReachablePolicy" : "ContextualPolicy{HydroReachablePolicy}",
         "num_workers"     => NUM_WORKERS,
@@ -536,6 +606,10 @@ function _build_rollout_de()
         load_scaler    = load_scaler,
         strict_targets = true,
         reactive_deficit_cost = REACTIVE_DEFICIT_COST,
+        # Stochastic demand: the 1-stage problem also carries a base_demand
+        # row; set_hydro_rollout_stage! refreshes it per stage and
+        # prepare_solve! applies the ξ_t carried in the stage's wt block.
+        demand_spread  = DEMAND_SPREAD,
     )
 end
 rollout_prob = _build_rollout_de()
@@ -545,9 +619,19 @@ rollout_pool = ROLLOUT_PARALLEL ? [_build_rollout_de() for _ in 1:n_rollout_pool
 
 function set_hydro_rollout_stage!(stage_prob, state_in, wt, target, stage)
     ExaModels.set_parameter!(stage_prob.core, stage_prob.p_x0, state_in)
+    # wt is the full stage uncertainty block ([w_t] or [w_t; ξ_t]); the stage
+    # problem's p_inflow is sized to match (n_uncertainty entries).
     ExaModels.set_parameter!(stage_prob.core, stage_prob.p_inflow, wt)
     if demand_mat !== nothing
-        set_demand!(stage_prob, load_scaler .* demand_mat[stage:stage, :])
+        if DEMAND_NOISE
+            # Stochastic demand: refresh the 1-stage problem's BASE demand row
+            # in place; prepare_solve! below multiplies it by the ξ_t carried
+            # in wt's last entry and writes the product via set_demand!.
+            stage_prob.base_demand[1, :] .= load_scaler .* @view demand_mat[stage, :]
+        else
+            # Deterministic demand: historical direct write (bit-identical).
+            set_demand!(stage_prob, load_scaler .* demand_mat[stage:stage, :])
+        end
     end
     ExaModels.set_parameter!(stage_prob.core, stage_prob.p_target, target)
     prepare_solve!(stage_prob, state_in, wt, target)
@@ -604,9 +688,20 @@ function protocol_eval_scenario(hydro_data::HydroData, T::Int, protocol_indices,
     return w
 end
 
+# Demand-noise augmentation of a protocol column: pair the column's inflows
+# with its SEEDED demand path (StableRNG(DEMAND_NOISE_SEED + column) — the
+# identical path eval_paired_exa_strict.jl draws for that column). With noise
+# off this is the identity, so the historical eval set is unchanged.
+_augment_protocol(w, col, T) = DEMAND_NOISE ?
+    augment_scenario(w, protocol_demand_factors(DEMAND_SPREAD, T, col)) : w
+
 eval_scenarios = if isempty(EVAL_PROTOCOL_IDS)
     Random.seed!(8789)
-    [sample_scenario(hydro_data, T_ROLLOUT) for _ in 1:NUM_EVAL_SCENARIOS]
+    # Random draws: the 3-arg sampler additionally draws i.i.d. ξ_t from the
+    # SAME seeded global stream, so the eval set stays reproducible.
+    [DEMAND_NOISE ? sample_scenario(hydro_data, T_ROLLOUT, DEMAND_SPREAD) :
+                    sample_scenario(hydro_data, T_ROLLOUT)
+     for _ in 1:NUM_EVAL_SCENARIOS]
 else
     # Same fixed-shape generation as the paired protocol (126 rows × 500
     # columns; see load_hydropowermodels.jl in the MAIN repo).
@@ -614,7 +709,8 @@ else
     @assert T_ROLLOUT <= 126 && all(1 .<= EVAL_PROTOCOL_IDS .<= 500)
     @assert length(EVAL_PROTOCOL_IDS) == NUM_EVAL_SCENARIOS "DR_NUM_EVAL_SCENARIOS must match the id count"
     @info "Eval set = paired-protocol columns $(EVAL_PROTOCOL_IDS)"
-    [protocol_eval_scenario(hydro_data, T_ROLLOUT, protocol_indices, s) for s in EVAL_PROTOCOL_IDS]
+    [_augment_protocol(protocol_eval_scenario(hydro_data, T_ROLLOUT, protocol_indices, s), s, T_ROLLOUT)
+     for s in EVAL_PROTOCOL_IDS]
 end
 # ── Training sampler ──────────────────────────────────────────────────────────
 # Default: fresh random inflow draws (genuine SAA). When DR_TRAIN_PROTOCOL_ALL
@@ -628,10 +724,18 @@ const TRAIN_PROTOCOL_ALL = lowercase(strip(get(ENV, "DR_TRAIN_PROTOCOL_ALL", "")
 train_sampler = if TRAIN_PROTOCOL_ALL
     train_protocol_indices = rand(StableRNG(20260706), 1:hydro_data.nScenarios, 126, 500)
     @assert T <= 126
-    protocol_cols = [protocol_eval_scenario(hydro_data, T, train_protocol_indices, s) for s in 1:500]
+    # With demand noise, each protocol column is paired with its seeded demand
+    # path (prefix-consistent with the T_ROLLOUT-length eval draws — see
+    # sample_demand_factors' sequential-draw prefix property).
+    protocol_cols = [_augment_protocol(protocol_eval_scenario(hydro_data, T, train_protocol_indices, s), s, T)
+                     for s in 1:500]
     @info "TRAINING on the exact 500 paired-protocol scenarios (cheating upper-bound test)" NUM_TRAIN_PER_BATCH
     cyc = Ref(0)
     () -> (cyc[] = cyc[] % 500 + 1; protocol_cols[cyc[]])
+elseif DEMAND_NOISE
+    # Genuine SAA over the PRODUCT distribution: fresh inflow draw + fresh
+    # i.i.d. per-stage demand factors, returned as augmented [w_t; ξ_t] blocks.
+    () -> sample_scenario(hydro_data, T, DEMAND_SPREAD)
 else
     () -> sample_scenario(hydro_data, T)
 end
@@ -641,7 +745,9 @@ rollout_evaluation = RolloutEvaluation(
     x0_init,
     eval_scenarios;
     horizon = T_ROLLOUT,
-    n_uncertainty = nHyd,
+    # Per-stage uncertainty width: nHyd, or nHyd+1 with demand noise (the
+    # stage callback then receives the full [w_t; ξ_t] block as wt).
+    n_uncertainty = N_UNC,
     set_stage_parameters! = set_hydro_rollout_stage!,
     realized_state = hydro_realized_state,
     objective_no_target_penalty = hydro_objective_no_target_penalty,
@@ -667,8 +773,12 @@ verify_evaluation = if VERIFY_SCENARIOS > 0 && SAVE_METRIC == "rollout"
     @info "Two-stage SaveBest: verify accepts on $VERIFY_SCENARIOS fresh random scenarios"
     RolloutEvaluation(
         _build_rollout_de(), x0_init,
-        [sample_scenario(hydro_data, T_ROLLOUT) for _ in 1:VERIFY_SCENARIOS];
-        horizon = T_ROLLOUT, n_uncertainty = nHyd,
+        # Fresh verification draws come from the same (augmented, when demand
+        # noise is on) sampler family as training.
+        [DEMAND_NOISE ? sample_scenario(hydro_data, T_ROLLOUT, DEMAND_SPREAD) :
+                        sample_scenario(hydro_data, T_ROLLOUT)
+         for _ in 1:VERIFY_SCENARIOS];
+        horizon = T_ROLLOUT, n_uncertainty = N_UNC,
         set_stage_parameters! = set_hydro_rollout_stage!,
         realized_state = hydro_realized_state,
         objective_no_target_penalty = hydro_objective_no_target_penalty,
@@ -687,8 +797,12 @@ best_verify_snapshot = Ref{Any}(nothing)   # deepcopy of the accepted-best polic
 # and require `model` to beat the incumbent snapshot on them (all must solve).
 function verified_improvement(model)
     verify_evaluation === nothing && return true
+    # Fresh draws per trigger; with demand noise the 3-arg sampler pairs each
+    # fresh inflow path with fresh i.i.d. demand factors ([w_t; ξ_t] blocks).
     verify_evaluation.scenarios =
-        [sample_scenario(hydro_data, T_ROLLOUT) for _ in 1:VERIFY_SCENARIOS]
+        [DEMAND_NOISE ? sample_scenario(hydro_data, T_ROLLOUT, DEMAND_SPREAD) :
+                        sample_scenario(hydro_data, T_ROLLOUT)
+         for _ in 1:VERIFY_SCENARIOS]
     verify_evaluation(1, model)
     verify_evaluation.last_n_ok == VERIFY_SCENARIOS || return false
     cand = verify_evaluation.last_objective_no_target_penalty

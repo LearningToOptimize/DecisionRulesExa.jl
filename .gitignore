@@ -43,3 +43,4 @@ logs/
 *.sbatch
 *.sh
 examples/HydroPowerModels/results/
+*strong.json

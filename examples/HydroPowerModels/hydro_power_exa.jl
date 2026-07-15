@@ -60,8 +60,25 @@ Parameters:
 - `p_demand`           : per-bus per-stage active demand   (length T*nBus, stage-major)
 - `p_reactive_demand`  : per-bus per-stage reactive demand (length T*nBus; nothing for DC)
 - `p_x0`               : initial reservoir levels          (length nHyd)
-- `p_inflow`           : inflow trajectory                 (length T*nHyd, stage-major)
+- `p_inflow`           : per-stage uncertainty trajectory  (length T*n_uncertainty,
+                         stage-major). Without demand noise `n_uncertainty = nHyd`
+                         and this is exactly the inflow trajectory. With demand
+                         noise (`demand_spread` set at build time)
+                         `n_uncertainty = nHyd + 1` and each stage block is
+                         `[w_t; ξ_t]`: the first nHyd entries are inflows, the
+                         last entry is the multiplicative demand factor ξ_t.
+                         The ξ slots appear in NO constraint — `prepare_solve!`
+                         reads them and applies `base_demand[t,:] · ξ_t` to
+                         `p_demand` via `set_demand!` before every solve.
 - `p_target`           : NN-predicted target levels        (length T*nHyd, stage-major)
+
+Demand-noise fields:
+- `n_uncertainty::Int` : per-stage uncertainty width (nHyd, or nHyd+1 with noise)
+- `base_demand`        : `nothing` (deterministic demand — bit-identical legacy
+                         behavior) or the `[T × nBus]` BASE active demand
+                         (already `load_scaler`-scaled) that `prepare_solve!`
+                         multiplies by ξ_t. Its CONTENT may be mutated in place
+                         (the rollout stage problem refreshes row 1 per stage).
 """
 struct HydroExaDEProblem
     core
@@ -100,6 +117,12 @@ struct HydroExaDEProblem
     #   :penalized — deficit_q = δq⁺ − δq⁻ (δq± ≥ 0) with linear cost c·Σ(δq⁺+δq⁻)
     #   :hard      — no reactive slack (hard reactive balance, MAIN-faithful)
     reactive_deficit_mode::Symbol
+    # Per-stage uncertainty width: nHyd (deterministic demand) or nHyd + 1
+    # (stochastic demand: each stage block of p_inflow is [w_t; ξ_t]).
+    n_uncertainty::Int
+    # nothing (deterministic demand) or the [T × nBus] load_scaler-scaled BASE
+    # active demand: prepare_solve! sets p_demand[t,:] = base_demand[t,:] · ξ_t.
+    base_demand::Union{Nothing,Matrix{Float64}}
 end
 
 # ── AC branch coefficient helper ──────────────────────────────────────────────
@@ -181,7 +204,8 @@ end
                    demand_matrix=nothing,
                    reactive_demand_matrix=nothing, deficit_cost=nothing,
                    load_scaler=1.0, strict_targets=false,
-                   reactive_deficit_cost=nothing)
+                   reactive_deficit_cost=nothing,
+                   demand_spread=nothing)
               -> HydroExaDEProblem
 
 Build the T-stage hydro-power deterministic equivalent.
@@ -221,6 +245,21 @@ reactive KCL:
   count/order again unchanged).
 Passing a non-`nothing` value with `formulation = :dc` throws (DC has no
 reactive balance).
+
+`demand_spread` enables stochastic demand (i.i.d. per-stage multiplicative
+factor `ξ_t ∈ {1−s, 1, 1+s}`, probability 1/3 each, independent of the inflow
+noise — the same model the SDDP baselines implement via
+sddp/sddp_demand_noise.jl):
+- `nothing` (default) — deterministic demand; the model is BIT-IDENTICAL to
+  builds preceding this kwarg.
+- spread `s ∈ [0, 1)` — the uncertainty parameter `p_inflow` grows to
+  `T·(nHyd+1)` with per-stage blocks `[w_t; ξ_t]`; the water-balance inflow
+  indices stride `nHyd+1`; the ξ slots are referenced by NO constraint and are
+  consumed by `prepare_solve!`, which applies
+  `p_demand[t,:] = base_demand[t,:] · ξ_t` via [`set_demand!`](@ref) before
+  every solve. Only the ACTIVE demand is perturbed (reactive demand stays at
+  its base value), matching the SDDP override which adds the deviation to the
+  real-power KCL only.
 """
 function build_hydro_de(power_data::PowerData,
                          hydro_data::HydroData,
@@ -235,10 +274,14 @@ function build_hydro_de(power_data::PowerData,
                          deficit_cost::Union{Nothing,Real} = nothing,
                          load_scaler::Real = 1.0,
                          strict_targets::Bool = false,
-                         reactive_deficit_cost::Union{Nothing,Real} = nothing)
+                         reactive_deficit_cost::Union{Nothing,Real} = nothing,
+                         demand_spread::Union{Nothing,Real} = nothing)
 
     formulation in (:dc, :ac_polar) ||
         error("formulation must be :dc or :ac_polar, got :$formulation")
+    # Validate the demand-noise spread once for both formulations.
+    demand_spread === nothing || 0.0 <= demand_spread < 1.0 ||
+        error("demand_spread must satisfy 0 ≤ s < 1; got $demand_spread")
 
     if formulation === :dc
         reactive_deficit_cost === nothing ||
@@ -250,7 +293,8 @@ function build_hydro_de(power_data::PowerData,
                                    demand_matrix=demand_matrix,
                                    deficit_cost=deficit_cost,
                                    load_scaler=load_scaler,
-                                   strict_targets=strict_targets)
+                                   strict_targets=strict_targets,
+                                   demand_spread=demand_spread)
     else
         return _build_ac_hydro_de(power_data, hydro_data, T;
                                    backend=backend, float_type=float_type,
@@ -261,7 +305,8 @@ function build_hydro_de(power_data::PowerData,
                                    deficit_cost=deficit_cost,
                                    load_scaler=load_scaler,
                                    strict_targets=strict_targets,
-                                   reactive_deficit_cost=reactive_deficit_cost)
+                                   reactive_deficit_cost=reactive_deficit_cost,
+                                   demand_spread=demand_spread)
     end
 end
 
@@ -297,12 +342,16 @@ function _build_dc_hydro_de(power_data::PowerData,
                               demand_matrix = nothing,
                               deficit_cost::Union{Nothing,Real} = nothing,
                               load_scaler::Real = 1.0,
-                              strict_targets::Bool = false)
+                              strict_targets::Bool = false,
+                              demand_spread::Union{Nothing,Real} = nothing)
 
     nBus    = power_data.nBus
     nGen    = power_data.nGen
     nBranch = power_data.nBranch
     nHyd    = hydro_data.nHyd
+    # Per-stage uncertainty width: +1 slot for the demand factor ξ_t when
+    # stochastic demand is enabled (see build_hydro_de docstring).
+    n_unc   = nHyd + (demand_spread === nothing ? 0 : 1)
     K       = float_type(hydro_data.K)
     ρ       = float_type(target_penalty === :auto ? auto_target_penalty(power_data, hydro_data) : target_penalty)
     ρ_l1    = if target_penalty_l1 === :auto
@@ -371,9 +420,19 @@ function _build_dc_hydro_de(power_data::PowerData,
         float_type.(load_scaler .* repeat(power_data.default_bus_demand, T))
     end
 
+    # Uncertainty parameter: length T·n_unc. With demand noise the per-stage
+    # block is [w_t; ξ_t]; initialize the ξ slots to 1.0 (factor-1 demand) so a
+    # solve before the first set_parameter! sees the base demand.
+    init_uncertainty = zeros(float_type, T * n_unc)
+    if demand_spread !== nothing
+        for t in 1:T
+            init_uncertainty[t * n_unc] = one(float_type)   # ξ_t slot ← 1.0
+        end
+    end
+
     p_demand       = ExaModels.parameter(core, init_demand)
     p_x0           = ExaModels.parameter(core, zeros(float_type, nHyd))
-    p_inflow       = ExaModels.parameter(core, zeros(float_type, T * nHyd))
+    p_inflow       = ExaModels.parameter(core, init_uncertainty)
     p_target       = ExaModels.parameter(core, zeros(float_type, T * nHyd))
     p_penalty_half = ExaModels.parameter(core, fill(float_type(ρ / 2), T * nHyd))
     p_penalty_l1   = ExaModels.parameter(core, fill(ρ_l1, T * nHyd))
@@ -502,7 +561,10 @@ function _build_dc_hydro_de(power_data::PowerData,
                  res_curr  = _ri(nHyd, t,   r),
                  out_idx   = _ri(nHyd, t,   r),
                  spill_idx = _ri(nHyd, t,   r),
-                 inflow_p  = _ri(nHyd, t,   r),
+                 # Inflow slot inside the uncertainty parameter: stride n_unc
+                 # (= nHyd without demand noise — unchanged; = nHyd+1 with it,
+                 # skipping the per-stage ξ_t slot).
+                 inflow_p  = _ri(n_unc, t,   r),
                  K = K)
                 for t in 1:T for r in 1:nHyd]
     c_wb = ExaModels.constraint(core,
@@ -579,6 +641,11 @@ function _build_dc_hydro_de(power_data::PowerData,
         Float64.([h.min_turn for h in hydro_data.units]),
         Float64.([h.max_vol for h in hydro_data.units]),
         :none,   # DC has no reactive balance, hence no reactive slack
+        n_unc,   # per-stage uncertainty width (nHyd, or nHyd+1 with demand noise)
+        # BASE demand [T × nBus] for prepare_solve!'s ξ_t multiplication;
+        # nothing keeps the deterministic path bit-identical.
+        demand_spread === nothing ? nothing :
+            Float64.(permutedims(reshape(init_demand, nBus, T))),
     )
 end
 
@@ -596,12 +663,16 @@ function _build_ac_hydro_de(power_data::PowerData,
                               deficit_cost::Union{Nothing,Real} = nothing,
                               load_scaler::Real = 1.0,
                               strict_targets::Bool = false,
-                              reactive_deficit_cost::Union{Nothing,Real} = nothing)
+                              reactive_deficit_cost::Union{Nothing,Real} = nothing,
+                              demand_spread::Union{Nothing,Real} = nothing)
 
     nBus    = power_data.nBus
     nGen    = power_data.nGen
     nBranch = power_data.nBranch
     nHyd    = hydro_data.nHyd
+    # Per-stage uncertainty width: +1 slot for the demand factor ξ_t when
+    # stochastic demand is enabled (see build_hydro_de docstring).
+    n_unc   = nHyd + (demand_spread === nothing ? 0 : 1)
     K       = float_type(hydro_data.K)
     ρ       = float_type(target_penalty === :auto ? auto_target_penalty(power_data, hydro_data) : target_penalty)
     ρ_l1    = if target_penalty_l1 === :auto
@@ -717,10 +788,20 @@ function _build_ac_hydro_de(power_data::PowerData,
         float_type.(load_scaler .* repeat(power_data.default_bus_reactive_demand, T))
     end
 
+    # Uncertainty parameter: length T·n_unc. With demand noise the per-stage
+    # block is [w_t; ξ_t]; initialize the ξ slots to 1.0 (factor-1 demand) so a
+    # solve before the first set_parameter! sees the base demand.
+    init_uncertainty = zeros(float_type, T * n_unc)
+    if demand_spread !== nothing
+        for t in 1:T
+            init_uncertainty[t * n_unc] = one(float_type)   # ξ_t slot ← 1.0
+        end
+    end
+
     p_demand          = ExaModels.parameter(core, init_demand)
     p_reactive_demand = ExaModels.parameter(core, init_reactive_demand)
     p_x0              = ExaModels.parameter(core, zeros(float_type, nHyd))
-    p_inflow          = ExaModels.parameter(core, zeros(float_type, T * nHyd))
+    p_inflow          = ExaModels.parameter(core, init_uncertainty)
     p_target          = ExaModels.parameter(core, zeros(float_type, T * nHyd))
     p_penalty_half    = ExaModels.parameter(core, fill(float_type(ρ / 2), T * nHyd))
     p_penalty_l1      = ExaModels.parameter(core, fill(ρ_l1, T * nHyd))
@@ -969,7 +1050,10 @@ function _build_ac_hydro_de(power_data::PowerData,
                  res_curr  = _ri(nHyd, t,   r),
                  out_idx   = _ri(nHyd, t,   r),
                  spill_idx = _ri(nHyd, t,   r),
-                 inflow_p  = _ri(nHyd, t,   r),
+                 # Inflow slot inside the uncertainty parameter: stride n_unc
+                 # (= nHyd without demand noise — unchanged; = nHyd+1 with it,
+                 # skipping the per-stage ξ_t slot).
+                 inflow_p  = _ri(n_unc, t,   r),
                  K = K)
                 for t in 1:T for r in 1:nHyd]
     c_wb = ExaModels.constraint(core,
@@ -1046,6 +1130,11 @@ function _build_ac_hydro_de(power_data::PowerData,
         Float64.([h.min_turn for h in hydro_data.units]),
         Float64.([h.max_vol for h in hydro_data.units]),
         rq_mode,
+        n_unc,   # per-stage uncertainty width (nHyd, or nHyd+1 with demand noise)
+        # BASE demand [T × nBus] for prepare_solve!'s ξ_t multiplication;
+        # nothing keeps the deterministic path bit-identical.
+        demand_spread === nothing ? nothing :
+            Float64.(permutedims(reshape(init_demand, nBus, T))),
     )
 end
 
@@ -1068,18 +1157,74 @@ end
 """
     set_inflows!(prob, w)
 
-Set the inflow trajectory. `w` is a flat vector of length `T*nHyd` (stage-major).
+Set the uncertainty trajectory. `w` is a flat stage-major vector of length
+`T*n_uncertainty`: without demand noise this is exactly the inflow trajectory
+(`n_uncertainty = nHyd`); with demand noise each stage block is `[w_t; ξ_t]`
+(`n_uncertainty = nHyd + 1`).
 """
 function set_inflows!(prob::HydroExaDEProblem, w::AbstractVector)
-    expected = prob.horizon * prob.nHyd
-    length(w) == expected || error("w must have length T*nHyd=$expected")
+    # Expected flat length follows the problem's per-stage uncertainty width.
+    expected = prob.horizon * prob.n_uncertainty
+    length(w) == expected || error("w must have length T*n_uncertainty=$expected")
     ExaModels.set_parameter!(prob.core, prob.p_inflow, w)
     return prob
 end
 
+"""
+    prepare_solve!(prob::HydroExaDEProblem, init_state, w_flat, xhat_flat) -> Nothing
+
+Pre-solve hook (called by the training loop, the rollout callback, and the
+one-shot scripts immediately before every MadNLP solve). Two jobs:
+
+1. **Stochastic demand** (only when the problem was built with
+   `demand_spread`): extract the per-stage demand factors `ξ_t` from the
+   augmented uncertainty vector (`w_flat[t·n_unc]`, the last entry of each
+   stage block `[w_t; ξ_t]`) and write the realized demand
+
+   ```math
+   pd_{t,b} = \\mathrm{base\\_demand}_{t,b} \\cdot \\xi_t
+   ```
+
+   into the `p_demand` parameter via [`set_demand!`](@ref). This runs in BOTH
+   the deterministic-equivalent training path (full-horizon `w`) and the
+   stage-wise rollout path (1-stage `w`), including inside multi-GPU worker
+   tasks (each worker's DE carries its own `base_demand`).
+2. **Strict-mode reservoir pinning** (only when `strict_targets`): apply the
+   Float64 cascade clamp to the target trajectory and write
+   `p_reservoir = [x0; x̂]`, preserving the invariant
+   `p_reservoir[1:nHyd] == x0` (see file-top comment).
+
+With `base_demand === nothing` and `p_reservoir === nothing` this is a no-op —
+bit-identical to the pre-demand-noise implementation.
+"""
 function prepare_solve!(prob::HydroExaDEProblem, init_state, w_flat, xhat_flat)
+    nH = prob.nHyd
+    # Per-stage uncertainty stride (nHyd, or nHyd+1 with demand noise).
+    nu = prob.n_uncertainty
+
+    # ── 1. Stochastic demand: p_demand[t,:] = base_demand[t,:] · ξ_t ─────────
+    if prob.base_demand !== nothing
+        T = prob.horizon
+        # Materialize the (possibly GPU) uncertainty vector once on the CPU.
+        w_cpu = Float64.(vec(Array(w_flat)))
+        # Guard: the caller must pass the AUGMENTED vector for a noise-enabled DE.
+        length(w_cpu) == T * nu ||
+            error("demand-noise DE expects w of length T*n_uncertainty=$(T*nu); got $(length(w_cpu))")
+        # Realized demand matrix: scale each base row by its stage factor.
+        demand = similar(prob.base_demand)
+        for t in 1:T
+            # ξ_t sits in the last slot of stage block t.
+            ξt = w_cpu[t * nu]
+            # Row-wise multiplicative demand realization.
+            demand[t, :] .= prob.base_demand[t, :] .* ξt
+        end
+        # Push the realized demand into the ExaModels parameter (device-safe:
+        # ExaModels.set_parameter! copyto!s a CPU vector into the GPU θ view).
+        set_demand!(prob, demand)
+    end
+
+    # ── 2. Strict mode: cascade-clamp targets and pin the reservoir path ─────
     if prob.p_reservoir !== nothing
-        nH = prob.nHyd
         T  = prob.horizon
         init = Float64.(vec(Array(init_state)))
         inflow = Float64.(vec(Array(w_flat)))
@@ -1089,7 +1234,9 @@ function prepare_solve!(prob::HydroExaDEProblem, init_state, w_flat, xhat_flat)
             for t in 1:T
                 x_prev = t == 1 ? init : view(xhat, (t-2)*nH+1:(t-1)*nH)
                 targets_t = view(xhat, (t-1)*nH+1:t*nH)
-                inflow_t = view(inflow, (t-1)*nH+1:t*nH)
+                # PHYSICAL inflow slice: first nH entries of stage block t
+                # (stride nu skips the ξ_t slot when demand noise is on).
+                inflow_t = view(inflow, (t-1)*nu+1:(t-1)*nu+nH)
                 for conn in prob.cascade
                     u, d = conn.upstream, conn.downstream
                     R_u = K * inflow_t[u] + x_prev[u] - targets_t[u]

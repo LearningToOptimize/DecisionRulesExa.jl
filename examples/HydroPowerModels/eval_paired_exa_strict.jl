@@ -168,6 +168,27 @@ const REACTIVE_DEFICIT_RAW = lowercase(strip(get(ENV, "DR_REACTIVE_DEFICIT", "ha
 const REACTIVE_DEFICIT_COST = REACTIVE_DEFICIT_RAW == "hard" ? Inf :
                               REACTIVE_DEFICIT_RAW == "free" ? nothing :
                               parse(Float64, REACTIVE_DEFICIT_RAW)
+
+# Stochastic demand (bolivia/demand_scenarios.csv, single line `s,<value>`):
+# i.i.d. per-stage multiplicative demand factor ξ_t ∈ {1−s, 1, 1+s} (P = 1/3),
+# independent of the inflow noise — the same model the SDDP baselines register
+# via sddp/sddp_demand_noise.jl and train_hydro_exa_strict.jl trains under.
+# For the PAIRED protocol, scenario column c uses the SEEDED demand path
+# StableRNG(DEMAND_NOISE_SEED + c) (protocol_demand_factors), identical to the
+# path the trainer's protocol eval and SDDP.Historical paired evaluator draw
+# for that column. Thus the comparison is paired over the complete joint
+# inflow-and-demand path, not merely distributional over demand.
+# When the file is absent every path below is bit-identical to the historical
+# evaluation.
+const DEMAND_SPREAD = load_demand_spread(joinpath(CASE_DIR, "demand_scenarios.csv"))
+const DEMAND_NOISE  = DEMAND_SPREAD !== nothing
+# MAIN reference checkpoints have policy input width 2·nHyd (no ξ slot); the
+# probe/open-loop parity gates are meaningless and would crash on the wider
+# demand-noise policy, so demand noise requires DR_CHECKPOINT_KIND=exa.
+DEMAND_NOISE && MAIN_PARITY_GATES &&
+    error("demand_scenarios.csv present: demand-noise evaluation requires DR_CHECKPOINT_KIND=exa " *
+          "(MAIN reference parity gates only apply to nHyd-input checkpoints)")
+DEMAND_NOISE && @info "Stochastic demand ACTIVE (seeded paired demand paths)" DEMAND_SPREAD
 # CPU MadNLP: same pattern as train_hydro_exa_strict.jl's SOLVER_KWARGS, but
 # this evaluation runs on a CPU node (backend = nothing everywhere).
 const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = MAX_ITER)
@@ -211,6 +232,37 @@ probe_out_ref = ref["probe_outputs"]        # [nHyd × 3]
 @info "Loaded reference: T=$T_EVAL, S=$NUM_SCEN from $REFERENCE_FILE"
 @assert size(inflow_ref) == (T_EVAL, nHyd, NUM_SCEN)
 @assert length(x0_ref) == nHyd
+
+# Seeded paired demand paths: column s of the protocol gets the demand factors
+# ξ[:, s] = protocol_demand_factors(s) — the identical path the trainer's
+# protocol eval uses for that column (column-keyed StableRNG seeding; see
+# hydro_power_data.jl). `nothing` when demand is deterministic.
+const demand_factors = DEMAND_NOISE ?
+    reduce(hcat, [protocol_demand_factors(DEMAND_SPREAD, T_EVAL, s) for s in 1:NUM_SCEN]) :
+    nothing   # [T_EVAL × NUM_SCEN] or nothing
+
+"""
+    augmented_stage_w(w_t::AbstractVector, t::Int, s::Int) -> Vector{Float64}
+
+Stage-t uncertainty block for paired scenario `s`: the inflow vector `w_t`
+alone (deterministic demand), or `[w_t; ξ_t^{(s)}]` with the seeded paired
+demand factor appended (stochastic demand).
+"""
+augmented_stage_w(w_t::AbstractVector, t::Int, s::Int) =
+    DEMAND_NOISE ? vcat(Float64.(w_t), demand_factors[t, s]) : Float64.(w_t)
+
+"""
+    augmented_flat_w(w_flat::AbstractVector, s::Int) -> Vector{Float64}
+
+Full-horizon stage-major uncertainty vector for paired scenario `s`: the flat
+inflow trajectory unchanged (deterministic demand), or with the seeded paired
+demand factor ξ_t^{(s)} interleaved into each stage block (stochastic demand).
+"""
+augmented_flat_w(w_flat::AbstractVector, s::Int) =
+    DEMAND_NOISE ? augment_scenario(Float64.(w_flat), demand_factors[:, s]) : Float64.(w_flat)
+
+# Per-stage uncertainty width used by the rollout machinery below.
+const N_UNC = nHyd + (DEMAND_NOISE ? 1 : 0)
 
 ref_string(key::AbstractString, default::AbstractString) =
     haskey(ref, key) ? string(ref[key]) : default
@@ -260,6 +312,9 @@ base_policy = hydro_reachable_policy(
     activation = ACTIVATION,
     combiner_layers = HEAD_LAYERS,
     n_context = N_CONTEXT,
+    # Demand-noise checkpoints were trained with the encoder observing ξ_t;
+    # the constructor must match the checkpoint's input width.
+    n_extra_uncertainty = DEMAND_NOISE ? 1 : 0,
 )
 policy = isnothing(STAGE_CONTEXT) ? base_policy : ContextualPolicy(base_policy, STAGE_CONTEXT)
 policy_core(policy) = policy isa ContextualPolicy ? policy.policy : policy
@@ -548,6 +603,9 @@ function _build_rollout_de()
         load_scaler    = LOAD_SCALER,
         strict_targets = true,
         reactive_deficit_cost = REACTIVE_DEFICIT_COST,  # header item 3
+        # Stochastic demand: prepare_solve! multiplies the (constant, 0.6 ×
+        # default) base demand by the ξ_t carried in the stage's wt block.
+        demand_spread  = DEMAND_SPREAD,
     )
 end
 @info "Building 1-stage strict ExaModels stage problem (CPU, formulation=$FORMULATION)..."
@@ -655,13 +713,17 @@ for s in 1:NUM_SCEN
     total = 0.0
     failed = false
     for t in 1:T_EVAL
-        # Authoritative inflow values from the MAIN reference (see gate item 2).
-        w_t = inflow_ref[t, :, s]
-        # Policy call with Float32 inputs, exactly as MAIN's closed loop does.
+        # Authoritative inflow values from the MAIN reference (see gate item 2),
+        # with the seeded paired demand factor ξ_t^{(s)} appended when
+        # stochastic demand is active ([w_t; ξ_t] block).
+        w_t = augmented_stage_w(inflow_ref[t, :, s], t, s)
+        # Policy call with Float32 inputs, exactly as MAIN's closed loop does
+        # (the policy slices the physical inflow internally).
         x_hat = Float64.(policy(vcat(Float32.(w_t), Float32.(state))))
         target_traj[:, t, s] = x_hat
 
-        # Write x_{t-1}, w_t, x̂_t into the strict stage problem.
+        # Write x_{t-1}, [w_t; ξ_t], x̂_t into the strict stage problem
+        # (prepare_solve! applies base_demand · ξ_t via set_demand!).
         set_hydro_rollout_stage!(rollout_prob, state, w_t, x_hat, t)
 
         # Cold one-shot solve (rollout_tsddr's fresh-solver path).
