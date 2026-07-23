@@ -81,7 +81,7 @@ For a custom problem you need:
 - **An uncertainty sampler** `() -> w_flat` returning a flat `Float32`/`Float64` vector of length `T * nw`.
 - **A Flux policy** (LSTM or MLP) mapping `(w_t, x_{t-1})` to target `x_t` at each stage.
 
-The package provides `build_deterministic_equivalent` for generic problems and `build_linear_tracking_problem` as a ready-made demo. For domain-specific models (power systems, robotics), build the ExaModels NLP directly — see `examples/HydroPowerModels/` for a complete AC-OPF example.
+The package provides `build_deterministic_equivalent` for generic problems and `build_linear_tracking_problem` as a ready-made demo. For domain-specific models, build the ExaModels NLP directly; `examples/BatteryStorageOPF/` contains an AC-OPF battery example.
 
 ## Strict reachable target equality
 
@@ -279,7 +279,7 @@ Choose DecisionRules.jl when:
 
 - [`examples/end_to_end_cpu.jl`](examples/end_to_end_cpu.jl) — minimal CPU demo with a linear tracking problem
 - [`examples/end_to_end_gpu.jl`](examples/end_to_end_gpu.jl) — same demo on GPU with CUDSS
-- [`examples/HydroPowerModels/`](examples/HydroPowerModels/) — full multi-stage hydrothermal scheduling with DC and AC OPF (open-loop DE, embedded closed-loop, strict targets, critic control variate)
+- [`examples/BatteryStorageOPF/`](examples/BatteryStorageOPF/) — reproducible PGLib AC-OPF cases with linear battery storage
 
 ## Repository Map
 
@@ -295,7 +295,7 @@ Choose DecisionRules.jl when:
 | `src/utils.jl` | Indexing and small shared utilities |
 | `examples/end_to_end_cpu.jl` | Minimal CPU training demo |
 | `examples/end_to_end_gpu.jl` | Minimal GPU training demo |
-| `examples/HydroPowerModels/` | Bolivia hydrothermal scheduling examples |
+| `examples/BatteryStorageOPF/` | PGLib AC-OPF battery-storage example |
 | `test/runtests.jl` | Unit and smoke tests |
 
 ## Citation

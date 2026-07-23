@@ -1,0 +1,3 @@
+# Generated outputs from run_case300.jl (manifests + battery tables are
+# reproducible from the seeded API, so they are not tracked).
+results/
