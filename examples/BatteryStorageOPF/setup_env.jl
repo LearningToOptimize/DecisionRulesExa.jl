@@ -1,42 +1,33 @@
 # setup_env.jl
 #
-# One-shot helper that resolves the BatteryStorageOPF example environment.
-# It activates THIS directory and adds the pinned dependency set, letting Pkg
-# fetch the correct UUIDs and a mutually compatible set of versions from the
-# registry. Run once (or after deleting Manifest.toml):
+# One-shot helper that resolves the BatteryStorageOPF example environment. It
+# activates THIS directory and instantiates the dependency set declared in
+# Project.toml — including the parent DecisionRulesExa package, brought in through
+# the relative `[sources]` path — letting Pkg fetch a mutually compatible set of
+# versions and precompile them. Run once (or after deleting Manifest.toml):
 #
-#   module load julia
-#   julia --project=examples/BatteryStorageOPF examples/BatteryStorageOPF/setup_env.jl
+#   module load julia            # Julia 1.12.x (matches the parent package)
+#   julia --pkgimages=no --project=examples/BatteryStorageOPF \
+#         examples/BatteryStorageOPF/setup_env.jl
 #
-# The depot lives in /tmp per project policy; do not redirect it elsewhere.
+# The depot lives in /tmp per project policy; do not redirect it elsewhere. On a
+# fresh node-local depot the General registry is installed first.
 
 import Pkg
 Pkg.activate(@__DIR__)
 
-# User-facing PGLib benchmark source + power-flow modeling stack, the ExaModels
-# builder + its CPU NLP solver (MadNLP), the independent JuMP/Ipopt reference,
-# the seeded RNG for reproducible placement, and JSON/SHA for the manifest.
-Pkg.add([
-    Pkg.PackageSpec(name = "PGLib"),
-    Pkg.PackageSpec(name = "PowerModels"),
-    Pkg.PackageSpec(name = "StableRNGs"),
-    Pkg.PackageSpec(name = "ExaModels"),
-    Pkg.PackageSpec(name = "MadNLP"),
-    Pkg.PackageSpec(name = "NLPModels"),
-    Pkg.PackageSpec(name = "JuMP"),
-    Pkg.PackageSpec(name = "Ipopt"),
-    Pkg.PackageSpec(name = "JSON"),
-    # Standard libraries used directly by the example (must be explicit deps in
-    # a project environment).
-    Pkg.PackageSpec(name = "TOML"),
-    Pkg.PackageSpec(name = "SHA"),
-    Pkg.PackageSpec(name = "Random"),
-    Pkg.PackageSpec(name = "LinearAlgebra"),
-    Pkg.PackageSpec(name = "Test"),
-    Pkg.PackageSpec(name = "Statistics"),
-    Pkg.PackageSpec(name = "Printf"),
-])
+# A fresh /tmp depot has no registry; install General before resolving.
+try
+    Pkg.Registry.add("General")
+catch err
+    @info "General registry already present or add skipped" err
+end
 
+# Resolve + install + precompile everything declared in Project.toml (deps +
+# [sources] DecisionRulesExa). This pulls the TS-DDR stack (Flux, Zygote, CUDA,
+# MadNLP/MadNLPGPU) plus the PGLib/PowerModels/ExaModels modeling stack.
+Pkg.resolve()
+Pkg.instantiate()
 Pkg.precompile()
 
 @info "BatteryStorageOPF environment resolved" project = Base.active_project()
