@@ -2,17 +2,17 @@
 
 The GPU half of the published case study. This directory trains and evaluates
 the strict TS-DDR policy on the Bolivian interconnected system; the case, the
-SDDP baseline, the parity gate and the figures live in the companion package,
+SDDP baseline and the figures live in the companion package,
 `DecisionRules.jl/examples/HydroPowerModels`.
 
-The two packages share the case bytes and four source files **byte for byte**:
+The two packages share the case bytes and two source files **byte for byte**:
 `bolivia/{PowerModels.json, hydro.json, inflows.csv, *.mof.json,
 case_manifest.json}`, `generate_canonical_case_artifacts.jl`,
-`hydro_reachable_reference.jl` and `hydro_solution_schema.jl`. The case files are
-mirrored by the other package's `export_subproblem_mof.jl --exa-root=…`; the
-source files are copies whose identity is the point — asserting the same contract
-and the same oracle in both engines establishes cross-engine parity without
-either package depending on the other.
+and `hydro_solution_schema.jl`. The case files are mirrored by the other
+package's `export_subproblem_mof.jl --exa-root=…`; the source files are copies
+whose identity is the point — both engines assert the same case contract and
+write their solutions in the same format, without either package depending on
+the other.
 
 The frozen case is described once, in the other package's
 [`README.md`](../../../DecisionRules.jl/examples/HydroPowerModels/README.md);
@@ -28,15 +28,13 @@ balance, load shedding priced at `6000 USD/(pu·stage)`, 126 stages simulated an
 | `hydro_power_data.jl` | parses `PowerModels.json` / `hydro.json` / `inflows.csv` into the flat arrays the ExaModels builder consumes |
 | `hydro_power_exa.jl` | builds the `ExaModel`: AC-polar or DC, strict or penalized targets, with `hydro_solution` to unpack a solved point into named blocks |
 | `hydro_reachable_policy.jl` | the feasibility-guaranteeing policy (LSTM encoder over inflow, state-conditioned head, targets mapped into the one-stage reachable interval) |
-| `hydro_reachable_reference.jl` | engine-independent oracle for that map; byte-identical to the JuMP engine's copy |
-| `hydro_solution_schema.jl` | the shared long-format solution schema; byte-identical to the JuMP engine's copy |
+| `hydro_solution_schema.jl` | the long format in which a full physical solution is written; byte-identical to the JuMP engine's copy |
 | `hydro_training_utils.jl` | small shared helpers for the training scripts |
 | `train_hydro_exa_strict.jl` | ONE training stage, fully parameterized by environment variables |
 | `run_tsddr_lineage.jl` | the lineage driver: runs a declared multi-stage schedule end to end, chaining only selected checkpoints |
 | `lineage_from_scratch.json` | the published from-scratch schedule (coldB → C1 → C3) |
 | `eval_paired_exa.jl` | paired evaluation of a checkpoint, with per-stage physical recording and an optional full-solution dump |
 | `generate_canonical_case_artifacts.jl` | the frozen-case contract and its verifier |
-| `test/runtests.jl` | the example's regression suite |
 
 ## Commands
 
@@ -48,13 +46,7 @@ Run from this directory with `--project=.`.
 julia --project=. generate_canonical_case_artifacts.jl --verify
 ```
 
-**2. Regression suite.**
-
-```bash
-julia --project=. test/runtests.jl
-```
-
-**3. A short GPU smoke run** — a few updates on a short horizon, to confirm the
+**2. A short GPU smoke run** — a few updates on a short horizon, to confirm the
 GPU stack (MadNLPGPU + CUDSS + cuDNN) is working before committing hours:
 
 ```bash
@@ -65,7 +57,7 @@ DR_ENABLE_WANDB=false \
   julia --project=. -t auto train_hydro_exa_strict.jl
 ```
 
-**4. The full from-scratch training recipe.** This is the published schedule,
+**3. The full from-scratch training recipe.** This is the published schedule,
 declared in `lineage_from_scratch.json` and executed stage by stage:
 
 ```bash
@@ -90,7 +82,7 @@ lineage-level ledger.
 Neither W&B nor a workload manager is required. `DR_ENABLE_WANDB=false` turns
 logging off; nothing in the driver reads a scheduler variable.
 
-**5. Paired evaluation of a checkpoint.**
+**4. Paired evaluation of a checkpoint.**
 
 ```bash
 DR_EVAL_CKPT=/path/to/checkpoint.jld2 DR_EVAL_LABEL=my_policy \
@@ -102,8 +94,10 @@ DR_EVAL_COL_FIRST=1 DR_EVAL_COL_LAST=50 \
 ```
 
 Adding `DR_SOLUTION_DUMP=1` additionally writes the full primal solution of every
-stage and the decision trace that reproduces it, in the shared long format — the
-input to the JuMP engine's `verify_full_solution_parity.jl`.
+stage and the decision trace that reproduces it, in the shared long format of
+`hydro_solution_schema.jl` — the per-bus, per-branch physics the stagewise
+figures are built from. (Nodal prices are duals and come from the JuMP engine's
+evaluators, which have them directly.)
 
 ## Configuration surface of one training stage
 
