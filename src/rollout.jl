@@ -259,6 +259,13 @@ where ``\\pi_\\theta`` is the learned policy (`model`),
   feasibility repairs via [`_project_realized_state`](@ref).
 - `retry_on_failure::Bool`: if `true`, failed or non-finite solves are
   retried once with a cold-start solver.
+- `stage_recorder`: `nothing`, or a callable
+  `f(stage_problem, result, stage, target, state_in) -> nothing` invoked after
+  each ACCEPTED stage solve. It exists so a diagnostic can read the stage
+  solution (per-bus load shedding, dispatch, turbine/spill decisions) off the
+  problem the rollout has already solved, without re-solving and without a
+  second, divergent rollout implementation. It is called for side effects only
+  and must not mutate the stage problem; `nothing` is a strict no-op.
 
 # Returns
 - `nothing` if any stage solve fails after retry.
@@ -307,6 +314,7 @@ function rollout_tsddr(
     state_bounds = nothing,
     project_state = nothing,
     retry_on_failure::Bool = true,
+    stage_recorder = nothing,
 )
     # --- Input validation ---------------------------------------------------
     horizon >= 1 || throw(ArgumentError("horizon must be >= 1"))
@@ -427,6 +435,12 @@ function rollout_tsddr(
         # Final guard: abort if the penalty-free cost is still non-finite.
         isfinite(no_penalty) || return nothing
 
+        # --- Optional diagnostic read-out of the accepted stage solve ------
+        # Runs on the solution already computed above (no extra solve) and is
+        # skipped entirely in production, where `stage_recorder === nothing`.
+        stage_recorder === nothing ||
+            stage_recorder(stage_problem, result, stage, target_f64, state_f64)
+
         # --- Accumulate costs and advance the state ------------------------
         objective += result.objective            # add stage cost to cumulative total
         objective_no_penalty += no_penalty       # add penalty-free stage cost
@@ -486,9 +500,20 @@ Store configuration and mutable summaries for periodic rollout evaluation.
 - `last_objective::Float64`: mean objective across successful scenarios.
 - `last_objective_no_target_penalty::Float64`: mean penalty-free objective.
 - `last_violation_share::Float64`: mean target-violation share.
+- `retry_failed_sequentially::Bool`: after the main pass, retry each failed
+  scenario once through a fresh sequential solve.
 - `last_n_ok::Int`: number of scenarios that solved successfully.
+- `last_n_requested::Int`: number of scenarios the last evaluation was asked
+  for, i.e. `min(active_scenarios, length(scenarios))`.
+- `last_scenario_status::Vector{Symbol}`: one entry per REQUESTED scenario, in
+  scenario order: `:ok`, `:ok_on_retry`, or `:failed`.
+- `last_failed_scenarios::Vector{Int}`: indices (into `scenarios`) that did not
+  solve, including after any retry.
 - `last_scenario_data::Vector{Any}`: per-scenario `(index, result)` pairs
-  from the most recent evaluation.
+  from the most recent evaluation, ascending in `index`.
+- `stage_recorder`: `nothing`, or the per-stage read-out callback forwarded to
+  [`rollout_tsddr`](@ref) (see its docstring). With a stage-problem pool it
+  runs concurrently on several tasks and must therefore be thread-safe.
 
 # Notes
 The struct is callable as `evaluation(iter, model)`. At every `stride`-th
@@ -496,6 +521,24 @@ iteration, it runs [`rollout_tsddr`](@ref) on up to `active_scenarios`
 scenarios and updates the mutable summary fields. When `stage_problem_pool`
 contains more than one entry, scenarios are distributed across the pool with
 `Threads.@spawn`.
+
+## Scenario identity is structural, not incidental
+
+Both the sequential and the pooled path write scenario `i`'s result into slot
+`i` of a pre-sized vector, so `last_scenario_status`, `last_failed_scenarios`
+and `last_scenario_data` refer to the same scenario indices no matter how the
+evaluation was executed, and `last_scenario_data` is always ascending in
+`index`. A scenario is never dropped, renumbered or reordered.
+
+## A partial evaluation is never silently a complete one
+
+`last_objective` and `last_objective_no_target_penalty` are means over the
+scenarios that SOLVED. If one expensive scenario fails, that mean is a
+different — and typically better-looking — statistic than the one it is
+compared against, so selecting a checkpoint on it is unsound. Callers must
+gate on [`is_complete`](@ref) (or on `last_n_ok == last_n_requested`); the
+struct deliberately does not overwrite the mean with `NaN`, because the partial
+mean is still useful diagnostically as long as its incompleteness is visible.
 
 Thread-safety: the single `set_stage_parameters!`, `realized_state`, and
 `objective_no_target_penalty` callbacks are shared across all spawned tasks
@@ -525,12 +568,40 @@ mutable struct RolloutEvaluation <: Function
     retry_on_failure::Bool                   # retry failed solves with cold start
     stage_problem_pool::Vector               # pool of stage problems for parallel evaluation
     active_scenarios::Int                    # how many scenarios to evaluate (leq length(scenarios))
+    retry_failed_sequentially::Bool          # retry failures once through a fresh sequential solve
     last_objective::Float64                  # mean objective from last evaluation
     last_objective_no_target_penalty::Float64 # mean penalty-free objective from last evaluation
     last_violation_share::Float64            # mean target-violation share from last evaluation
     last_n_ok::Int                           # number of successful scenarios in last evaluation
+    last_n_requested::Int                    # number of scenarios the last evaluation asked for
+    last_scenario_status::Vector{Symbol}     # per requested scenario: :ok / :ok_on_retry / :failed
+    last_failed_scenarios::Vector{Int}       # scenario indices still unsolved after any retry
     last_scenario_data::Vector{Any}          # per-scenario (index, result) pairs from last eval
+    stage_recorder                           # per-stage read-out callback, or nothing
 end
+
+"""
+    is_complete(evaluation::RolloutEvaluation) -> Bool
+
+Whether the last evaluation solved EVERY scenario it was asked for.
+
+# Arguments
+- `evaluation::RolloutEvaluation`: an evaluation that has been called at least
+  once at a `stride`-aligned iteration.
+
+# Returns
+- `Bool`: `true` when `last_n_requested > 0` and no requested scenario failed.
+
+# Notes
+This is the gate a checkpoint-selection rule must use. `last_objective` and
+`last_objective_no_target_penalty` are means over SOLVED scenarios only, so an
+incomplete evaluation produces a number that is not comparable to a complete
+one and must never be accepted as a selection score. Returns `false` before the
+first evaluation, when `last_n_requested` is still `0`.
+"""
+is_complete(evaluation::RolloutEvaluation) =
+    evaluation.last_n_requested > 0 &&
+    evaluation.last_n_ok == evaluation.last_n_requested
 
 """
     RolloutEvaluation(
@@ -552,6 +623,8 @@ end
         retry_on_failure::Bool = true,
         stage_problem_pool::Vector = [],
         active_scenarios::Int = length(scenarios),
+        retry_failed_sequentially::Bool = false,
+        stage_recorder = nothing,
     ) -> RolloutEvaluation
 
 Construct a [`RolloutEvaluation`](@ref) callback for periodic out-of-sample
@@ -590,6 +663,17 @@ initialized to `NaN` / `0` / empty and are populated on the first call.
   otherwise results race.
 - `active_scenarios::Int`: cap on how many scenarios to evaluate (defaults
   to all).
+- `retry_failed_sequentially::Bool`: when `true`, any scenario that failed the
+  main pass is retried ONCE, sequentially, on `stage_problem` with a fresh
+  solver and no warm start, and is marked `:ok_on_retry` if it then succeeds.
+  Defaults to `false`, which leaves the evaluation exactly as it has always
+  behaved. This exists because the pooled path has been observed to lose a
+  scenario that the sequential path solves; the retry recovers it instead of
+  quietly shrinking the sample.
+- `stage_recorder`: `nothing`, or a per-stage read-out callback forwarded to
+  [`rollout_tsddr`](@ref). `nothing` (the default) is a strict no-op. With a
+  pool of more than one stage problem the callback runs concurrently and must
+  be thread-safe.
 
 # Returns
 - `RolloutEvaluation`: callable training callback with empty result summaries.
@@ -631,6 +715,8 @@ function RolloutEvaluation(
     retry_on_failure::Bool = true,
     stage_problem_pool::Vector = [],
     active_scenarios::Int = length(scenarios),
+    retry_failed_sequentially::Bool = false,
+    stage_recorder = nothing,
 )
     # At least one scenario is required for meaningful evaluation.
     isempty(scenarios) && throw(ArgumentError("scenarios must be nonempty"))
@@ -661,11 +747,69 @@ function RolloutEvaluation(
         retry_on_failure,
         collect(stage_problem_pool),       # materialize the pool to a concrete Vector
         active_scenarios,
+        retry_failed_sequentially,         # retry failures on a fresh sequential solve
         NaN,                               # last_objective: not yet evaluated
         NaN,                               # last_objective_no_target_penalty
         NaN,                               # last_violation_share
         0,                                 # last_n_ok: no successful scenarios yet
+        0,                                 # last_n_requested: nothing requested yet
+        Symbol[],                          # last_scenario_status: empty until first eval
+        Int[],                             # last_failed_scenarios: empty until first eval
         Any[],                             # last_scenario_data: empty until first eval
+        stage_recorder,                    # per-stage read-out callback (default: none)
+    )
+end
+
+"""
+    _evaluate_scenario(evaluation, model, stage_problem, i; solver_state, reuse_solver)
+
+Run one rollout for scenario `i` under `evaluation`'s configuration.
+
+# Arguments
+- `evaluation::RolloutEvaluation`: supplies every rollout keyword.
+- `model`: the policy to evaluate. Must be exclusively owned by the caller —
+  [`rollout_tsddr`](@ref) resets and threads the policy's recurrent state.
+- `stage_problem`: the stage problem this rollout may write into.
+- `i::Integer`: index into `evaluation.scenarios`.
+
+# Keywords
+- `solver_state`: pre-built solver, or `nothing`.
+- `reuse_solver::Bool`: reuse one solver across the horizon.
+
+# Returns
+- The rollout `NamedTuple`, or `nothing` if any stage failed after retry.
+
+# Notes
+Exists so the sequential and the pooled path cannot drift apart: they differ
+only in the two keywords above and in who owns `model` and `stage_problem`.
+"""
+function _evaluate_scenario(
+    evaluation::RolloutEvaluation,
+    model,
+    stage_problem,
+    i::Integer;
+    solver_state,
+    reuse_solver::Bool,
+)
+    return rollout_tsddr(
+        model,
+        evaluation.initial_state,
+        stage_problem,
+        evaluation.scenarios[i];
+        horizon = evaluation.horizon,
+        n_uncertainty = evaluation.n_uncertainty,
+        set_stage_parameters! = evaluation.set_stage_parameters!,
+        realized_state = evaluation.realized_state,
+        objective_no_target_penalty = evaluation.objective_no_target_penalty,
+        madnlp_kwargs = evaluation.madnlp_kwargs,
+        warmstart = evaluation.warmstart,
+        policy_state = evaluation.policy_state,
+        solver_state = solver_state,
+        reuse_solver = reuse_solver,
+        state_bounds = evaluation.state_bounds,
+        project_state = evaluation.project_state,
+        retry_on_failure = evaluation.retry_on_failure,
+        stage_recorder = evaluation.stage_recorder,
     )
 end
 
@@ -686,77 +830,56 @@ Evaluate `model` on rollout scenarios when `iter` is aligned with
 # Notes
 If `iter % evaluation.stride != 0`, the method only clears stale per-scenario
 data and returns. Otherwise it records mean objective, mean penalty-free
-objective, mean target-violation share, the number of successful scenarios, and
+objective, mean target-violation share, the number of successful scenarios,
+the per-scenario status vector, the indices of any scenarios that failed, and
 per-scenario results.
+
+Scenario `i` is always written into slot `i`, sequentially and in the pooled
+path alike, so identity and order survive parallel execution. Failures are
+REPORTED (`last_scenario_status`, `last_failed_scenarios`), never dropped
+silently; see [`is_complete`](@ref) before using the resulting means to select
+anything.
 """
 function (evaluation::RolloutEvaluation)(iter, model)
     empty!(evaluation.last_scenario_data)
+    empty!(evaluation.last_scenario_status)
+    empty!(evaluation.last_failed_scenarios)
     iter % evaluation.stride == 0 || return nothing
 
     n_eval = min(evaluation.active_scenarios, length(evaluation.scenarios))
     pool   = evaluation.stage_problem_pool
     nw     = length(pool)
 
-    total = 0.0
-    total_no_penalty = 0.0
-    n_ok = 0
+    evaluation.last_n_requested = n_eval
+    # Slot i holds scenario i's result in BOTH paths, so nothing downstream has
+    # to know how the evaluation was executed.
+    results = Vector{Union{Nothing, NamedTuple}}(nothing, n_eval)
 
     if nw <= 1
-        # Sequential path (original behavior)
+        # Sequential path (original behavior: the caller's model object, the
+        # caller's solver, warm start as configured).
         for i in 1:n_eval
-            result = rollout_tsddr(
-                model,
-                evaluation.initial_state,
-                evaluation.stage_problem,
-                evaluation.scenarios[i];
-                horizon = evaluation.horizon,
-                n_uncertainty = evaluation.n_uncertainty,
-                set_stage_parameters! = evaluation.set_stage_parameters!,
-                realized_state = evaluation.realized_state,
-                objective_no_target_penalty = evaluation.objective_no_target_penalty,
-                madnlp_kwargs = evaluation.madnlp_kwargs,
-                warmstart = evaluation.warmstart,
-                policy_state = evaluation.policy_state,
+            results[i] = _evaluate_scenario(
+                evaluation, model, evaluation.stage_problem, i;
                 solver_state = evaluation.solver_state,
                 reuse_solver = evaluation.reuse_solver,
-                state_bounds = evaluation.state_bounds,
-                project_state = evaluation.project_state,
-                retry_on_failure = evaluation.retry_on_failure,
             )
-            result === nothing && continue
-            total += result.objective
-            total_no_penalty += result.objective_no_target_penalty
-            n_ok += 1
-            push!(evaluation.last_scenario_data, (i, result))
         end
     else
-        # Parallel path: distribute scenarios across pool
-        results = Vector{Union{Nothing, NamedTuple}}(nothing, n_eval)
+        # Parallel path: distribute scenarios across the pool. Each task gets
+        # its OWN policy copy (the policy carries mutable recurrent state) and
+        # its own stage problem and solver.
         for round_start in 1:nw:n_eval
             round_end = min(round_start + nw - 1, n_eval)
             tasks = Task[]
             for i in round_start:round_end
                 wi = i - round_start + 1
                 sp = pool[wi]
-                scenario = evaluation.scenarios[i]
                 m_copy = deepcopy(model)
-                t = Threads.@spawn rollout_tsddr(
-                    m_copy,
-                    evaluation.initial_state,
-                    sp,
-                    scenario;
-                    horizon = evaluation.horizon,
-                    n_uncertainty = evaluation.n_uncertainty,
-                    set_stage_parameters! = evaluation.set_stage_parameters!,
-                    realized_state = evaluation.realized_state,
-                    objective_no_target_penalty = evaluation.objective_no_target_penalty,
-                    madnlp_kwargs = evaluation.madnlp_kwargs,
-                    warmstart = evaluation.warmstart,
-                    policy_state = evaluation.policy_state,
+                t = Threads.@spawn _evaluate_scenario(
+                    evaluation, m_copy, sp, i;
+                    solver_state = nothing,
                     reuse_solver = false,
-                    state_bounds = evaluation.state_bounds,
-                    project_state = evaluation.project_state,
-                    retry_on_failure = evaluation.retry_on_failure,
                 )
                 push!(tasks, t)
             end
@@ -764,14 +887,42 @@ function (evaluation::RolloutEvaluation)(iter, model)
                 results[round_start + j - 1] = fetch(t)
             end
         end
-        for (idx, r) in enumerate(results)
-            r === nothing && continue
-            total += r.objective
-            total_no_penalty += r.objective_no_target_penalty
-            n_ok += 1
-            push!(evaluation.last_scenario_data, (idx, r))
+    end
+
+    # --- Status bookkeeping, then the optional single retry ------------------
+    status = Symbol[r === nothing ? :failed : :ok for r in results]
+    if evaluation.retry_failed_sequentially
+        # A fresh SEQUENTIAL solve: the caller's own stage problem, a new
+        # solver, no warm start and no pool concurrency. This is the path whose
+        # reproducibility is established, so it recovers scenarios the pooled
+        # evaluator loses instead of letting the sample shrink.
+        for i in findall(==(:failed), status)
+            retried = _evaluate_scenario(
+                evaluation, model, evaluation.stage_problem, i;
+                solver_state = nothing,
+                reuse_solver = false,
+            )
+            if retried !== nothing
+                results[i] = retried
+                status[i] = :ok_on_retry
+            end
         end
     end
+
+    total = 0.0
+    total_no_penalty = 0.0
+    n_ok = 0
+    for (i, r) in enumerate(results)
+        if r === nothing
+            push!(evaluation.last_failed_scenarios, i)
+            continue
+        end
+        total += r.objective
+        total_no_penalty += r.objective_no_target_penalty
+        n_ok += 1
+        push!(evaluation.last_scenario_data, (i, r))
+    end
+    append!(evaluation.last_scenario_status, status)
 
     evaluation.last_n_ok = n_ok
     if n_ok == 0

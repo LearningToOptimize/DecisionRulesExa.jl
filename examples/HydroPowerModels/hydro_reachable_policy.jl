@@ -155,6 +155,14 @@ Return `x` as a vector with the same array family and element type as `ref`.
 # Notes
 This keeps metadata such as `min_vol` and `max_vol` on the same device as the
 policy forward pass: CPU inputs stay on CPU, GPU inputs stay on GPU.
+
+`ref` supplies ONLY an element type and a device family — the returned VALUES
+are `x`, which is frozen policy metadata. The map is therefore constant in
+both arguments, and the `Zygote.@nograd` declaration below is EXACT, not an
+approximation. It is required because the device adaptation goes through
+`similar` + `copyto!`, and Zygote refuses to differentiate array mutation;
+without it the (now differentiable) reachability bounds could not be traced at
+all. See [`_hydro_reachable_bounds`](@ref).
 """
 function _hydro_adapt_bound(x::AbstractVector, ref::AbstractArray)
     # `ref` may be a vector (one scenario) or a matrix (batched); either way we
@@ -166,6 +174,9 @@ function _hydro_adapt_bound(x::AbstractVector, ref::AbstractArray)
     copyto!(y, convert.(eltype(ref), x))
     return y
 end
+# Constant in both arguments (see docstring): the output values are the frozen
+# metadata `x`; `ref` contributes only an element type and a device.
+Zygote.@nograd _hydro_adapt_bound
 
 """
     _hydro_adapt_index(x, ref)
@@ -189,6 +200,9 @@ function _hydro_adapt_index(x::AbstractVector, ref::AbstractVector)
     copyto!(y, x)
     return y
 end
+# Integer index metadata: constant in both arguments, and mutating (`copyto!`),
+# so it must be hidden from Zygote exactly as `_hydro_adapt_bound` is.
+Zygote.@nograd _hydro_adapt_index
 
 """
     _hydro_reachable_bounds(policy, inflow, x_prev, ref) -> (lower, upper)
@@ -222,6 +236,34 @@ equation and variable bounds. Substituting extremal admissible outflow/spill
 values gives an interval containing all one-stage reachable reservoir states.
 Mapping a sigmoid output into this interval therefore produces a reachable
 target in the relaxed one-stage balance.
+
+# Differentiability
+This function is DIFFERENTIABLE in `x_prev` and that is load-bearing. The
+emitted target is `x̂_t = l_t + (u_t − l_t) ⊙ y_t`, and both endpoints depend
+affinely on the previous state, so
+
+```math
+\\frac{\\partial \\hat{x}_t}{\\partial x_{t-1}}
+  = \\operatorname{diag}\\bigl(y_t\\bigr)
+    \\quad\\text{wherever } u_t = x_{t-1} + K w_t - K\\,\\underline{u} + c
+    \\text{ is off its } \\texttt{max\\_vol} \\text{ ceiling,}
+```
+
+plus `diag(1 − y_t)` on any coordinate whose lower bound is the spill-limited
+`lower_raw` rather than the constant `min_vol`. Because the TS-DDR actor loss
+`⟨λ, x̂(θ)⟩` feeds `x̂_{t-1}` back as the next stage's state input, suppressing
+this term truncates the adjoint recursion at EVERY stage — not only where a
+constraint binds — and the error compounds with the horizon.
+
+A `Zygote.@nograd` declaration used to sit here. Measured at the production
+operating point (T = 126, Bolivia, `min_turn ≡ 0`) it dropped the term on 34.6%
+of (stage, reservoir) pairs and left the applied update at cosine 0.673 / norm
+ratio 0.059 versus the true gradient, i.e. ~48° off-direction with 6% of the
+correct magnitude; finite differences agree with the differentiable form to six
+digits. It is therefore removed. The constant metadata lookups it also hid are
+now hidden individually and exactly by `Zygote.@nograd` on
+[`_hydro_adapt_bound`](@ref), which is what made the mutating device adaptation
+untraceable.
 """
 function _hydro_reachable_bounds(policy::HydroReachablePolicy, inflow, x_prev, ref)
     min_vol  = _hydro_adapt_bound(policy.min_vol, ref)
@@ -245,7 +287,6 @@ function _hydro_reachable_bounds(policy::HydroReachablePolicy, inflow, x_prev, r
     upper = max.(upper, lower)
     return lower, upper
 end
-Zygote.@nograd _hydro_reachable_bounds
 
 """
     _cascade_upper_bounds(policy, target, inflow, x_prev) -> upper
@@ -285,10 +326,15 @@ that respects the upstream target and cascade balance.
   over-tight for multi-level chains. Bolivia's three links
   (COR→SIS turbine-only, ZON→CHU turbine+spill, TAQ1→TAQ2 turbine+spill) are
   all single-level, so the bound is exact for that case.
-- **No gradient through the clamp.** `Zygote.@nograd` on this function means
-  that when the cascade clamp binds, the true dependence of the downstream
-  target on the upstream target carries no gradient — a deliberate
-  approximation that keeps the policy pullback cheap and well-defined.
+- **Gradient through the clamp.** This function is DIFFERENTIABLE: when the
+  clamp binds, the downstream target inherits `∂/∂x̂_u = −1` from
+  `release_u = K w_u + x_{u} − x̂_u` (turbine-capped links additionally pass
+  through `min`, whose pullback selects the active branch). Reservoirs with no
+  incoming link get the constant `Inf` branch of the `ifelse.`, which carries
+  no gradient — correct, since `min.(raw_target, Inf) == raw_target`. The
+  declaration was previously `Zygote.@nograd`; it was removed together with the
+  one on [`_hydro_reachable_bounds`](@ref), whose differentiable replica this
+  matches (see that docstring for the measurement).
 - **Physically infeasible edge case.** If the cascade upper bound falls below
   the reachable lower bound of `_hydro_reachable_bounds`, the clamped target
   can fall below `lower`. There is no policy-level remedy: the stage is
@@ -330,7 +376,6 @@ function _cascade_upper_bounds(policy::HydroReachablePolicy, target, inflow, x_p
     )
     return vec(minimum(link_by_reservoir; dims = 1))
 end
-Zygote.@nograd _cascade_upper_bounds
 
 """
     (policy::HydroReachablePolicy)(input) -> target
@@ -364,9 +409,10 @@ The cascade clamp inherits the assumptions documented on
   (COR→SIS turn-only, ZON→CHU turn+spill, TAQ1→TAQ2 turn+spill) are all
   single-level.
 - Both `_hydro_reachable_bounds` and `_cascade_upper_bounds` are
-  `Zygote.@nograd`, so when the cascade clamp binds, the downstream target's
-  true dependence on the upstream target carries no gradient (deliberate
-  approximation).
+  DIFFERENTIABLE, so the reachable interval's dependence on `x_prev` and the
+  binding cascade clamp's dependence on the upstream target both carry
+  gradient. (Only the constant metadata adapters `_hydro_adapt_bound` /
+  `_hydro_adapt_index` are `Zygote.@nograd`, which is exact.)
 - In the physically infeasible edge case where the cascade upper bound is
   below the reachable lower bound, the returned target can fall below `lower`;
   the stage is genuinely infeasible and no policy-level remedy exists.
@@ -422,11 +468,12 @@ function (m::HydroReachablePolicy)(input)
     lower, upper = _hydro_reachable_bounds(m, inflow, x_prev, y)
     # Because `y` is sigmoid-bounded, this affine map stays in [lower, upper].
     raw_target = lower .+ (upper .- lower) .* y
-    # The single-level cascade clamp uses per-reservoir index gathering (vector
-    # op) and is `@nograd`. For batched (matrix) input it is skipped: this is
-    # exact when imitating FEASIBLE targets (SDDP decisions respect the cascade
-    # balance, so `raw_target <= cascade_upper` and the clamp is a no-op). Single-
-    # scenario (vector) input keeps the full clamp — strict trainer/eval unchanged.
+    # The single-level cascade clamp is DIFFERENTIABLE (see
+    # `_cascade_upper_bounds`) and uses per-reservoir index gathering, a vector
+    # op. For batched (matrix) input it is skipped: this is exact when imitating
+    # FEASIBLE targets (SDDP decisions respect the cascade balance, so
+    # `raw_target <= cascade_upper` and the clamp is a no-op). Single-scenario
+    # (vector) input keeps the full clamp — strict trainer/eval unchanged.
     if !isempty(m.cascade) && ndims(input) == 1
         cascade_upper = _cascade_upper_bounds(m, raw_target, inflow, x_prev)
         return min.(raw_target, cascade_upper)

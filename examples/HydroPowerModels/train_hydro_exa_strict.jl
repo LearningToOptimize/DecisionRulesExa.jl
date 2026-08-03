@@ -74,6 +74,8 @@ using Flux
 using Statistics, Random, Dates
 using Logging   # Wandb loaded conditionally below (DR_ENABLE_WANDB) — see note at ENABLE_WANDB
 using JLD2
+using JSON      # machine-readable end-of-stage summary (DR_STAGE_SUMMARY)
+using SHA       # checkpoint hash recorded in that summary
 using MadNLP
 using MadNLPGPU, KernelAbstractions, CUDA
 using CUDSS, CUDSS_jll, cuDNN
@@ -254,6 +256,13 @@ const NUM_WORKERS    = let n = parse(Int, get(ENV, "DR_NUM_WORKERS", "1"))
 end
 
 const ROLLOUT_PARALLEL = parse(Bool, get(ENV, "DR_ROLLOUT_PARALLEL", "false"))
+# The pooled evaluator has been observed to lose a scenario that the sequential
+# path solves. Selection requires a COMPLETE evaluation, so losing one is not a
+# small numerical event — it silently replaces the ten-scenario mean with a
+# nine-scenario mean. With this on, each failed scenario is retried once through
+# a fresh sequential solve before the evaluation is judged. Off by default so
+# existing callers are unaffected.
+const ROLLOUT_RETRY_FAILED = parse(Bool, get(ENV, "DR_ROLLOUT_RETRY_FAILED", "false"))
 
 const MAX_ITER = parse(Int, get(ENV, "DR_MAX_ITER", "9000"))
 const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = MAX_ITER)
@@ -276,7 +285,19 @@ const _ACT_TAG   = ACTIVATION === sigmoid ? "" :
 # Demand-noise tag: runs with stochastic demand are a different experiment
 # family (different SP and different policy input width) — mark them.
 const _DN_TAG    = DEMAND_NOISE ? "-dnoise$(value_tag(DEMAND_SPREAD))" : ""
-const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-deteq-strict-gpu$(_CLIP_TAG)$(_ENC_TAG)$(_HEAD_TAG)$(_NT_TAG)$(_CTX_TAG)$(_EV_TAG)$(_SAVE_TAG)$(_WARM_TAG)$(_RQ_TAG)$(_ACT_TAG)$(_DN_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
+# Track identity. RUN_NAME is otherwise built only from case/architecture/tags plus a
+# to-the-second timestamp, and the LEARNING RATE is not part of it — so two lineages that
+# differ only in LR and start in the same second get the SAME RUN_NAME, hence the same
+# MODEL_PATH, and silently CLOBBER each other's checkpoints (observed 2026-07-30: warmL
+# and warmH both wrote …-nt48-…-20260730-174231.jld2). It also makes a chained cold-start
+# lineage indistinguishable from a warm one in W&B, since every stage after the first
+# loads a checkpoint and therefore carries the "-warm" tag.
+# DR_OUTPUT_TAG names the lineage; SLURM_JOB_ID is the fallback so a run is always
+# attributable to exactly one job even when the tag is unset.
+const _TRACK_TAG = let t = strip(get(ENV, "DR_OUTPUT_TAG", ""))
+    isempty(t) ? (haskey(ENV, "SLURM_JOB_ID") ? "-j$(ENV["SLURM_JOB_ID"])" : "") : "-$(t)"
+end
+const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-deteq-strict-gpu$(_CLIP_TAG)$(_ENC_TAG)$(_HEAD_TAG)$(_NT_TAG)$(_CTX_TAG)$(_EV_TAG)$(_SAVE_TAG)$(_WARM_TAG)$(_RQ_TAG)$(_ACT_TAG)$(_DN_TAG)$(_TRACK_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
 const MODEL_DIR = joinpath(CASE_DIR, FORM_LABEL, "models")
 mkpath(MODEL_DIR)
 const MODEL_PATH = joinpath(MODEL_DIR, RUN_NAME * ".jld2")
@@ -689,6 +710,35 @@ const _max_vols_dev = USE_GPU ? CUDA.cu(_max_vols) : _max_vols
 
 hydro_objective_no_target_penalty(stage_prob, result) = result.objective
 
+# ── Load-shedding telemetry for the rollout evaluation ────────────────────────
+# `deficit[b]` is the per-bus ACTIVE-POWER balance slack: the only physical
+# load shedding in this model. It was previously never logged, so a high cost
+# could not be attributed to shedding vs thermal dispatch from W&B alone. (Note
+# that `rollout_target_violation_share` is a RESERVOIR-TARGET penalty share and
+# is structurally zero in strict mode — it is a tripwire, never shedding
+# evidence.) The recorder reads solutions the rollout has already computed, so
+# it adds no solve. It runs on several tasks concurrently when the stage-problem
+# pool is used, hence the lock.
+const _def_lock = ReentrantLock()
+const _def_sum  = Ref(0.0)   # Σ over (scenario, stage, bus) of deficit_b   [pu]
+const _def_max  = Ref(0.0)   # max single (bus, stage) deficit               [pu]
+const _def_n    = Ref(0)     # (scenario, stage) pairs shedding above 1e-6 pu
+
+_reset_deficit_stats!() = lock(_def_lock) do
+    _def_sum[] = 0.0; _def_max[] = 0.0; _def_n[] = 0
+end
+
+function _record_stage_deficit(stage_prob, result, stage, target, state_in)
+    d = Array(vec(hydro_solution(stage_prob, result).deficit))
+    s = sum(d); mx = maximum(d); shed = any(>(1e-6), d) ? 1 : 0
+    lock(_def_lock) do
+        _def_sum[] += s
+        _def_max[]  = max(_def_max[], mx)
+        _def_n[]   += shed
+    end
+    return nothing
+end
+
 # Held-out evaluation scenarios. Two modes:
 #
 # 1. DR_EVAL_PROTOCOL_IDS set (comma-separated column ids of the seeded paired
@@ -800,6 +850,8 @@ rollout_evaluation = RolloutEvaluation(
     retry_on_failure = true,
     active_scenarios = NUM_EVAL_SCENARIOS,
     state_bounds = (_min_vols_dev, _max_vols_dev),
+    retry_failed_sequentially = ROLLOUT_RETRY_FAILED,
+    stage_recorder = _record_stage_deficit,
 )
 
 # ── Two-stage SaveBest verification (guards against overfitting the fixed eval
@@ -878,6 +930,104 @@ elseif SAVE_METRIC == "rollout"
     @info "Skipping initial rollout eval (DR_SKIP_INITIAL_EVAL=true) — training starts immediately on all GPUs"
 end
 
+# ── Generic stage controls (all default OFF; no schedule logic here) ──────────
+# These let an EXTERNAL driver run a lineage as a sequence of independent stage
+# processes without any in-trainer scheduler: each flag is a plain stopping or
+# admissibility condition on the run, so the same trainer serves any lineage.
+#
+# Nothing here is scheduler- or Slurm-specific. A stage is fully described by
+# environment variables the caller sets: parent checkpoint (DR_PRE_TRAINED),
+# parent value (DR_SEED_BEST), nt (DR_NUM_TRAIN_PER_BATCH), learning-rate start
+# and final (DR_LR / DR_LR_FINAL), warm-up (DR_LR_WARMUP), update budget
+# (DR_NUM_BATCHES), evaluation interval (DR_EVAL_EVERY), evaluation scenario ids
+# (DR_EVAL_PROTOCOL_IDS) and the selection requirements below. SLURM_JOB_ID is
+# read in exactly one place — as a fallback for DR_OUTPUT_TAG when the caller
+# supplies no lineage name — and the script runs identically without it.
+#
+#   DR_SEED_BEST             seed `best_obj` with the PARENT's validation value,
+#                            so a warm restart can only save a checkpoint that
+#                            genuinely beats the checkpoint it started from.
+#   DR_TARGET_ROLLOUT        stop as soon as a VALID checkpoint reaches this
+#                            value or lower (the screening threshold).
+#   DR_MAX_TRAIN_SECONDS     stop when this stage's training wall time is spent
+#                            (used to honour a cumulative lineage allowance).
+#   DR_ABORT_IF_NO_IMPROVE_BY  stop at this update if nothing has yet improved
+#                            on `DR_SEED_BEST` — an unproductive stage is ended
+#                            instead of consuming the rest of its budget.
+#   DR_MAX_DEFICIT_PU        a checkpoint is only selectable if the evaluation
+#                            that produced it had per-bus physical load shedding
+#                            at or below this tolerance.
+#   DR_STOP_AFTER_STALE_EVALS  stop after this many CONSECUTIVE evaluations that
+#                            produce no new valid best (an invalid evaluation
+#                            counts as stale, since it cannot select anything).
+#                            CAUTION: this interacts badly with a high-LR
+#                            restart, which reliably degrades a converged policy
+#                            before it recovers — a small value terminates the
+#                            stage inside that dip. Leave it OFF unless the
+#                            stage is expected to improve monotonically.
+#   DR_PARENT_REPRO_TOL      tolerance for the parent reproduction check below.
+#                            It guards the VALUE only; a wide tolerance can
+#                            never make an incomplete evaluation comparable —
+#                            that is what the n_ok requirement is for.
+#   DR_STAGE_SUMMARY         path for a machine-readable end-of-stage summary.
+const SEED_BEST = parse(Float64, get(ENV, "DR_SEED_BEST", "Inf"))
+const TARGET_ROLLOUT = parse(Float64, get(ENV, "DR_TARGET_ROLLOUT", "-Inf"))
+const MAX_TRAIN_SECONDS = parse(Float64, get(ENV, "DR_MAX_TRAIN_SECONDS", "Inf"))
+const ABORT_IF_NO_IMPROVE_BY = parse(Int, get(ENV, "DR_ABORT_IF_NO_IMPROVE_BY", "0"))
+const MAX_DEFICIT_PU = parse(Float64, get(ENV, "DR_MAX_DEFICIT_PU", "1e-6"))
+const STOP_AFTER_STALE_EVALS = parse(Int, get(ENV, "DR_STOP_AFTER_STALE_EVALS", "0"))
+const STAGE_SUMMARY = strip(get(ENV, "DR_STAGE_SUMMARY", ""))
+
+# CHECKPOINT REPRODUCTION CHECK. When the stage both seeds from a parent value
+# and ran the initial evaluation, the two must agree: the panel is deterministic,
+# so a mismatch means the checkpoint loaded is not the one that produced the
+# recorded value. That is a hard stop, not a warning — every downstream number
+# would be attributed to the wrong policy.
+const PARENT_REPRO_TOL = parse(Float64, get(ENV, "DR_PARENT_REPRO_TOL", "1e-3"))
+if isfinite(SEED_BEST) && SAVE_METRIC == "rollout" && !SKIP_INITIAL_EVAL
+    observed = rollout_evaluation.last_objective_no_target_penalty
+    if !isfinite(observed) || abs(observed - SEED_BEST) > PARENT_REPRO_TOL
+        error("CHECKPOINT REPRODUCTION FAILURE: parent value $SEED_BEST but the " *
+              "initial evaluation of $PRE_TRAINED gave $observed " *
+              "(tolerance $PARENT_REPRO_TOL). Refusing to train from an " *
+              "unverified parent.")
+    end
+    @info "Parent checkpoint reproduced" SEED_BEST observed
+end
+isfinite(SEED_BEST) && (best_obj = SEED_BEST)
+isfinite(SEED_BEST) && @info "Seeded best_obj from parent" SEED_BEST
+isfinite(TARGET_ROLLOUT) && @info "Stage target" TARGET_ROLLOUT
+isfinite(MAX_TRAIN_SECONDS) && @info "Stage wall budget (s)" MAX_TRAIN_SECONDS
+
+# Early exit uses `train_tsddr`'s own documented contract: `record_loss` returns
+# `Bool`, and returning `true` breaks the training loop (src/training.jl). No
+# exception, no library change — the loop's own cleanup runs normally.
+const STOP_NOW = Ref(false)
+
+"""
+    request_stop!(reason) -> true
+
+Record why this stage is ending and ask the training loop to break. Returns
+`true` so it can be used directly as the value of `record_loss`.
+"""
+function request_stop!(reason::AbstractString)
+    STAGE_STATE["stop_reason"] = reason
+    STOP_NOW[] = true
+    @info "STAGE STOP REQUESTED: $reason"
+    return true
+end
+
+const TRAIN_T0 = Ref(time())          # set immediately before train_tsddr
+const STAGE_STATE = Dict{String, Any}(
+    "stop_reason" => "budget_exhausted",   # overwritten by any early stop
+    "n_valid_saves" => 0,
+    "n_invalid_evals" => 0,
+    "first_improve_iter" => -1,
+    "last_iter" => 0,
+    "stale_evals" => 0,        # consecutive evaluations with no new valid best
+    "max_stale_run" => 0,
+)
+
 Random.seed!(8788)
 
 last_batch_stats = Ref(Dict{String, Any}())
@@ -900,6 +1050,7 @@ function _merge_batch_stats!(metrics, stats)
     return metrics
 end
 
+TRAIN_T0[] = time()
 train_tsddr(
     policy,
     x0_init,
@@ -989,27 +1140,106 @@ train_tsddr(
         isfinite(loss) && push!(epoch_losses, loss)
 
         if iter % EVAL_EVERY == 0
+            _reset_deficit_stats!()
             rollout_evaluation(iter, m)
+            # Physical load shedding over this evaluation (see the recorder's
+            # note above): total pu and MW, the worst single bus/stage, and how
+            # many (scenario, stage) pairs shed at all.
+            metrics["metrics/rollout_deficit_pu"] = _def_sum[]
+            metrics["metrics/rollout_deficit_MW"] = _def_sum[] * power_data.baseMVA
+            metrics["metrics/rollout_deficit_max_bus_pu"] = _def_max[]
+            metrics["metrics/rollout_stages_with_deficit"] = _def_n[]
             metrics["metrics/rollout_objective_no_target_penalty"] =
                 rollout_evaluation.last_objective_no_target_penalty
             metrics["metrics/rollout_target_violation_share"] =
                 rollout_evaluation.last_violation_share
             metrics["metrics/rollout_n_ok"] =
                 rollout_evaluation.last_n_ok
+            # Scenario identity is preserved through the evaluator, so a lost
+            # scenario is nameable rather than merely countable. Log the count
+            # and print the ids: a mean over 9 of 10 scenarios is a DIFFERENT
+            # statistic, and which one was lost determines how different.
+            metrics["metrics/rollout_n_requested"] =
+                rollout_evaluation.last_n_requested
+            metrics["metrics/rollout_n_failed"] =
+                length(rollout_evaluation.last_failed_scenarios)
+            metrics["metrics/rollout_n_ok_on_retry"] =
+                count(==(:ok_on_retry), rollout_evaluation.last_scenario_status)
+            if !isempty(rollout_evaluation.last_failed_scenarios)
+                failed_ids = [
+                    isempty(EVAL_PROTOCOL_IDS) ? i : EVAL_PROTOCOL_IDS[i]
+                    for i in rollout_evaluation.last_failed_scenarios
+                ]
+                @warn "  rollout INCOMPLETE — scenarios did not solve" failed_ids n_ok=rollout_evaluation.last_n_ok n_requested=rollout_evaluation.last_n_requested
+            end
+            # PER-COLUMN eval costs. The evaluation keeps every scenario's
+            # rollout result in `last_scenario_data`; only the MEAN used to be
+            # reported, which made paired differences against the SDDP panel
+            # impossible to compute. With DR_EVAL_PROTOCOL_IDS set, entry i of
+            # the eval set is protocol column EVAL_PROTOCOL_IDS[i], so each
+            # cost is logged (and printed) under its own column id.
+            if !isempty(rollout_evaluation.last_scenario_data)
+                cols = String[]
+                for (i, r) in rollout_evaluation.last_scenario_data
+                    id = isempty(EVAL_PROTOCOL_IDS) ? i : EVAL_PROTOCOL_IDS[i]
+                    metrics["metrics/rollout_col_$(id)"] = r.objective
+                    push!(cols, "$(id)=$(round(r.objective; digits=2))")
+                end
+                @info "  rollout per-column: " * join(cols, " ")
+            end
             if SAVE_METRIC == "rollout"
                 rollout_score = rollout_evaluation.last_objective_no_target_penalty
-                # Honest selection: the rollout mean is over the scenarios that
-                # SOLVED (total / n_ok), so a policy that fails one expensive
-                # scenario gets a fake bonus of hundreds of cost units. Only
-                # trust evals where every active scenario succeeded.
-                if rollout_evaluation.last_n_ok == current_eval_scenarios[] &&
-                   isfinite(rollout_score) && rollout_score < best_obj &&
+                # An evaluation is VALID only if every REQUESTED scenario solved
+                # AND the policy shed no physical load. The first is the honest-
+                # selection guard (the mean is over SOLVED scenarios, so a failed
+                # expensive scenario is a fake bonus of hundreds of cost units);
+                # the second refuses a policy that buys cost by dropping load.
+                # `is_complete` compares against what the evaluator was ASKED
+                # for, which is the same quantity the schedule sets — asserting
+                # both keeps the two from drifting apart.
+                rollout_evaluation.last_n_requested == current_eval_scenarios[] || error(
+                    "evaluator ran $(rollout_evaluation.last_n_requested) scenarios but the " *
+                    "schedule asked for $(current_eval_scenarios[]); the selection gate would " *
+                    "be judging a different sample than the one configured",
+                )
+                eval_all_solved = is_complete(rollout_evaluation)
+                eval_no_shedding = _def_max[] <= MAX_DEFICIT_PU
+                eval_valid = eval_all_solved && eval_no_shedding && isfinite(rollout_score)
+                eval_valid || (STAGE_STATE["n_invalid_evals"] += 1)
+                eval_no_shedding ||
+                    @warn "  eval REJECTED: physical load shedding above tolerance" max_bus_deficit_pu=_def_max[] MAX_DEFICIT_PU
+                if eval_valid && rollout_score < best_obj &&
                    verified_improvement(m)   # second-stage fresh-scenario gate
                     global best_obj = rollout_score
                     jldsave(MODEL_PATH; model_state = checkpoint_policy_state(m))
+                    STAGE_STATE["n_valid_saves"] += 1
+                    STAGE_STATE["first_improve_iter"] == -1 &&
+                        (STAGE_STATE["first_improve_iter"] = iter)
+                    STAGE_STATE["stale_evals"] = 0
                     @info "  -> New best rollout: $(round(rollout_score; digits=4)) -- saved $MODEL_PATH"
+                else
+                    # No new selectable checkpoint from this evaluation. An
+                    # INVALID evaluation counts as stale too: it cannot select.
+                    STAGE_STATE["stale_evals"] += 1
+                    STAGE_STATE["max_stale_run"] =
+                        max(STAGE_STATE["max_stale_run"], STAGE_STATE["stale_evals"])
+                end
+
+                # ── Stage stopping conditions (external driver owns strategy) ──
+                if eval_valid && best_obj <= TARGET_ROLLOUT
+                    request_stop!("target_reached:$(best_obj)")
+                elseif ABORT_IF_NO_IMPROVE_BY > 0 && iter >= ABORT_IF_NO_IMPROVE_BY &&
+                       STAGE_STATE["n_valid_saves"] == 0
+                    request_stop!("no_improvement_by_iter_$(ABORT_IF_NO_IMPROVE_BY)")
+                elseif STOP_AFTER_STALE_EVALS > 0 &&
+                       STAGE_STATE["stale_evals"] >= STOP_AFTER_STALE_EVALS
+                    request_stop!("stalled_$(STAGE_STATE["stale_evals"])_consecutive_evals")
                 end
             end
+        end
+        STAGE_STATE["last_iter"] = iter
+        if !STOP_NOW[] && time() - TRAIN_T0[] >= MAX_TRAIN_SECONDS
+            request_stop!("wall_budget_exhausted")
         end
 
         # Crash-safety: overwrite the "_latest" checkpoint every N steps,
@@ -1034,9 +1264,56 @@ train_tsddr(
             end
         end
         lg === nothing || Wandb.log(lg, metrics)
-        return false
+        # `true` breaks the training loop (train_tsddr's documented contract).
+        return STOP_NOW[]
     end,
 )
+const TRAIN_SECONDS = time() - TRAIN_T0[]
 
 lg === nothing || close(lg)
-@info "Done. Best model saved to: $(MODEL_PATH)"
+
+# ── Machine-readable stage summary ────────────────────────────────────────────
+# One JSON object per stage, written by the process that ran it. The driver
+# appends it to the lineage ledger; nothing downstream has to parse log prose.
+if !isempty(STAGE_SUMMARY)
+    # SHA-256 in-process: it is the hash the case manifest and the result
+    # bundles use, and it does not depend on an external `md5sum` binary being
+    # on PATH (which silently produced an empty hash when it was not).
+    ckpt_sha256 = isfile(MODEL_PATH) ? bytes2hex(open(SHA.sha256, MODEL_PATH)) : ""
+    open(STAGE_SUMMARY, "w") do io
+        JSON.print(io, Dict(
+            "tag" => _TRACK_TAG,
+            "run_name" => RUN_NAME,
+            "job_id" => get(ENV, "SLURM_JOB_ID", ""),
+            "parent_checkpoint" => PRE_TRAINED,
+            "parent_value" => isfinite(SEED_BEST) ? SEED_BEST : nothing,
+            "nt" => NUM_TRAIN_PER_BATCH,
+            "lr" => LR, "lr_final" => LR_FINAL, "lr_warmup" => LR_WARMUP,
+            "max_updates" => TOTAL_ITERS, "eval_every" => EVAL_EVERY,
+            "eval_protocol_ids" => EVAL_PROTOCOL_IDS,
+            "target_rollout" => isfinite(TARGET_ROLLOUT) ? TARGET_ROLLOUT : nothing,
+            "max_train_seconds" => isfinite(MAX_TRAIN_SECONDS) ? MAX_TRAIN_SECONDS : nothing,
+            "abort_if_no_improve_by" => ABORT_IF_NO_IMPROVE_BY,
+            "updates_run" => STAGE_STATE["last_iter"],
+            "train_seconds" => TRAIN_SECONDS,
+            "best_validation" => isfinite(best_obj) ? best_obj : nothing,
+            "n_valid_saves" => STAGE_STATE["n_valid_saves"],
+            "n_invalid_evals" => STAGE_STATE["n_invalid_evals"],
+            "max_stale_eval_run" => STAGE_STATE["max_stale_run"],
+            "first_improve_iter" => STAGE_STATE["first_improve_iter"],
+            "improved_on_parent" => STAGE_STATE["n_valid_saves"] > 0,
+            "max_bus_deficit_pu_last_eval" => _def_max[],
+            "max_deficit_pu_tolerance" => MAX_DEFICIT_PU,
+            "rollout_evaluation" => ROLLOUT_PARALLEL ? "parallel" : "sequential",
+            "rollout_retry_failed_sequentially" => ROLLOUT_RETRY_FAILED,
+            "last_eval_n_requested" => rollout_evaluation.last_n_requested,
+            "last_eval_n_ok" => rollout_evaluation.last_n_ok,
+            "last_eval_failed_scenarios" => rollout_evaluation.last_failed_scenarios,
+            "stop_reason" => STAGE_STATE["stop_reason"],
+            "checkpoint" => MODEL_PATH,
+            "checkpoint_sha256" => ckpt_sha256,
+        ))
+    end
+    @info "Stage summary written" STAGE_SUMMARY
+end
+@info "Done. Best model saved to: $(MODEL_PATH)" best_obj TRAIN_SECONDS STAGE_STATE["stop_reason"]

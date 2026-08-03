@@ -1,28 +1,129 @@
-# Bolivia hydro example (ExaModels)
+# Bolivia long-term hydrothermal scheduling — ExaModels engine
 
-This directory is the ExaModels counterpart of the canonical Bolivia MAIN
-hydro example in DecisionRules.jl.
+The GPU half of the published case study. This directory trains and evaluates
+the strict TS-DDR policy on the Bolivian interconnected system; the case, the
+SDDP baseline, the parity gate and the figures live in the companion package,
+`DecisionRules.jl/examples/HydroPowerModels`.
 
-Canonical invariants:
+The two packages share the case bytes and four source files **byte for byte**:
+`bolivia/{PowerModels.json, hydro.json, inflows.csv, *.mof.json,
+case_manifest.json}`, `generate_canonical_case_artifacts.jl`,
+`hydro_reachable_reference.jl` and `hydro_solution_schema.jl`. The case files are
+mirrored by the other package's `export_subproblem_mof.jl --exa-root=…`; the
+source files are copies whose identity is the point — asserting the same contract
+and the same oracle in both engines establishes cross-engine parity without
+either package depending on the other.
 
-- identical MAIN input bytes in both repositories;
-- `pd_scale = qd_scale = 0.6`;
-- weekly stages (`stage_hours = 168`) and `K = 0.6048`;
-- operational active deficit cost `6000 USD/(pu·stage)`;
-- strict reachable targets using the stretched sigmoid with a safe `1e-3`
-  upper margin;
-- hard reactive balance and apparent-power thermal limits at both branch ends;
-- 96 reporting stages, 30 look-ahead stages, and one saved 126-by-500
-  stage-major joint inflow-and-demand protocol.
+The frozen case is described once, in the other package's
+[`README.md`](../../../DecisionRules.jl/examples/HydroPowerModels/README.md);
+in short: weekly stages with `K = 0.6048`, deterministic `0.6`-scaled active and
+reactive demand, inflow-only uncertainty, empty initial reservoirs, hard reactive
+balance, load shedding priced at `6000 USD/(pu·stage)`, 126 stages simulated and
+96 reported.
 
-The ACP, DC, and SOC-WR MOFs are generated once by the DecisionRules.jl
-exporter and copied here without reserialization. Corresponding files must
-therefore be byte-identical across the repositories.
+## Layout
 
-`bolivia/case_manifest.json` records hashes, constants, topology, objective
-metadata, and protocol seeds. `bolivia/joint_protocol_500.csv` records the
-paired inflow-scenario and demand-atom indices.
+| file | role |
+|---|---|
+| `hydro_power_data.jl` | parses `PowerModels.json` / `hydro.json` / `inflows.csv` into the flat arrays the ExaModels builder consumes |
+| `hydro_power_exa.jl` | builds the `ExaModel`: AC-polar or DC, strict or penalized targets, with `hydro_solution` to unpack a solved point into named blocks |
+| `hydro_reachable_policy.jl` | the feasibility-guaranteeing policy (LSTM encoder over inflow, state-conditioned head, targets mapped into the one-stage reachable interval) |
+| `hydro_reachable_reference.jl` | engine-independent oracle for that map; byte-identical to the JuMP engine's copy |
+| `hydro_solution_schema.jl` | the shared long-format solution schema; byte-identical to the JuMP engine's copy |
+| `hydro_training_utils.jl` | small shared helpers for the training scripts |
+| `train_hydro_exa_strict.jl` | ONE training stage, fully parameterized by environment variables |
+| `run_tsddr_lineage.jl` | the lineage driver: runs a declared multi-stage schedule end to end, chaining only selected checkpoints |
+| `lineage_from_scratch.json` | the published from-scratch schedule (coldB → C1 → C3) |
+| `eval_paired_exa.jl` | paired evaluation of a checkpoint, with per-stage physical recording and an optional full-solution dump |
+| `generate_canonical_case_artifacts.jl` | the frozen-case contract and its verifier |
+| `test/runtests.jl` | the example's regression suite |
 
-The single retained checkpoint and historical strict result are provenance
-references, not final paired evidence. Phase 2A does not recreate missing SDDP
-cuts or run production training.
+## Commands
+
+Run from this directory with `--project=.`.
+
+**1. Verify the case.**
+
+```bash
+julia --project=. generate_canonical_case_artifacts.jl --verify
+```
+
+**2. Regression suite.**
+
+```bash
+julia --project=. test/runtests.jl
+```
+
+**3. A short GPU smoke run** — a few updates on a short horizon, to confirm the
+GPU stack (MadNLPGPU + CUDSS + cuDNN) is working before committing hours:
+
+```bash
+DR_NUM_STAGES=8 DR_NUM_ROLLOUT_STAGES=8 \
+DR_NUM_EPOCHS=1 DR_NUM_BATCHES=3 DR_NUM_TRAIN_PER_BATCH=2 \
+DR_NUM_EVAL_SCENARIOS=2 DR_EVAL_PROTOCOL_IDS=2,39 DR_EVAL_EVERY=3 \
+DR_ENABLE_WANDB=false \
+  julia --project=. -t auto train_hydro_exa_strict.jl
+```
+
+**4. The full from-scratch training recipe.** This is the published schedule,
+declared in `lineage_from_scratch.json` and executed stage by stage:
+
+```bash
+julia --project=. run_tsddr_lineage.jl                 # full lineage
+julia --project=. run_tsddr_lineage.jl --dry-run       # print the plan only
+julia --project=. run_tsddr_lineage.jl --stages=C3     # resume one stage
+```
+
+Each stage runs as its own process, so a stage boundary is a real restart: the
+optimizer state, the cosine learning-rate phase and the warm-up counter all
+begin again. The driver chains only checkpoints that a COMPLETE, non-shedding
+panel evaluation selected, hashes every parent before use, refuses `_latest`
+snapshots outright, and stops the lineage — rather than falling back — if a
+stage produces nothing selectable. Re-running resumes: a stage whose record
+exists and whose checkpoint still hashes correctly is skipped.
+
+Records land in `bolivia/ACPPowerModel/lineage/`: one JSON per stage with the
+resolved environment, ancestry, checkpoint hashes, update count and both the
+process wall time and the trainer's own training-loop seconds, plus a
+lineage-level ledger.
+
+Neither W&B nor a workload manager is required. `DR_ENABLE_WANDB=false` turns
+logging off; nothing in the driver reads a scheduler variable.
+
+**5. Paired evaluation of a checkpoint.**
+
+```bash
+DR_EVAL_CKPT=/path/to/checkpoint.jld2 DR_EVAL_LABEL=my_policy \
+  julia --project=. -t auto eval_paired_exa.jl                    # the 10-column panel
+
+DR_EVAL_CKPT=… DR_EVAL_LABEL=shard_1_50 \
+DR_EVAL_COL_FIRST=1 DR_EVAL_COL_LAST=50 \
+  julia --project=. -t auto eval_paired_exa.jl                    # one shard of the 500
+```
+
+Adding `DR_SOLUTION_DUMP=1` additionally writes the full primal solution of every
+stage and the decision trace that reproduces it, in the shared long format — the
+input to the JuMP engine's `verify_full_solution_parity.jl`.
+
+## Configuration surface of one training stage
+
+`train_hydro_exa_strict.jl` is driven entirely by environment variables; the
+lineage driver simply sets them. The ones that define a stage:
+
+| variable | meaning |
+|---|---|
+| `DR_NUM_TRAIN_PER_BATCH` | `nt`, trajectories sampled per gradient step |
+| `DR_LR`, `DR_LR_FINAL`, `DR_LR_WARMUP` | cosine learning-rate schedule and its warm-up |
+| `DR_NUM_EPOCHS` × `DR_NUM_BATCHES` | the update budget |
+| `DR_MAX_TRAIN_SECONDS` | wall budget for the training loop |
+| `DR_EVAL_EVERY`, `DR_EVAL_PROTOCOL_IDS`, `DR_NUM_EVAL_SCENARIOS` | the fixed evaluation panel and its cadence |
+| `DR_SAVE_METRIC=rollout` | select checkpoints on the panel, not on the training loss |
+| `DR_MAX_DEFICIT_PU` | reject an evaluation that shed load |
+| `DR_ROLLOUT_PARALLEL`, `DR_ROLLOUT_RETRY_FAILED` | pooled vs sequential evaluation, and whether a failed scenario is retried sequentially |
+| `DR_PRETRAINED_MODEL`, `DR_SEED_BEST`, `DR_PARENT_REPRO_TOL` | the parent checkpoint, its recorded value, and how exactly it must reproduce |
+| `DR_STAGE_SUMMARY` | where to write the machine-readable end-of-stage record |
+
+`DR_STOP_AFTER_STALE_EVALS` exists but defaults off, and should stay off unless a
+stage is expected to improve monotonically: raising the learning rate at a
+restart reliably degrades the policy before it recovers, and a small stale count
+terminates the stage inside that dip.

@@ -111,6 +111,7 @@ export
 
     # Stage-wise rollout evaluation
     rollout_tsddr,
-    RolloutEvaluation
+    RolloutEvaluation,
+    is_complete
 
 end # module
