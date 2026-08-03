@@ -1,9 +1,9 @@
 {
   "name": "bolivia_from_scratch",
-  "description": "The selected from-scratch TS-DDR lineage for the frozen Bolivia case: random initialisation -> coldB -> C1 -> C3. Every setting below is the one the published policy was trained with; see the release notes for the per-stage evaluation trace. C2 branched from C1, produced no selectable checkpoint, and is NOT part of the lineage — it is not listed here because this file declares the lineage to REPRODUCE, not the search that found it.",
+  "description": "The published from-scratch TS-DDR training schedule: random initialisation, then three phases, each restarting from the policy the previous phase selected. Every setting below is the one the published policy was trained with. A fourth phase was attempted during the original search, produced no selectable policy, and is not listed: this file declares the schedule to REPRODUCE, not the search that found it.",
   "trainer": "train_hydro_exa_strict.jl",
   "reference": {
-    "selected_ancestry": ["random initialisation", "coldB", "C1", "C3"],
+    "selected_ancestry": ["random initialisation", "phase1", "phase2", "phase3"],
     "selected_updates_total": 890,
     "active_seconds": 39481.6,
     "final_panel_objective": 313751.55485,
@@ -34,7 +34,7 @@
   },
   "stages": [
     {
-      "tag": "coldB",
+      "tag": "phase1",
       "parent": null,
       "comment": "From random initialisation. nt is held low and the learning rate high: on the repaired gradient this is the fastest descent regime, and starting at a high nt is flat. Rollout evaluation is pooled here because the stage has no parent value to reproduce.",
       "env": {
@@ -49,9 +49,9 @@
       }
     },
     {
-      "tag": "C1",
-      "parent": "coldB",
-      "comment": "Same nt and learning-rate band, restarted from coldB's selected checkpoint. A restart resets Adam, the cosine phase and the warm-up, which is the point: the stage is a fresh descent from a better initialisation, not a continuation.",
+      "tag": "phase2",
+      "parent": "phase1",
+      "comment": "Same sampling and learning-rate band, restarted from the previous phase's selected policy. A restart resets Adam, the cosine phase and the warm-up, which is the point: the stage is a fresh descent from a better initialisation, not a continuation.",
       "env": {
         "DR_NUM_TRAIN_PER_BATCH": "16",
         "DR_LR": "1e-3",
@@ -65,8 +65,8 @@
       }
     },
     {
-      "tag": "C3",
-      "parent": "C1",
+      "tag": "phase3",
+      "parent": "phase2",
       "comment": "The convergence stage: nt is raised and the learning rate dropped an order of magnitude, so the gradient is precise and the step small. Rollout evaluation is SEQUENTIAL — this is the stage whose checkpoint is published, and the sequential path is the one whose reproducibility is established.",
       "env": {
         "DR_NUM_TRAIN_PER_BATCH": "24",

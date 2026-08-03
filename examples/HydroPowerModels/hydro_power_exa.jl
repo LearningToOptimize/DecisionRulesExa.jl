@@ -248,8 +248,8 @@ reactive balance).
 
 `demand_spread` enables stochastic demand (i.i.d. per-stage multiplicative
 factor `ξ_t ∈ {1−s, 1, 1+s}`, probability 1/3 each, independent of the inflow
-noise — the same model the SDDP baselines implement via
-sddp/sddp_demand_noise.jl):
+noise). The frozen Bolivia case does NOT use it — demand there is
+deterministic — so this kwarg is `nothing` on every published run:
 - `nothing` (default) — deterministic demand; the model is BIT-IDENTICAL to
   builds preceding this kwarg.
 - spread `s ∈ [0, 1)` — the uncertainty parameter `p_inflow` grows to

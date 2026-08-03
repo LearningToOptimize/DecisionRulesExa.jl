@@ -100,7 +100,7 @@ const INFLOW_FILE = joinpath(CASE_DIR, "inflows.csv")
 # Stochastic demand (bolivia/demand_scenarios.csv, single line `s,<value>`):
 # i.i.d. per-stage multiplicative factor ξ_t ∈ {1−s, 1, 1+s} (P = 1/3 each) on
 # every bus's active demand, independent of the inflow noise — the same model
-# the SDDP baselines register via sddp/sddp_demand_noise.jl. When the file is
+# the stochastic-demand variant would register. When the file is
 # ABSENT every code path below is bit-identical to the historical trainer.
 # Mechanics: scenarios become augmented stage-major vectors [w_t; ξ_t]
 # (sample_scenario 3-arg method / augment_scenario), the DE is built with

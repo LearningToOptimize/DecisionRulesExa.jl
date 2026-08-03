@@ -115,11 +115,12 @@ state, not the sensitivity of a penalized approximation. This is useful when:
 - total recourse is guaranteed by the model for every state produced by that
   map.
 
-There are two strict hydro paths:
+The package supports two ways to make strict mode safe:
 
-- **Embedded strict DE** evaluates the policy inside the NLP against realized
-  reservoir states. This is the usual way to make strict mode safe because the
-  policy sees the state from which its next target must be reachable.
+- **Embedded strict DE** ([`train_tsddr_embedded`](@ref),
+  [`build_embedded_deterministic_equivalent`](@ref)) evaluates the policy inside
+  the NLP against realized states, so the policy always sees the state from
+  which its next target must be reachable.
 - **Regular strict DE with reachable rollout** computes targets before solving
   the NLP, but starts from the true initial state and feeds the previous target
   back to the reachable policy. If
@@ -127,8 +128,18 @@ There are two strict hydro paths:
   induction. The strict equality then forces the realized path to equal that
   reachable target path.
 
+The published hydro case study uses the second path; see
+[`examples/HydroPowerModels`](examples/HydroPowerModels).
+
 Do not use strict equality for a generic open-loop target policy. For
 unreachable targets, the slack-penalty formulation is the robust fallback.
+
+The reachable map depends on the incoming state, and that dependence **must be
+differentiated**. Declaring the interval endpoints non-differentiable still
+produces a gradient and still lowers the loss, while descending a different
+direction — measured on the hydro case, 6% of the true magnitude and 48 degrees
+off. Check the complete actor gradient against finite differences before
+drawing hyperparameter conclusions from it.
 
 The hydro reachable policy keeps recurrence over inflows only. Optional
 `combiner_layers` / `DR_HEAD_LAYERS` add a nonlinear feed-forward map from

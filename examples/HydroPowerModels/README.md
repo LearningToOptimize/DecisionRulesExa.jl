@@ -1,25 +1,19 @@
-# Bolivia long-term hydrothermal scheduling — ExaModels engine
+# Bolivia hydro — ExaModels engine
 
-The GPU half of the published case study. This directory trains and evaluates
-the strict TS-DDR policy on the Bolivian interconnected system; the case, the
-SDDP baseline and the figures live in the companion package,
-`DecisionRules.jl/examples/HydroPowerModels`.
+The GPU half of the long-term hydrothermal planning case study: this directory
+trains and evaluates the policy. The case, the SDDP baseline and the figures live
+in the companion package, `DecisionRules.jl/examples/HydroPowerModels`.
+
+**The science is in the documentation** of that package, under *Case studies →
+Long-term hydrothermal planning*. This file is the operating manual.
 
 The two packages share the case bytes and two source files **byte for byte**:
 `bolivia/{PowerModels.json, hydro.json, inflows.csv, *.mof.json,
-case_manifest.json}`, `generate_canonical_case_artifacts.jl`,
-and `hydro_solution_schema.jl`. The case files are mirrored by the other
-package's `export_subproblem_mof.jl --exa-root=…`; the source files are copies
-whose identity is the point — both engines assert the same case contract and
-write their solutions in the same format, without either package depending on
-the other.
-
-The frozen case is described once, in the other package's
-[`README.md`](../../../DecisionRules.jl/examples/HydroPowerModels/README.md);
-in short: weekly stages with `K = 0.6048`, deterministic `0.6`-scaled active and
-reactive demand, inflow-only uncertainty, empty initial reservoirs, hard reactive
-balance, load shedding priced at `6000 USD/(pu·stage)`, 126 stages simulated and
-96 reported.
+case_manifest.json}`, `generate_canonical_case_artifacts.jl` and
+`hydro_solution_schema.jl`. The case files are mirrored by the other package's
+`export_subproblem_mof.jl --exa-root=…`; the source files are copies whose
+identity is the point — both engines assert the same case contract and write
+their solutions in the same format, without either depending on the other.
 
 ## Layout
 
@@ -32,7 +26,7 @@ balance, load shedding priced at `6000 USD/(pu·stage)`, 126 stages simulated an
 | `hydro_training_utils.jl` | small shared helpers for the training scripts |
 | `train_hydro_exa_strict.jl` | ONE training stage, fully parameterized by environment variables |
 | `run_tsddr_lineage.jl` | the lineage driver: runs a declared multi-stage schedule end to end, chaining only selected checkpoints |
-| `lineage_from_scratch.json` | the published from-scratch schedule (coldB → C1 → C3) |
+| `lineage_from_scratch.json` | the published from-scratch training schedule, as data: one entry per phase |
 | `eval_paired_exa.jl` | paired evaluation of a checkpoint, with per-stage physical recording and an optional full-solution dump |
 | `generate_canonical_case_artifacts.jl` | the frozen-case contract and its verifier |
 
@@ -63,7 +57,7 @@ declared in `lineage_from_scratch.json` and executed stage by stage:
 ```bash
 julia --project=. run_tsddr_lineage.jl                 # full lineage
 julia --project=. run_tsddr_lineage.jl --dry-run       # print the plan only
-julia --project=. run_tsddr_lineage.jl --stages=C3     # resume one stage
+julia --project=. run_tsddr_lineage.jl --stages=phase3  # resume one phase
 ```
 
 Each stage runs as its own process, so a stage boundary is a real restart: the

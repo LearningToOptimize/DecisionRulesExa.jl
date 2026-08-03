@@ -404,7 +404,7 @@ end
 
 # ── Stochastic demand (demand_scenarios.csv) ──────────────────────────────────
 #
-# Demand model shared with the SDDP engine (see sddp/sddp_demand_noise.jl in
+# Demand model for the STOCHASTIC-demand variant of this case (see
 # the MAIN repo): an i.i.d. per-stage MULTIPLICATIVE factor on every bus's
 # active demand,
 #

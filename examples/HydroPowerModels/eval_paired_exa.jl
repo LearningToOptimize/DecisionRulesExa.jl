@@ -30,9 +30,7 @@
 #   <label>_trace.csv      scenario,stage,reservoir,state_in,target,inflow
 #
 # The trace is what lets a different engine replay this policy's decisions
-# exactly: `DecisionRules.jl/examples/HydroPowerModels/verify_full_solution_parity.jl`
-# reads it, replays it through the serialized JuMP/MathOptFormat stage model, and
-# differences the two solutions variable by variable.
+# exactly: incoming state, realized inflow and the reservoir target, per stage.
 #
 # ── PHYSICAL load shedding ────────────────────────────────────────────────────
 # The only load-shedding quantity is the per-bus active-balance slack
