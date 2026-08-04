@@ -67,7 +67,7 @@
     {
       "tag": "phase3",
       "parent": "phase2",
-      "comment": "The convergence stage: nt is raised and the learning rate dropped an order of magnitude, so the gradient is precise and the step small. Rollout evaluation is SEQUENTIAL — this is the stage whose checkpoint is published, and the sequential path is the one whose reproducibility is established.",
+      "comment": "The convergence stage: nt is raised and the learning rate dropped an order of magnitude, so the gradient is precise and the step small. Rollout evaluation is SEQUENTIAL — this is the stage whose checkpoint is published, and the sequential path is the one whose reproducibility is established. NOTE that DR_MAX_TRAIN_SECONDS binds before the cosine completes: the published run stopped near iteration 100 of the scheduled 150, so the learning rate reached about 5e-5 rather than the 3e-5 the schedule targets. That is a property of the run being time-capped, not a different schedule, and reproducing this file reproduces it.",
       "env": {
         "DR_NUM_TRAIN_PER_BATCH": "24",
         "DR_LR": "1e-4",
