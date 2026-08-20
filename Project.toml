@@ -18,7 +18,7 @@ Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 [compat]
 CUDA = "6"
 ChainRulesCore = "1.26"
-ExaModels = "0.11"
+ExaModels = "0.11, 0.12"
 Flux = "0.16"
 MadNLP = "0.10"
 MadNLPGPU = "0.10"
