@@ -256,6 +256,68 @@ end
 # also keeps `±Inf` bounds out of a `Inf * 0 == NaN`.
 @inline _avail_scale(v::Real, a::Real) = a == 1 ? Float64(v) : Float64(v) * Float64(a)
 
+raw"""
+    _pin_exact_boxes!(lb, ub) -> Vector{NamedTuple{(:i, :v)}}
+
+Open every EXACTLY degenerate box in `lb`/`ub` IN PLACE and return the
+`(index, value)` pairs that must be pinned by an equality row instead.
+
+# Returns
+- one `(i = index, v = value)` per coordinate that had `lb[i] == ub[i]`, in
+  ascending index order. `lb[i]`/`ub[i]` are set to `-Inf`/`+Inf`.
+
+# Notes
+A variable with `lb == ub` is not a decision at all; it is data wearing a
+variable's clothes. PGLib cases are full of them — synchronous condensers carry
+`pmin = pmax = 0`, and this study's per-stage availability schedule creates one
+for every unit it takes fully out of service. Both forms below describe the
+SAME feasible set:
+
+```math
+x \in [v, v]
+\qquad\text{versus}\qquad
+x \in (-\infty, \infty),\; x - v = 0 .
+```
+
+The second is the one this engine builds, and the reason is measured rather than
+stylistic. A zero-width box forces an interior-point method down a
+fixed-variable code path, and on this model every such path is defective:
+
+* MadNLP's default `MakeParameter` REMOVES the variable from its internal primal
+  vector. On the CPU that works; on the CUDA/CUDSS backend the solve fails in
+  restoration at iteration 2, on every case and every horizon measured
+  (`case14` T=3 and T=24, `case118` T=24, `case1354_pegase` T=24). The same
+  removal is what makes MadNLP's `reinitialize!` path raise a `DimensionMismatch`
+  on this model, which is why the engine already builds a fresh solver per solve.
+* `RelaxBound` does not remove it, and then the zero-width box itself defeats the
+  barrier: measured `RESTORATION_FAILED` on BOTH devices.
+
+The alternative that hides the problem is a nonzero `bound_relax_factor`, which
+widens EVERY bound in the model — not only the degenerate ones — and put the
+recomputed physical residual of `case1354_pegase` at `2.9e-6`, four orders above
+this study's `1e-7` gate. That is the trade this function exists to refuse: the
+degeneracy is removed where it lives, in the two variables that have it, and
+every other bound in the model stays exact.
+
+The equality is imposed at the case's own value with no tolerance, so a solve
+that satisfies it satisfies the original box exactly; the residual a caller
+recomputes from the reported solution is the honest check and is unaffected by
+this reformulation.
+"""
+function _pin_exact_boxes!(lb::AbstractVector, ub::AbstractVector)
+    length(lb) == length(ub) ||
+        throw(ArgumentError("bound vectors of different length: $(length(lb)) and $(length(ub))"))
+    T = eltype(lb)
+    pins = NamedTuple{(:i, :v),Tuple{Int,T}}[]
+    for i in eachindex(lb)
+        lb[i] == ub[i] || continue
+        push!(pins, (i = i, v = lb[i]))
+        lb[i] = T(-Inf)
+        ub[i] = T(Inf)
+    end
+    return pins
+end
+
 """
     exa_network(case::BatteryCase) -> ExaNetwork
 
@@ -581,14 +643,20 @@ function build_battery_exa(case::BatteryCase, T::Int;
     # The infinite reactive bounds are substituted BEFORE scaling: a case that
     # leaves `qmin` unstated means "unlimited", and `-Inf * 0` is `NaN`, not the
     # zero an unavailable unit must have.
-    pg = ExaModels.variable(core, T * nG;
-        lvar = float_type[_avail_scale(g.pmin, availability_at(g, s)) for s in stage_of for g in net.gens],
-        uvar = float_type[_avail_scale(g.pmax, availability_at(g, s)) for s in stage_of for g in net.gens])
-    qg = ExaModels.variable(core, T * nG;
-        lvar = float_type[_avail_scale(isfinite(g.qmin) ? g.qmin : -1e4, availability_at(g, s))
-                          for s in stage_of for g in net.gens],
-        uvar = float_type[_avail_scale(isfinite(g.qmax) ? g.qmax : 1e4, availability_at(g, s))
-                          for s in stage_of for g in net.gens])
+    pg_lb = float_type[_avail_scale(g.pmin, availability_at(g, s)) for s in stage_of for g in net.gens]
+    pg_ub = float_type[_avail_scale(g.pmax, availability_at(g, s)) for s in stage_of for g in net.gens]
+    qg_lb = float_type[_avail_scale(isfinite(g.qmin) ? g.qmin : -1e4, availability_at(g, s))
+                       for s in stage_of for g in net.gens]
+    qg_ub = float_type[_avail_scale(isfinite(g.qmax) ? g.qmax : 1e4, availability_at(g, s))
+                       for s in stage_of for g in net.gens]
+    # An EXACTLY degenerate box is pinned by an EQUALITY ROW instead — see
+    # `_pin_exact_boxes!`. The bounds handed to `variable` are therefore the
+    # opened ones; the pinning constraints are added below, before the
+    # transitions, so those stay last.
+    pg_pins = _pin_exact_boxes!(pg_lb, pg_ub)
+    qg_pins = _pin_exact_boxes!(qg_lb, qg_ub)
+    pg = ExaModels.variable(core, T * nG; lvar = pg_lb, uvar = pg_ub)
+    qg = ExaModels.variable(core, T * nG; lvar = qg_lb, uvar = qg_ub)
     # Branch flow boxes are ±rate_a, exactly as PowerModels' bounded branch
     # power variables are; the apparent-power disks below are what actually
     # binds, and a box alone would be a strictly weaker (square) relaxation.
@@ -758,6 +826,23 @@ function build_battery_exa(case::BatteryCase, T::Int;
         for item in [(row = _bi(nB, t, br.t_pos), col = _bri(nBR, t, l))
                      for t in 1:T for (l, br) in enumerate(net.branches)])
     n_con += T * nB
+
+    # ── 9b. Exactly-fixed generator variables, pinned by EQUALITY ────────────
+    # `pmin == pmax` (a synchronous condenser, or any unit an availability
+    # schedule takes fully out of service) would otherwise be a zero-width box.
+    # A zero-width box is a MODELLING accident, not a physical statement: the
+    # same feasible set is expressed exactly by an open variable and the row
+    # `x − v = 0`, and that form has no degenerate bound for an interior-point
+    # method to choke on. See `_pin_exact_boxes!` for why this is not optional.
+    #
+    # The rows are EQUALITIES at the case's own value, so the feasible set is
+    # unchanged and no tolerance is involved anywhere in the statement.
+    for (var, pins) in ((pg, pg_pins), (qg, qg_pins))
+        isempty(pins) && continue
+        ExaModels.constraint(core,
+            var[item.i] - item.v for item in pins)
+        n_con += length(pins)
+    end
 
     # ── 10. Battery state transition — ADDED LAST ────────────────────────────
     # e_t − α e_{t-1} − η^{ch} Δt p^{ch}_t + (Δt/η^{dis}) p^{dis}_t = 0,
@@ -950,8 +1035,32 @@ interior-point method parks a nonnegative variable roughly one tolerance below
 its zero bound, and a positively priced variable sitting there lowers the
 objective by a near-constant amount at every stage — an offset that looks
 exactly like a systematic model difference when two engines are compared.
+
+`bound_relax_factor` is the second half, and `tol` cannot substitute for it.
+It is set EXPLICITLY to `ACP_BOUND_RELAX_FACTOR` — the single value shared by
+every true-ACP path of this study, on both engines and both devices — rather
+than inherited from a solver default, because MadNLP's CPU and GPU paths were
+measured to report DIFFERENT effective defaults here, and a study whose engines
+relax bounds differently is not comparing like with like.
+
+**It may not be set to zero.** An earlier revision did exactly that, justified by
+a CPU-only residual measurement, and it broke the GPU: `MadNLPGPU`/CUDSS fails in
+restoration at iteration 2 with `0.0`, on every case and horizon measured
+(`case14` T=3 and T=24, `case118` T=24, `case1354_pegase` T=24), while the CPU
+path is unaffected. The regression survived because the GPU was never re-gated
+after the change.
+
+The guarantee is NOT this factor. It is the physical residual recomputed from the
+reported solution by the shared schema, checked against the study's gate, plus
+the maximum ORIGINAL-model bound violation reported per variable family. The
+solver's own infeasibility report describes the RELAXED problem and cannot
+establish either.
+
+One configuration for every portfolio case. Not a per-case setting, and not a
+change to any model equation or to any case datum.
 """
-const DEFAULT_SOLVER_OPTIONS = (print_level = MadNLP.ERROR, tol = 1e-10)
+const DEFAULT_SOLVER_OPTIONS = (print_level = MadNLP.ERROR, tol = 1e-10,
+                                bound_relax_factor = ACP_BOUND_RELAX_FACTOR)
 
 """
     solve!(prob; solver_kwargs...) -> result
