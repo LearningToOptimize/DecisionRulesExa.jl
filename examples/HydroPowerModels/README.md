@@ -1,111 +1,117 @@
-# HydroPowerModels Example
+# Bolivia hydro — ExaModels engine
 
-Multi-stage hydrothermal scheduling using DecisionRulesExa.jl with DC or AC OPF formulations.
+The GPU half of the long-term hydrothermal planning case study: this directory
+trains and evaluates the policy. The case, the SDDP baseline and the figures live
+in the companion package, `DecisionRules.jl/examples/HydroPowerModels`.
 
-## Problem description
+**The science is in the documentation** of that package, under *Case studies →
+Long-term hydrothermal planning*. This file is the operating manual.
 
-A hydro-dominated power system (Bolivia test case) is operated over a planning horizon of up to 96 stages. At each stage, the operator must decide generator dispatch, reservoir outflows, and spillage subject to:
+The two packages share the case bytes and two source files **byte for byte**:
+`bolivia/{PowerModels.json, hydro.json, inflows.csv, *.mof.json,
+case_manifest.json}`, `generate_canonical_case_artifacts.jl` and
+`hydro_solution_schema.jl`. The case files are mirrored by the other package's
+`export_subproblem_mof.jl --exa-root=…`; the source files are copies whose
+identity is the point — both engines assert the same case contract and write
+their solutions in the same format, without either depending on the other.
 
-- **Power flow constraints** (DC linearization or full AC polar OPF)
-- **Reservoir dynamics** (water balance with stochastic inflows)
-- **Generator and transmission limits**
+## Layout
 
-The TS-DDR policy (an LSTM network) predicts target reservoir levels at each stage. The deterministic-equivalent NLP projects these targets onto the feasible set via slack-penalized target constraints. Training uses envelope-theorem gradients: dual multipliers on the target constraints give the policy gradient without differentiating through the solver.
-
-## Formulations
-
-Set `FORMULATION` in `train_hydro_exa.jl`:
-
-| Formulation | `FORMULATION` | Variables per stage | Description |
-|---|---|---|---|
-| DC OPF | `:dc` | ~500 | Linear power flow, fast solves |
-| AC Polar OPF | `:ac_polar` | ~2000 | Full nonlinear AC power flow |
-
-## Data
-
-The `bolivia/` directory contains:
-
-- `PowerModels.json` — power system topology (39 buses, 55 branches, 19 generators)
-- `hydro.json` — hydro unit parameters (7 reservoirs)
-- `inflows.csv` — historical inflow scenarios (144 stages x 200 scenarios x 7 reservoirs)
-- `_demand.csv` — per-stage bus demand scaling
-
-Pre-solved deterministic-equivalent references (MOF format) are provided for validation:
-- `DCPPowerModel.mof.json`
-- `ACPPowerModel.mof.json`
-
-## Files
-
-| File | Description |
+| file | role |
 |---|---|
-| `train_hydro_exa.jl` | Main training script with penalty scheduling, parallel GPU solves, and W&B logging |
-| `train_hydro_exa_critic.jl` | Critic/control-variate variant of the main training script; uses normalized hydro features, a replay buffer, and cheap critic rollouts |
-| `hydro_power_data.jl` | Data parsing (PowerModels JSON, hydro JSON, inflows CSV) |
-| `hydro_power_exa.jl` | ExaModels problem builder for DC and AC OPF formulations |
-| `eval_exa_de.jl` | Validation script comparing ExaModels results against JuMP reference |
-| `Project.toml` | Example-specific dependencies (W&B, JLD2, CUDA, etc.) |
+| `hydro_power_data.jl` | parses `PowerModels.json` / `hydro.json` / `inflows.csv` into the flat arrays the ExaModels builder consumes |
+| `hydro_power_exa.jl` | builds the `ExaModel`: AC-polar or DC, strict or penalized targets, with `hydro_solution` to unpack a solved point into named blocks |
+| `hydro_reachable_policy.jl` | the feasibility-guaranteeing policy (LSTM encoder over inflow, state-conditioned head, targets mapped into the one-stage reachable interval) |
+| `hydro_solution_schema.jl` | the long format in which a full physical solution is written; byte-identical to the JuMP engine's copy |
+| `hydro_training_utils.jl` | small shared helpers for the training scripts |
+| `train_hydro_exa_strict.jl` | ONE training stage, fully parameterized by environment variables |
+| `run_tsddr_lineage.jl` | the lineage driver: runs a declared multi-stage schedule end to end, chaining only selected checkpoints |
+| `lineage_from_scratch.json` | the published from-scratch training schedule, as data: one entry per phase |
+| `eval_paired_exa.jl` | paired evaluation of a checkpoint, with per-stage physical recording and an optional full-solution dump |
+| `generate_canonical_case_artifacts.jl` | the frozen-case contract and its verifier |
 
-## Running
+## Commands
 
-### GPU training (recommended)
+Run from this directory with `--project=.`.
 
-```julia
-# From this directory:
-julia --project -t auto train_hydro_exa.jl
+**1. Verify the case.**
+
+```bash
+julia --project=. generate_canonical_case_artifacts.jl --verify
 ```
 
-Set `USE_GPU = true` in `train_hydro_exa.jl` (default). Requires a CUDA-capable GPU.
+**2. A short GPU smoke run** — a few updates on a short horizon, to confirm the
+GPU stack (MadNLPGPU + CUDSS + cuDNN) is working before committing hours:
 
-### GPU training with critic control variate
-
-```julia
-# From this directory:
-julia --project -t auto train_hydro_exa_critic.jl
+```bash
+DR_NUM_STAGES=8 DR_NUM_ROLLOUT_STAGES=8 \
+DR_NUM_EPOCHS=1 DR_NUM_BATCHES=3 DR_NUM_TRAIN_PER_BATCH=2 \
+DR_NUM_EVAL_SCENARIOS=2 DR_EVAL_PROTOCOL_IDS=2,39 DR_EVAL_EVERY=3 \
+DR_ENABLE_WANDB=false \
+  julia --project=. -t auto train_hydro_exa_strict.jl
 ```
 
-The critic script keeps the dual-multiplier actor update but adds a damped
-control variate (`critic_cv_weight = 0.5`) trained on the stage-wise rollout
-objective without target penalty. Its default critic rollout uses
-`policy_state = :target`; set `CRITIC_POLICY_STATE = :realized` for closed-loop
-critic labels. Deterministic-equivalent critic fitting remains available as an
-ablation through `DeterministicEquivalentCriticTarget()`.
+**3. The full from-scratch training recipe.** This is the published schedule,
+declared in `lineage_from_scratch.json` and executed stage by stage:
 
-### CPU training
-
-Set `USE_GPU = false` in `train_hydro_exa.jl`, then run the same command.
-
-### Configuration
-
-Key parameters in `train_hydro_exa.jl`:
-
-| Parameter | Default | Description |
-|---|---|---|
-| `FORMULATION` | `:ac_polar` | OPF formulation (`:dc` or `:ac_polar`) |
-| `NUM_STAGES` | 96 | Planning horizon |
-| `NUM_EPOCHS` | 20 | Training epochs |
-| `NUM_BATCHES` | 100 | Gradient steps per epoch |
-| `NUM_WORKERS` | 4 | Parallel GPU solver instances |
-| `LAYERS` | `[128, 128]` | LSTM hidden layer sizes |
-| `LR` | 1e-3 | Learning rate |
-| `DEFICIT_COST` | 1e5 | Load-shedding penalty ($/pu) |
-
-### Training features
-
-- **Penalty scheduling**: target penalty multiplier ramps through phases (0.1 -> 1.0 -> 10.0 -> 30.0) over training
-- **Sample scheduling**: `num_train_per_batch` increases from `NUM_WORKERS` to `8 * NUM_WORKERS`
-- **Evaluation scheduling**: rollout evaluation starts with 4 scenarios and ramps to 32 at halfway
-- **Parallel solves**: independent NLP copies solved concurrently via `Threads.@spawn` worker pool
-- **Parallel rollout**: evaluation scenarios distributed across CPU stage-problem copies
-- **Critic variant**: optional scalar critic with value and gradient matching,
-  replay-buffer training, and cheap critic actor samples
-- **W&B logging**: training loss, rollout objectives, violation share, penalty multiplier
-
-## Validation
-
-Compare the ExaModels formulation against a JuMP/MadNLP reference:
-
-```julia
-julia --project -t auto eval_exa_de.jl
+```bash
+julia --project=. run_tsddr_lineage.jl                 # full lineage
+julia --project=. run_tsddr_lineage.jl --dry-run       # print the plan only
+julia --project=. run_tsddr_lineage.jl --stages=phase3  # resume one phase
 ```
 
-This loads a pre-solved JuMP reference and solves the same problem in ExaModels, printing a side-by-side comparison of objectives and reservoir trajectories.
+Each stage runs as its own process, so a stage boundary is a real restart: the
+optimizer state, the cosine learning-rate phase and the warm-up counter all
+begin again. The driver chains only checkpoints that a COMPLETE, non-shedding
+panel evaluation selected, hashes every parent before use, refuses `_latest`
+snapshots outright, and stops the lineage — rather than falling back — if a
+stage produces nothing selectable. Re-running resumes: a stage whose record
+exists and whose checkpoint still hashes correctly is skipped.
+
+Records land in `bolivia/ACPPowerModel/lineage/`: one JSON per stage with the
+resolved environment, ancestry, checkpoint hashes, update count and both the
+process wall time and the trainer's own training-loop seconds, plus a
+lineage-level ledger.
+
+Neither W&B nor a workload manager is required. `DR_ENABLE_WANDB=false` turns
+logging off; nothing in the driver reads a scheduler variable.
+
+**4. Paired evaluation of a checkpoint.**
+
+```bash
+DR_EVAL_CKPT=/path/to/checkpoint.jld2 DR_EVAL_LABEL=my_policy \
+  julia --project=. -t auto eval_paired_exa.jl                    # the 10-column panel
+
+DR_EVAL_CKPT=… DR_EVAL_LABEL=shard_1_50 \
+DR_EVAL_COL_FIRST=1 DR_EVAL_COL_LAST=50 \
+  julia --project=. -t auto eval_paired_exa.jl                    # one shard of the 500
+```
+
+Adding `DR_SOLUTION_DUMP=1` additionally writes the full primal solution of every
+stage and the decision trace that reproduces it, in the shared long format of
+`hydro_solution_schema.jl` — the per-bus, per-branch physics the stagewise
+figures are built from. (Nodal prices are duals and come from the JuMP engine's
+evaluators, which have them directly.)
+
+## Configuration surface of one training stage
+
+`train_hydro_exa_strict.jl` is driven entirely by environment variables; the
+lineage driver simply sets them. The ones that define a stage:
+
+| variable | meaning |
+|---|---|
+| `DR_NUM_TRAIN_PER_BATCH` | `nt`, trajectories sampled per gradient step |
+| `DR_LR`, `DR_LR_FINAL`, `DR_LR_WARMUP` | cosine learning-rate schedule and its warm-up |
+| `DR_NUM_EPOCHS` × `DR_NUM_BATCHES` | the update budget |
+| `DR_MAX_TRAIN_SECONDS` | wall budget for the training loop |
+| `DR_EVAL_EVERY`, `DR_EVAL_PROTOCOL_IDS`, `DR_NUM_EVAL_SCENARIOS` | the fixed evaluation panel and its cadence |
+| `DR_SAVE_METRIC=rollout` | select checkpoints on the panel, not on the training loss |
+| `DR_MAX_DEFICIT_PU` | reject an evaluation that shed load |
+| `DR_ROLLOUT_PARALLEL`, `DR_ROLLOUT_RETRY_FAILED` | pooled vs sequential evaluation, and whether a failed scenario is retried sequentially |
+| `DR_PRETRAINED_MODEL`, `DR_SEED_BEST`, `DR_PARENT_REPRO_TOL` | the parent checkpoint, its recorded value, and how exactly it must reproduce |
+| `DR_STAGE_SUMMARY` | where to write the machine-readable end-of-stage record |
+
+`DR_STOP_AFTER_STALE_EVALS` exists but defaults off, and should stay off unless a
+stage is expected to improve monotonically: raising the learning rate at a
+restart reliably degrades the policy before it recovers, and a small stale count
+terminates the stage inside that dip.

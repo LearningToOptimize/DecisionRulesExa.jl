@@ -59,6 +59,16 @@ train_tsddr(
 )
 ```
 
+> **Note on the uncertainty parameter**: `train_tsddr` writes the full sampled
+> trajectory (length `T * nw`) into `p_uncertainty` with
+> `ExaModels.set_parameter!`, which enforces an exact size match (ExaModels ≥
+> 0.11). The `p_w` built by `build_deterministic_equivalent` /
+> `build_linear_tracking_problem` holds only the `(T - 1) * nw` dynamics
+> entries, so for `train_tsddr` your NLP needs an uncertainty parameter of
+> length `T * nw` (as the Hydro example's `p_inflow` is). See the
+> `"train_tsddr open-loop smoke test"` testset in `test/runtests.jl` for a
+> minimal full-length variant of the problem above.
+
 For GPU, replace `backend = nothing` with `backend = CUDABackend()` and add `linear_solver = CUDSSSolver` to `madnlp_kwargs`.
 
 ## What you need to provide
@@ -71,7 +81,70 @@ For a custom problem you need:
 - **An uncertainty sampler** `() -> w_flat` returning a flat `Float32`/`Float64` vector of length `T * nw`.
 - **A Flux policy** (LSTM or MLP) mapping `(w_t, x_{t-1})` to target `x_t` at each stage.
 
-The package provides `build_deterministic_equivalent` for generic problems and `build_linear_tracking_problem` as a ready-made demo. For domain-specific models (power systems, robotics), build the ExaModels NLP directly — see `examples/HydroPowerModels/` for a complete AC-OPF example.
+The package provides `build_deterministic_equivalent` for generic problems and `build_linear_tracking_problem` as a ready-made demo. For domain-specific models, build the ExaModels NLP directly; `examples/BatteryStorageOPF/` contains an AC-OPF battery example.
+
+## Strict reachable target equality
+
+The usual TS-DDR deterministic equivalent uses slack-penalized target
+constraints,
+
+```text
+x_t - pi_theta(w_t, x_{t-1}) = delta_t,
+objective += rho * penalty(delta_t).
+```
+
+This is the right default for open-loop target trajectories and for cases where
+the policy can request states that are not reachable from the previous realized
+state. The target multipliers are then gradients of the penalized projection
+problem, so their quality depends on the penalty calibration.
+
+For policies whose output is guaranteed to lie in a one-stage reachable state
+set, a stricter formulation is possible:
+
+```text
+x_t = pi_theta(w_t, x_{t-1}),      pi_theta(w_t, x_{t-1}) in R(w_t, x_{t-1}).
+```
+
+In that case the deterministic equivalent does not need target slack variables
+or target penalties. The multiplier on the equality is the local envelope
+sensitivity of the true stage problem with respect to the policy-imposed next
+state, not the sensitivity of a penalized approximation. This is useful when:
+
+- users can define a differentiable or piecewise differentiable map into a
+  subset of the one-stage reachable set;
+- total recourse is guaranteed by the model for every state produced by that
+  map.
+
+The package supports two ways to make strict mode safe:
+
+- **Embedded strict DE** ([`train_tsddr_embedded`](@ref),
+  [`build_embedded_deterministic_equivalent`](@ref)) evaluates the policy inside
+  the NLP against realized states, so the policy always sees the state from
+  which its next target must be reachable.
+- **Regular strict DE with reachable rollout** computes targets before solving
+  the NLP, but starts from the true initial state and feeds the previous target
+  back to the reachable policy. If
+  `x̂_t ∈ R(x̂_{t-1}, w_t)` and `x̂_0 = x_0`, the full target path is feasible by
+  induction. The strict equality then forces the realized path to equal that
+  reachable target path.
+
+The published hydro case study uses the second path; see
+[`examples/HydroPowerModels`](examples/HydroPowerModels).
+
+Do not use strict equality for a generic open-loop target policy. For
+unreachable targets, the slack-penalty formulation is the robust fallback.
+
+The reachable map depends on the incoming state, and that dependence **must be
+differentiated**. Declaring the interval endpoints non-differentiable still
+produces a gradient and still lowers the loss, while descending a different
+direction — measured on the hydro case, 6% of the true magnitude and 48 degrees
+off. Check the complete actor gradient against finite differences before
+drawing hyperparameter conclusions from it.
+
+The hydro reachable policy keeps recurrence over inflows only. Optional
+`combiner_layers` / `DR_HEAD_LAYERS` add a nonlinear feed-forward map from
+`[encoded_inflow; reservoir_state]` to targets without adding recurrence over
+the state input.
 
 ## Parallel GPU solves
 
@@ -217,7 +290,24 @@ Choose DecisionRules.jl when:
 
 - [`examples/end_to_end_cpu.jl`](examples/end_to_end_cpu.jl) — minimal CPU demo with a linear tracking problem
 - [`examples/end_to_end_gpu.jl`](examples/end_to_end_gpu.jl) — same demo on GPU with CUDSS
-- [`examples/HydroPowerModels/`](examples/HydroPowerModels/) — full multi-stage hydrothermal scheduling with DC and AC OPF
+- [`examples/BatteryStorageOPF/`](examples/BatteryStorageOPF/) — reproducible PGLib AC-OPF cases with linear battery storage
+
+## Repository Map
+
+| Path | Purpose |
+|---|---|
+| `src/DecisionRulesExa.jl` | Module entrypoint and public exports |
+| `src/policy.jl` | MLP, state-conditioned LSTM policies, bounded target policies, nonlinear target heads |
+| `src/deterministic_equivalent.jl` | Generic open-loop deterministic-equivalent builder and solve helpers |
+| `src/embedded_deterministic_equivalent.jl` | Generic embedded-policy deterministic equivalent with nonlinear oracle |
+| `src/training.jl` | `train_tsddr`, embedded training, solver retry/warm-start handling |
+| `src/rollout.jl` | Stage-wise rollout evaluation for ExaModels problems |
+| `src/critic_control_variate.jl` | Scalar critic/control-variate helpers |
+| `src/utils.jl` | Indexing and small shared utilities |
+| `examples/end_to_end_cpu.jl` | Minimal CPU training demo |
+| `examples/end_to_end_gpu.jl` | Minimal GPU training demo |
+| `examples/BatteryStorageOPF/` | PGLib AC-OPF battery-storage example |
+| `test/runtests.jl` | Unit and smoke tests |
 
 ## Citation
 

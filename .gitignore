@@ -42,3 +42,13 @@ logs/
 # Slurm batch scripts (user-specific, not part of the package)
 *.sbatch
 *.sh
+examples/HydroPowerModels/results/
+*strong.json
+
+# Generated evaluation artifacts: per-policy physical audit dumps and result
+# shards. They are reproducible from the frozen case plus a checkpoint, they are
+# bulky, and they are specific to one run — so they stay out of the package.
+# The small reproducibility artifact that DOES belong in it is
+# examples/HydroPowerModels/bolivia/case_manifest.json, which is tracked.
+examples/**/audit/
+examples/**/results/

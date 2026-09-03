@@ -9,15 +9,32 @@
 """
     DeterministicEquivalentProblem
 
-Holds an ExaModels parametric NLP for the deterministic equivalent subproblem
+Container for an ExaModels parametric NLP representing a deterministic
+equivalent subproblem.
 
-    Q(w, x̂) =  min_{x,u,δ}  Σ_t stage_cost(t, x_t, u_t, w_t) + (ρ/2)‖δ‖²
-                s.t.        x₁ = x₀
-                            dynamics(t, x_t, u_t, w_t, x_{t+1}) = 0
-                            x̂_t - x_t - δ_t = 0     (target constraints, **added last**)
+# Fields
 
-We add the target constraints last so their multipliers are a contiguous slice of
-`result.multipliers`.
+- `core`: ExaModels core used to build variables, parameters, objectives, and
+  constraints.
+- `model`: ExaModels model passed to MadNLP.
+- `x`, `u`, `δ`: Flat state, control, and target-slack variables.
+- `p_x0`, `p_w`, `p_target`: Initial-state, uncertainty, and target parameters.
+- `nx`, `nu`, `nw`, `horizon`: State, control, uncertainty, and time dimensions.
+- `target_con_range`: Range of target-constraint multipliers in solver results.
+
+# Notes
+
+The subproblem has the form
+
+```math
+Q(w, \\hat{x}) =
+    \\min_{x,u,\\delta}
+        \\sum_t c_t(x_t, u_t, w_t) + \\frac{\\rho}{2}\\|\\delta\\|^2
+```
+
+subject to the initial condition, dynamics constraints, and target constraints
+``\\hat{x}_t - x_t - \\delta_t = 0``. The target constraints are added last so
+their multipliers occupy the contiguous slice `target_con_range`.
 """
 struct DeterministicEquivalentProblem
     core
@@ -42,8 +59,17 @@ end
 """
     MadNLPCache
 
-Optional cache to re-use a MadNLP solver instance across repeated solves
-(warm-start + reusing symbolic factorizations).
+Cache for reusing a MadNLP solver across repeated solves.
+
+# Fields
+
+- `solver`: Cached `MadNLP.MadNLPSolver`.
+- `last_result`: Most recent solver result, used for optional warm starts.
+
+# Notes
+
+Reusing the solver can avoid repeated symbolic setup and can warm-start the
+next primal iterate from the previous solution.
 """
 mutable struct MadNLPCache
     solver
@@ -53,27 +79,45 @@ end
 """
     build_deterministic_equivalent(; kwargs...) -> DeterministicEquivalentProblem
 
-Generic builder for a deterministic-equivalent dynamic NLP.
+Build a deterministic-equivalent dynamic nonlinear program.
 
-Keyword arguments:
-- `horizon::Int`  : number of stages T (states are 1..T, controls are 1..T-1)
-- `nx::Int`       : state dimension
-- `nu::Int`       : control dimension (demo assumes `nu == nx` for default dynamics)
-- `nw::Int`       : disturbance dimension (default: `nx`)
-- `backend`       : ExaModels backend (e.g., `nothing` for CPU, `CUDABackend()` for GPU)
-- `float_type`    : numeric type (Float64 recommended for MadNLP)
-- `x_bounds`      : `(lb, ub)` applied to all state variables
-- `u_bounds`      : `(lb, ub)` applied to all control variables
-- `slack_penalty` : ρ ≥ 0, weight for (ρ/2)‖δ‖²
+# Keywords
 
-- `dynamics_eq`   : function `(t, i, x, u, w, nx, nu, nw) -> expr == 0`
-                    returns the scalar equality residual for dimension `i` at stage `t`.
-- `stage_cost`    : function `(t, i, x, u, w, nx, nu, nw) -> expr` returns a scalar term.
+- `horizon::Int`: Number of stages. States are indexed over `1:horizon`;
+  controls and uncertainties over `1:(horizon - 1)`.
+- `nx::Int`: State dimension.
+- `nu::Int = nx`: Control dimension.
+- `nw::Int = nx`: Uncertainty dimension.
+- `backend = nothing`: ExaModels backend, such as `nothing` for CPU or a CUDA
+  backend for GPU execution.
+- `float_type::Type{<:AbstractFloat} = Float64`: Scalar type used by the model.
+- `x_bounds::Tuple{<:Real,<:Real} = (-Inf, Inf)`: Lower and upper bounds applied
+  to every state variable.
+- `u_bounds = (-Inf, Inf)`: Control bounds, either a scalar `(lb, ub)` tuple or
+  a tuple of length-`nu` lower and upper bound vectors.
+- `slack_penalty::Real = 1.0`: Nonnegative target-slack penalty weight ``ρ``.
+- `dynamics_eq::Function = default_dynamics_eq`: Function
+  `(t, i, x, u, w, nx, nu, nw) -> residual` defining one scalar dynamics
+  equality.
+- `stage_cost::Function = default_stage_cost`: Function
+  `(t, i, x, u, w, nx, nu, nw) -> term` defining one scalar objective term.
 
-Notes:
-- All variables are stored in flat vectors to keep the interface simple and robust.
-- Target constraints are added *last* and written as `x̂ - x - δ = 0` so that their
-  multipliers are directly the gradient w.r.t. `x̂` (envelope theorem).
+# Returns
+
+- `DeterministicEquivalentProblem`: A mutable problem container with parameters
+  that can be updated by `set_x0!`, `set_uncertainty!`, and `set_targets!`.
+
+# Throws
+
+Throws an error if dimensions are invalid, if vector control bounds have the
+wrong length, or if the default dynamics/cost are used with dimensions other
+than `nu == nx` and `nw == nx`.
+
+# Notes
+
+All variables are stored in flat vectors. Target constraints are added last and
+written as ``\\hat{x} - x - \\delta = 0`` so the envelope theorem identifies their
+multipliers with gradients with respect to the target trajectory.
 """
 function build_deterministic_equivalent(;
     horizon::Int,
@@ -180,11 +224,28 @@ end
 """
     build_linear_tracking_problem(; kwargs...)
 
-Convenience wrapper that builds a *simple* deterministic equivalent problem with:
-- dynamics: x_{t+1} = x_t + u_t + w_t
-- stage cost: (1/2) x_t^2 + (1/2) u_t^2
+Build the default linear-quadratic tracking demonstration problem.
 
-This is meant as an end-to-end demo and a template for your real model.
+# Keywords
+
+- `horizon::Int`: Number of stages.
+- `nx::Int = 1`: State, control, and uncertainty dimension.
+- `backend = nothing`: ExaModels backend.
+- `float_type::Type{<:AbstractFloat} = Float64`: Scalar type used by the model.
+- `x_bounds::Tuple{<:Real,<:Real} = (-Inf, Inf)`: State bounds.
+- `u_bounds::Tuple{<:Real,<:Real} = (-1.0, 1.0)`: Control bounds.
+- `slack_penalty::Real = 10.0`: Target-slack penalty weight.
+
+# Returns
+
+- `DeterministicEquivalentProblem`: Problem with dynamics
+  ``x_{t+1} = x_t + u_t + w_t`` and stage cost
+  ``(x_t^2 + u_t^2) / 2``.
+
+# Notes
+
+This helper is intended as a small end-to-end example and as a template for
+model-specific deterministic-equivalent builders.
 """
 function build_linear_tracking_problem(;
     horizon::Int,
@@ -215,11 +276,28 @@ end
 # --------------------------
 
 """
-Default per-dimension dynamics residual for the demo:
+    default_dynamics_eq(t, i, x, u, w, nx::Int, nu::Int, nw::Int)
 
-    x_{t+1,i} - x_{t,i} - u_{t,i} - w_{t,i} == 0
+Return the default scalar dynamics residual.
 
-Assumes `nu == nx` and `nw == nx`.
+# Arguments
+
+- `t`: Stage index.
+- `i`: State component index.
+- `x`: Flat state variable vector.
+- `u`: Flat control variable vector.
+- `w`: Flat uncertainty parameter vector.
+- `nx::Int`: State dimension.
+- `nu::Int`: Control dimension.
+- `nw::Int`: Uncertainty dimension.
+
+# Returns
+
+- Scalar residual ``x_{t+1,i} - x_{t,i} - u_{t,i} - w_{t,i}``.
+
+# Notes
+
+The default residual assumes `nu == nx` and `nw == nx`.
 """
 function default_dynamics_eq(t, i, x, u, w, nx::Int, nu::Int, nw::Int)
     return x[x_index(nx, t + 1, i)] -
@@ -229,9 +307,24 @@ function default_dynamics_eq(t, i, x, u, w, nx::Int, nu::Int, nw::Int)
 end
 
 """
-Default per-dimension stage cost term for the demo:
+    default_stage_cost(t, i, x, u, w, nx::Int, nu::Int, nw::Int)
 
-    (1/2) x_{t,i}^2 + (1/2) u_{t,i}^2
+Return the default scalar stage-cost term.
+
+# Arguments
+
+- `t`: Stage index.
+- `i`: State/control component index.
+- `x`: Flat state variable vector.
+- `u`: Flat control variable vector.
+- `w`: Flat uncertainty parameter vector.
+- `nx::Int`: State dimension.
+- `nu::Int`: Control dimension.
+- `nw::Int`: Uncertainty dimension.
+
+# Returns
+
+- Scalar cost ``(x_{t,i}^2 + u_{t,i}^2) / 2``.
 """
 function default_stage_cost(t, i, x, u, w, nx::Int, nu::Int, nw::Int)
     return (x[x_index(nx, t, i)]^2 + u[u_index(nu, t, i)]^2) / 2
@@ -242,9 +335,22 @@ end
 # --------------------------
 
 """
-    set_x0!(prob, x0)
+    set_x0!(prob::DeterministicEquivalentProblem, x0::AbstractVector)
 
-Update initial state parameter (length nx).
+Update the initial-state parameter.
+
+# Arguments
+
+- `prob::DeterministicEquivalentProblem`: Problem to update.
+- `x0::AbstractVector`: Initial state with length `prob.nx`.
+
+# Returns
+
+- `prob`: The updated problem.
+
+# Throws
+
+Throws an error if `length(x0) != prob.nx`.
 """
 function set_x0!(prob::DeterministicEquivalentProblem, x0::AbstractVector)
     length(x0) == prob.nx || error("x0 length must be nx=$(prob.nx), got $(length(x0))")
@@ -253,12 +359,29 @@ function set_x0!(prob::DeterministicEquivalentProblem, x0::AbstractVector)
 end
 
 """
-    set_uncertainty!(prob, w)
+    set_uncertainty!(prob::DeterministicEquivalentProblem, w::AbstractVector)
 
-Update disturbance trajectory parameter.
-`w` must have length `(T-1)*nw` or `T*nw`; in the latter case the first `(T-1)*nw`
-elements are used (the last stage's uncertainty only enters the policy rollout, not
-the NLP dynamics).
+Update the disturbance-trajectory parameter.
+
+# Arguments
+
+- `prob::DeterministicEquivalentProblem`: Problem to update.
+- `w::AbstractVector`: Disturbance trajectory with length `(T - 1) * nw` or
+  `T * nw`.
+
+# Returns
+
+- `prob`: The updated problem.
+
+# Throws
+
+Throws an error if `w` has any length other than `(T - 1) * nw` or `T * nw`.
+
+# Notes
+
+When `w` has length `T * nw`, only the first `(T - 1) * nw` entries are used in
+the NLP dynamics. The final-stage uncertainty may be needed by a policy rollout
+but does not enter these dynamics constraints.
 """
 function set_uncertainty!(prob::DeterministicEquivalentProblem, w::AbstractVector)
     expected = (prob.horizon - 1) * prob.nw
@@ -274,9 +397,22 @@ function set_uncertainty!(prob::DeterministicEquivalentProblem, w::AbstractVecto
 end
 
 """
-    set_targets!(prob, xhat)
+    set_targets!(prob::DeterministicEquivalentProblem, xhat::AbstractVector)
 
-Update target trajectory parameter (length T*nx).
+Update the target-trajectory parameter.
+
+# Arguments
+
+- `prob::DeterministicEquivalentProblem`: Problem to update.
+- `xhat::AbstractVector`: Target trajectory with length `prob.horizon * prob.nx`.
+
+# Returns
+
+- `prob`: The updated problem.
+
+# Throws
+
+Throws an error if `length(xhat) != prob.horizon * prob.nx`.
 """
 function set_targets!(prob::DeterministicEquivalentProblem, xhat::AbstractVector)
     expected = prob.horizon * prob.nx
@@ -292,7 +428,20 @@ end
 """
     init_madnlp_cache(prob; solver_kwargs...) -> MadNLPCache
 
-Create and store a `MadNLP.MadNLPSolver` for repeated solves.
+Create a cached MadNLP solver for repeated solves.
+
+# Arguments
+
+- `prob::DeterministicEquivalentProblem`: Problem whose ExaModel will be solved.
+
+# Keywords
+
+- `solver_kwargs...`: Keyword arguments forwarded to `MadNLP.MadNLPSolver`.
+
+# Returns
+
+- `MadNLPCache`: Cache containing the solver and an initially empty
+  `last_result`.
 """
 function init_madnlp_cache(prob::DeterministicEquivalentProblem; solver_kwargs...)
     solver = MadNLP.MadNLPSolver(prob.model; solver_kwargs...)
@@ -300,19 +449,62 @@ function init_madnlp_cache(prob::DeterministicEquivalentProblem; solver_kwargs..
 end
 
 """
-    solve!(prob; solver_kwargs...) -> result
+    solve!(prob::DeterministicEquivalentProblem; solver_kwargs...) -> result
 
-Solve once by instantiating a fresh MadNLP solver (simplest, but allocates).
+Solve a deterministic-equivalent problem with a fresh MadNLP solver.
+
+# Arguments
+
+- `prob::DeterministicEquivalentProblem`: Problem to solve.
+
+# Keywords
+
+- `solver_kwargs...`: Keyword arguments forwarded to `MadNLP.madnlp`.
+
+# Returns
+
+- `result`: MadNLP result object.
+
+# Notes
+
+This path is simple but allocates a new solver for every call.
 """
 function solve!(prob::DeterministicEquivalentProblem; solver_kwargs...)
     return MadNLP.madnlp(prob.model; solver_kwargs...)
 end
 
 """
-    solve!(prob, cache; warmstart=true, solver_kwargs...) -> result
+    solve!(prob::DeterministicEquivalentProblem, cache::MadNLPCache; warmstart=true, solver_kwargs...) -> result
 
-Solve using a cached solver instance. Optionally warm-start the primal
-variables from the previous solution.
+Solve a deterministic-equivalent problem with a cached MadNLP solver.
+
+# Arguments
+
+- `prob::DeterministicEquivalentProblem`: Problem to solve.
+- `cache::MadNLPCache`: Cached solver and previous result.
+
+# Keywords
+
+- `warmstart::Bool = true`: Whether to copy the previous primal solution into
+  the model initial point before solving.
+- `solver_kwargs...`: Keyword arguments forwarded to `MadNLP.solve!`.
+
+# Returns
+
+- `result`: MadNLP result object, also stored in `cache.last_result`.
+
+# Notes
+
+Warm starts are used only when `warmstart` is true and `cache.last_result` is
+available.
+
+MadNLP's iteration counter `cnt.k` is cumulative across `solve!` calls on the
+same solver instance and is never reset by MadNLP itself. Without resetting it
+(together with `cnt.acceptable_cnt` and `cnt.start_time`), repeated solves on a
+cached solver eventually exhaust `max_iter` spuriously — the counters are reset
+here before each solve so every call gets its intended per-solve iteration and
+wall-clock budget. This mirrors the reset in `_solve!` (training.jl) and does
+not change any numerics of an individual solve.
 """
 function solve!(prob::DeterministicEquivalentProblem, cache::MadNLPCache;
     warmstart::Bool = true,
@@ -322,6 +514,10 @@ function solve!(prob::DeterministicEquivalentProblem, cache::MadNLPCache;
         # Warm-start primal from previous solution
         copyto!(NLPModels.get_x0(prob.model), cache.last_result.solution)
     end
+    # Reset per-solve iteration budget (cnt.k is cumulative in MadNLP).
+    cache.solver.cnt.k              = 0                     # reset iteration counter
+    cache.solver.cnt.acceptable_cnt = 0                     # reset acceptable-step counter
+    cache.solver.cnt.start_time     = time()                # reset wall-clock timer
     res = MadNLP.solve!(cache.solver; solver_kwargs...)
     cache.last_result = res
     return res
@@ -332,17 +528,43 @@ end
 # --------------------------
 
 """
-    target_multipliers(prob, result) -> λ
+    target_multipliers(prob::DeterministicEquivalentProblem, result) -> λ
 
-Return the dual multipliers associated with the target constraints (∇_{x̂} Q).
+Return the dual multipliers associated with target constraints.
+
+# Arguments
+
+- `prob::DeterministicEquivalentProblem`: Problem that defines the multiplier
+  slice.
+- `result`: MadNLP result containing `multipliers`.
+
+# Returns
+
+- `λ`: Multipliers in `result.multipliers[prob.target_con_range]`.
+
+# Notes
+
+With target constraints written as ``\\hat{x} - x - \\delta = 0``, these
+multipliers are the envelope-theorem derivatives with respect to the target
+trajectory.
 """
 target_multipliers(prob::DeterministicEquivalentProblem, result) =
     result.multipliers[prob.target_con_range]
 
 """
-    solution_components(prob, result) -> (x, u, δ)
+    solution_components(prob::DeterministicEquivalentProblem, result) -> (x, u, δ)
 
 Split the flat solution vector into state, control, and slack components.
+
+# Arguments
+
+- `prob::DeterministicEquivalentProblem`: Problem that defines component sizes.
+- `result`: MadNLP result containing `solution`.
+
+# Returns
+
+- `(x, u, δ)`: Flat slices of the primal solution for states, controls, and
+  target slacks.
 """
 function solution_components(prob::DeterministicEquivalentProblem, result)
     n_x = prob.horizon * prob.nx

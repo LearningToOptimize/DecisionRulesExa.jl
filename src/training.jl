@@ -6,7 +6,7 @@
 #   1. uncertainty_sampler() → flat w  (length T × nw_per_stage)
 #   2. Policy rollout: x̂_t = policy(vcat(w_t, x̂_{t-1}))  for t = 1..T
 #   3. ExaModels.set_parameter! for x0, uncertainty, targets → MadNLP.solve!
-#   4. λ = result.multipliers[target_con_range]   (∇_{x̂} Q, envelope theorem)
+#   4. λ = target_multipliers(de, result)          (∇_{x̂} Q, envelope theorem)
 #   5. Zygote: ∇_θ (1/n) Σ_s ⟨λ_s, x̂_s(θ)⟩  →  Flux.update!
 #
 # The user passes parameter objects (p_x0, p_target, p_uncertainty) exactly as
@@ -21,34 +21,264 @@
 
 # ── Gradient materialization ──────────────────────────────────────────────────
 
-_mat(x) = x
-_mat(x::Zygote.OneElement) = collect(x)
+"""
+    _mat(x)
+    _mat(x::Zygote.OneElement)
+    _mat(x::ChainRulesCore.Tangent)
+    _mat(x::ChainRulesCore.MutableTangent)
+
+Recursively materialize lazy Zygote / ChainRules tangent wrappers into plain
+Julia values (arrays and named tuples).
+
+Zygote may return `OneElement` sparse arrays or `Tangent`/`MutableTangent`
+wrappers instead of dense arrays or named tuples. `Flux.update!` expects
+concrete data, so every tangent node must be materialized before the optimizer
+step.
+
+# Arguments
+- `x`: a gradient value — may be a plain array, a `Zygote.OneElement`, a
+  `ChainRulesCore.Tangent`, or a `ChainRulesCore.MutableTangent`.
+
+# Returns
+- For plain values: returns `x` unchanged.
+- For `OneElement`: returns `collect(x)`, a dense array.
+- For `Tangent`/`MutableTangent`: returns a `NamedTuple` with recursively
+  materialized fields.
+- For `Base.RefValue` (Zygote's wrapper for tangents of mutated mutable
+  structs, such as the state-threading policies): unwraps and recurses.
+- For plain `NamedTuple`/`Tuple`: recurses so nested wrappers are stripped.
+- For `NoTangent`/`ZeroTangent`: returns `nothing`.
+"""
+_mat(x) = x                                          # plain value — no conversion needed
+_mat(x::Zygote.OneElement) = collect(x)               # sparse one-hot → dense array
 function _mat(x::ChainRulesCore.Tangent{<:Any})
-    nt = ChainRulesCore.backing(x)
-    return NamedTuple{keys(nt)}(map(_mat, values(nt)))
+    nt = ChainRulesCore.backing(x)                    # extract underlying named tuple
+    return NamedTuple{keys(nt)}(map(_mat, values(nt)))  # recursively materialize each field
 end
 function _mat(x::ChainRulesCore.MutableTangent{<:Any})
-    nt = ChainRulesCore.backing(x)
-    return NamedTuple{keys(nt)}(map(_mat, values(nt)))
+    nt = ChainRulesCore.backing(x)                    # extract underlying named tuple
+    return NamedTuple{keys(nt)}(map(_mat, values(nt)))  # recursively materialize each field
 end
-materialize_tangent(g) = isnothing(g) ? nothing : _mat(g)
+# Structural-zero tangents (non-differentiable fields) map to nothing so
+# Flux.update! skips them.
+_mat(::ChainRulesCore.NoTangent)   = nothing
+_mat(::ChainRulesCore.ZeroTangent) = nothing
+# Zygote wraps tangents of MUTATED mutable structs (e.g. the state-threading
+# policies, whose forward pass stores the new recurrent state via setfield!) in
+# Base.RefValue and MutableTangent containers, potentially nested inside plain
+# NamedTuples/Tuples. Recurse through those containers so every wrapper is
+# stripped before the gradient reaches Flux.update!.
+_mat(ref::Base.RefValue) = _mat(ref[])                # unwrap Ref and recurse
+_mat(nt::NamedTuple{K}) where {K} =
+    NamedTuple{K}(map(_mat, values(nt)))              # recurse plain named tuples
+_mat(t::Tuple) = map(_mat, t)                          # recurse plain tuples
 
-_all_finite_gradient(x::AbstractArray) = all(isfinite, x)
-_all_finite_gradient(x::Number)        = isfinite(x)
-_all_finite_gradient(x::Nothing)       = true
-_all_finite_gradient(x::NamedTuple)    = all(_all_finite_gradient(v) for v in values(x))
-_all_finite_gradient(x::Tuple)         = all(_all_finite_gradient(v) for v in x)
-_all_finite_gradient(x)                = true
+"""
+    materialize_tangent(g) -> Union{Nothing, Any}
+
+Convert a Zygote gradient `g` into plain Julia arrays and named tuples that
+`Flux.update!` can consume. Returns `nothing` when `g` is `nothing` (i.e., no
+gradient was produced for that parameter).
+
+This is the public entry point; internally it delegates to [`_mat`](@ref).
+
+# Arguments
+- `g`: raw gradient returned by `Zygote.gradient`; may be `nothing`.
+
+# Returns
+- `nothing` if `g` is `nothing`.
+- A materialized gradient (dense arrays / named tuples) otherwise.
+
+# Examples
+```julia
+gs = Zygote.gradient(model) do m
+    sum(m(x))
+end
+grad = materialize_tangent(gs[1])   # NamedTuple or nothing
+```
+"""
+materialize_tangent(g) = isnothing(g) ? nothing : _mat(g)  # guard against nothing gradients
+
+"""
+    _all_finite_gradient(x) -> Bool
+
+Recursively check that every element of a (possibly nested) gradient structure
+is finite (no `NaN` or `±Inf`).
+
+After BPTT through physics-based dynamics, accumulated Jacobian products can
+overflow `Float32` range (> 3.4e38), producing `Inf` or `NaN` values that
+would corrupt the Adam optimizer state. This guard prevents
+`Flux.update!` from being called with non-finite gradients.
+
+# Arguments
+- `x`: gradient value — may be an `AbstractArray`, `Number`, `Nothing`,
+  `NamedTuple`, `Tuple`, or any other type.
+
+# Returns
+- `true` if every numeric leaf is finite (or the value is `nothing` / an
+  unrecognized type that carries no numeric data).
+- `false` if any leaf contains `NaN` or `±Inf`.
+
+# Examples
+```julia
+_all_finite_gradient([1.0, 2.0])     # true
+_all_finite_gradient([1.0, NaN])     # false
+_all_finite_gradient((a=[1.0], b=Inf))  # false
+_all_finite_gradient(nothing)        # true
+```
+"""
+_all_finite_gradient(x::AbstractArray) = all(isfinite, x)   # check every element
+_all_finite_gradient(x::Number)        = isfinite(x)        # scalar check
+_all_finite_gradient(x::Nothing)       = true               # nothing → vacuously finite
+_all_finite_gradient(x::NamedTuple)    = all(_all_finite_gradient(v) for v in values(x))  # recurse named tuple fields
+_all_finite_gradient(x::Tuple)         = all(_all_finite_gradient(v) for v in x)          # recurse tuple elements
+_all_finite_gradient(x)                = true               # fallback: assume finite for unknown types
+
+"""
+    _status_key(status) -> String
+
+Convert a MadNLP solver status enum value into a safe string key by replacing
+non-alphanumeric characters with underscores. Used to build human-readable
+diagnostic dictionaries keyed by solver outcome.
+
+# Arguments
+- `status`: a MadNLP status enum (e.g., `MadNLP.SOLVE_SUCCEEDED`).
+
+# Returns
+- A sanitized `String` suitable for use as a dictionary key.
+
+# Examples
+```julia
+_status_key(MadNLP.SOLVE_SUCCEEDED)  # "SOLVE_SUCCEEDED"
+```
+"""
+_status_key(status) = replace(string(status), r"[^A-Za-z0-9_]" => "_")  # sanitize status to dict-safe key
+
+"""
+    _inc_status!(counts::Dict{String, Int}, status) -> Dict{String, Int}
+
+Increment the counter for the given MadNLP solver `status` in `counts`.
+Converts `status` to a string key via [`_status_key`](@ref) before
+incrementing.
+
+# Arguments
+- `counts::Dict{String, Int}`: mutable dictionary of status counts.
+- `status`: a MadNLP solver status enum.
+
+# Returns
+- The mutated `counts` dictionary.
+"""
+function _inc_status!(counts::Dict{String, Int}, status)
+    key = _status_key(status)                  # convert enum to string key
+    counts[key] = get(counts, key, 0) + 1      # increment (initialize to 0 if absent)
+    return counts
+end
+
+"""
+    _inc_count!(counts::Dict{String, Int}, key::String) -> Dict{String, Int}
+
+Increment the counter for `key` in the diagnostics dictionary `counts`.
+Used to track failure reasons (e.g., `"nonfinite_objective"`) and retry
+outcomes during training batches.
+
+# Arguments
+- `counts::Dict{String, Int}`: mutable dictionary of event counts.
+- `key::String`: the event identifier to increment.
+
+# Returns
+- The mutated `counts` dictionary.
+"""
+function _inc_count!(counts::Dict{String, Int}, key::String)
+    counts[key] = get(counts, key, 0) + 1      # increment (initialize to 0 if absent)
+    return counts
+end
+
+"""
+    _adapt_array(x::AbstractVector, ref::AbstractVector) -> AbstractVector
+
+Move `x` onto the same device (CPU or GPU) as `ref`, allocating a new array
+only when the concrete types differ.
+
+When training runs on GPU, solver outputs (multipliers, states) may be
+`CuVector`s while sampled data may arrive as CPU `Vector`s (or vice versa).
+This helper ensures type-homogeneous arithmetic by copying `x` into a
+`similar` array derived from `ref`.
+
+# Arguments
+- `x::AbstractVector`: the source data to adapt (may be CPU or GPU).
+- `ref::AbstractVector`: a reference vector whose concrete type determines the
+  target device / storage backend.
+
+# Returns
+- `x` itself when `typeof(x) === typeof(ref)` (zero-copy fast path).
+- A new array on the same device as `ref`, with the element type of `x` and
+  the data of `x` copied in.
+
+# Examples
+```julia
+using CUDA
+cpu_vec = [1.0f0, 2.0f0]
+gpu_ref = CUDA.zeros(Float32, 3)
+gpu_vec = _adapt_array(cpu_vec, gpu_ref)  # CuVector{Float32}
+```
+"""
+function _adapt_array(x::AbstractVector, ref::AbstractVector)
+    typeof(x) === typeof(ref) && return x                       # same type → no copy needed
+    copyto!(similar(ref, eltype(x), length(x)), x)              # allocate on ref's device, copy x into it
+end
 
 # ── Solve-status check ────────────────────────────────────────────────────────
 
 """
     solve_succeeded(result) -> Bool
+
+Check whether a MadNLP solve result indicates a usable solution.
+
+MadNLP returns `0.0` objective for failed or infeasible solves, so checking
+`isfinite(objective)` alone is not sufficient. This function inspects the
+solver status directly.
+
+# Arguments
+- `result`: a MadNLP result object with a `.status` field.
+
+# Returns
+- `true` if `result.status` is `SOLVE_SUCCEEDED` or `SOLVED_TO_ACCEPTABLE_LEVEL`.
+- `false` for all other statuses (e.g., `MAXIMUM_ITERATIONS_EXCEEDED`,
+  `INFEASIBLE_PROBLEM_DETECTED`).
+
+# Examples
+```julia
+result = MadNLP.solve!(solver)
+if solve_succeeded(result)
+    @show result.objective
+end
+```
 """
 function solve_succeeded(result)
-    s = result.status
-    return s == MadNLP.SOLVE_SUCCEEDED || s == MadNLP.SOLVED_TO_ACCEPTABLE_LEVEL
+    s = result.status                                                           # extract MadNLP status enum
+    return s == MadNLP.SOLVE_SUCCEEDED || s == MadNLP.SOLVED_TO_ACCEPTABLE_LEVEL  # accept both convergence levels
 end
+
+"""
+    prepare_solve!(de, init_state, w_flat, xhat_flat)
+
+Hook called after standard parameter updates and before each NLP solve.
+
+# Arguments
+- `de`: deterministic-equivalent problem.
+- `init_state`: initial state used for the current sample.
+- `w_flat`: flat uncertainty trajectory for the current sample.
+- `xhat_flat`: flat target trajectory for the current sample.
+
+# Returns
+- `nothing` by default.
+
+# Notes
+Override this method for problem types that need additional parameter updates,
+for example setting a reservoir parameter from `x0` and targets when the
+reservoir is not a decision variable.
+"""
+prepare_solve!(de, init_state, w_flat, xhat_flat) = nothing
 
 # ── Internal: one MadNLP solve with cascade-failure prevention ────────────────
 #
@@ -60,57 +290,205 @@ end
 # Per-solve iteration budget: MadNLP's cnt.k is CUMULATIVE across calls, so we
 # reset it before each solve to give each batch a fresh max_iter budget.
 
+"""
+    _SolverState
+
+Mutable wrapper around a MadNLP solver that caches the last successful
+primal-dual snapshot for warm-start cascade-failure prevention.
+
+After a failed solve, MadNLP's duals (`y`, `zl`, `zu`) are corrupted.
+If the next call uses `reinitialize!()` (warm-start path), it keeps those
+corrupted duals and the failure cascades. `_SolverState` stores the
+last-good dual values so they can be restored after a failure, breaking
+the cascade without paying the cost of a full cold start.
+
+# Fields
+- `solver`: the `MadNLP.MadNLPSolver` instance.
+- `last_good_x`: primal snapshot from the last successful solve (CPU or GPU
+  array), or `nothing` before the first success.
+- `last_good_y`: equality dual snapshot, or `nothing`.
+- `last_good_zl_vals`: lower-bound dual values snapshot, or `nothing`.
+- `last_good_zu_vals`: upper-bound dual values snapshot, or `nothing`.
+- `has_fixed_vars::Bool`: `true` when the NLP has fixed variables (via
+  `MakeParameter`), which requires a fresh solver per solve to avoid stale
+  KKT factorization state.
+"""
 mutable struct _SolverState
-    solver
-    last_good_x        # primal snapshot (CPU or GPU array), or nothing
-    last_good_y        # dual snapshot, or nothing
-    last_good_zl_vals
-    last_good_zu_vals
+    solver                     # MadNLP.MadNLPSolver instance
+    last_good_x                # primal snapshot (CPU or GPU array), or nothing
+    last_good_y                # dual snapshot, or nothing
+    last_good_zl_vals          # lower-bound dual values snapshot, or nothing
+    last_good_zu_vals          # upper-bound dual values snapshot, or nothing
+    has_fixed_vars::Bool       # true when fixed variables exist in the NLP
 end
 
+"""
+    _make_solver(nlp, madnlp_kwargs) -> _SolverState
+
+Construct a [`_SolverState`](@ref) wrapping a fresh `MadNLP.MadNLPSolver`.
+
+Detects whether the NLP has fixed variables by comparing the solver's internal
+variable count against the NLP's variable count. When fixed variables exist
+(via `ExaModels.MakeParameter`), the solver cannot be safely reused across
+parameter changes, so `has_fixed_vars` is set to `true`.
+
+# Arguments
+- `nlp`: an NLPModels-compatible problem (e.g., `ExaModel`).
+- `madnlp_kwargs`: `NamedTuple` of keyword arguments forwarded to
+  `MadNLP.MadNLPSolver`.
+
+# Returns
+- A fresh [`_SolverState`](@ref) with no cached primal-dual snapshot.
+
+# Examples
+```julia
+state = _make_solver(det_equivalent.model, (print_level=0, tol=1e-6))
+```
+"""
 function _make_solver(nlp, madnlp_kwargs)
-    solver = MadNLP.MadNLPSolver(nlp; madnlp_kwargs...)
-    return _SolverState(solver, nothing, nothing, nothing, nothing)
+    solver = MadNLP.MadNLPSolver(nlp; madnlp_kwargs...)  # build MadNLP solver with user options
+    nvar_solver = length(solver.x.x)                      # internal (reduced) variable count
+    nvar_nlp    = length(NLPModels.get_x0(nlp))            # NLP-level variable count
+    has_fixed   = nvar_solver != nvar_nlp                  # mismatch → fixed variables present
+    return _SolverState(solver, nothing, nothing, nothing, nothing, has_fixed)  # no cached duals yet
 end
 
-function _solve!(state::_SolverState, nlp; warmstart::Bool, madnlp_kwargs)
-    solver = state.solver
+"""
+    _solve!(state::_SolverState, nlp; warmstart::Bool, madnlp_kwargs)
 
-    # Primal warm-start: seed NLPModel's x0 from last-good primal.
-    if warmstart && state.last_good_x !== nothing
-        copyto!(NLPModels.get_x0(nlp), state.last_good_x)
+Solve `nlp` using the MadNLP solver cached in `state`, with cascade-failure
+prevention via dual snapshot restore.
+
+The warm-start logic implements three paths:
+
+1. **Fixed variables** (`state.has_fixed_vars`): create a fresh solver each
+   call because MadNLP's KKT factorization becomes stale when `MakeParameter`
+   changes fixed-variable values between solves.
+
+2. **Warm start after success**: copy the last-good primal into `x0` and let
+   `reinitialize!()` keep the cached duals.
+
+3. **Warm start after failure**: restore the last-good dual snapshot
+   (`y`, `zl.values`, `zu.values`) and mark the solver as `SOLVE_SUCCEEDED`
+   so `reinitialize!()` keeps those restored duals rather than the corrupted
+   ones. If no good snapshot exists, fall back to `INITIAL` (cold start).
+
+MadNLP's `cnt.k` is cumulative and never reset internally, so we reset it
+before each solve to give every call a fresh `max_iter` budget.
+
+# Arguments
+- `state::_SolverState`: solver wrapper with optional cached primal-dual
+  snapshot.
+- `nlp`: the NLPModels-compatible problem to solve.
+- `warmstart::Bool`: `true` to reuse duals from prior solves, `false` to
+  cold-start.
+- `madnlp_kwargs`: `NamedTuple` forwarded to `MadNLP.solve!`.
+
+# Returns
+- A MadNLP result object with fields `.status`, `.objective`,
+  `.multipliers`, `.solution`.
+
+# Examples
+```julia
+state = _make_solver(nlp, (print_level=0,))
+result = _solve!(state, nlp; warmstart=true, madnlp_kwargs=(print_level=0,))
+```
+"""
+function _solve!(state::_SolverState, nlp; warmstart::Bool, madnlp_kwargs)
+    solver = state.solver                                  # cached MadNLP solver instance
+
+    # MadNLP solver reuse with MakeParameter (fixed variables) causes INFEASIBLE
+    # on subsequent solves even with INITIAL status — stale KKT factorization state.
+    # Fix: create a fresh solver each time when fixed variables exist.
+    if state.has_fixed_vars
+        return MadNLP.madnlp(nlp; madnlp_kwargs...)        # one-shot fresh solver
     end
 
-    prev_result = solver.status
-    prev_failed = (prev_result != MadNLP.INITIAL &&
-                   prev_result != MadNLP.SOLVE_SUCCEEDED &&
+    # Normal path (no fixed variables): full warm-start support.
+    if warmstart && state.last_good_x !== nothing
+        copyto!(NLPModels.get_x0(nlp), state.last_good_x)  # seed primal with last-good solution
+    end
+
+    prev_result = solver.status                             # check previous solve outcome
+    prev_failed = (prev_result != MadNLP.INITIAL &&         # any non-success, non-initial status
+                   prev_result != MadNLP.SOLVE_SUCCEEDED &&   # means the duals may be corrupted
                    prev_result != MadNLP.SOLVED_TO_ACCEPTABLE_LEVEL)
 
     if !warmstart
-        solver.status = MadNLP.INITIAL
+        solver.status = MadNLP.INITIAL                      # cold start: reset x, y, zl, zu
     elseif prev_failed && state.last_good_y !== nothing
-        solver.y         .= state.last_good_y
-        solver.zl.values .= state.last_good_zl_vals
-        solver.zu.values .= state.last_good_zu_vals
-        solver.status     = MadNLP.SOLVE_SUCCEEDED
+        solver.y         .= state.last_good_y               # restore last-good equality duals
+        solver.zl.values .= state.last_good_zl_vals         # restore last-good lower-bound duals
+        solver.zu.values .= state.last_good_zu_vals         # restore last-good upper-bound duals
+        solver.status     = MadNLP.SOLVE_SUCCEEDED          # trick reinitialize!() into warm path
     elseif prev_failed
-        solver.status = MadNLP.INITIAL
+        solver.status = MadNLP.INITIAL                      # no snapshot available → cold start
     end
 
-    # Reset per-solve iteration budget.
-    solver.cnt.k              = 0
-    solver.cnt.acceptable_cnt = 0
-    solver.cnt.start_time     = time()
+    # Reset per-solve iteration budget (cnt.k is cumulative in MadNLP).
+    solver.cnt.k              = 0                           # reset iteration counter
+    solver.cnt.acceptable_cnt = 0                           # reset acceptable-step counter
+    solver.cnt.start_time     = time()                      # reset wall-clock timer
 
-    res = MadNLP.solve!(solver; madnlp_kwargs...)
+    res = MadNLP.solve!(solver; madnlp_kwargs...)           # run the solver
 
     if solve_succeeded(res)
-        state.last_good_x       = copy(solver.x.x)
-        state.last_good_y       = copy(solver.y)
-        state.last_good_zl_vals = copy(solver.zl.values)
-        state.last_good_zu_vals = copy(solver.zu.values)
+        state.last_good_x       = copy(solver.x.x)         # snapshot primal (GPU-safe copy)
+        state.last_good_y       = copy(solver.y)            # snapshot equality duals
+        state.last_good_zl_vals = copy(solver.zl.values)    # snapshot lower-bound duals
+        state.last_good_zu_vals = copy(solver.zu.values)    # snapshot upper-bound duals
     end
     return res
+end
+
+"""
+    _solve_with_retry!(state::_SolverState, nlp;
+                       warmstart::Bool, madnlp_kwargs, retry_on_failure::Bool)
+        -> (result, retried::Bool)
+
+Solve `nlp` via [`_solve!`](@ref), optionally retrying with a fresh cold-start
+solver if the first attempt fails or returns a non-finite objective.
+
+The retry creates a brand-new [`_SolverState`](@ref) (discarding any corrupted
+internal state) and solves with `warmstart=false`. This is more expensive than
+the dual-restore path in `_solve!` but guarantees a clean factorization.
+
+# Arguments
+- `state::_SolverState`: primary solver state (may have cached duals).
+- `nlp`: the NLPModels-compatible problem.
+- `warmstart::Bool`: whether the first attempt should warm-start.
+- `madnlp_kwargs`: `NamedTuple` forwarded to `MadNLP.solve!`.
+- `retry_on_failure::Bool`: if `true`, retry with a fresh solver on failure.
+
+# Returns
+- `result`: the MadNLP result from whichever attempt succeeded (or the retry
+  result if both failed).
+- `retried::Bool`: `true` if the retry path was taken.
+
+# Examples
+```julia
+result, retried = _solve_with_retry!(
+    state, nlp;
+    warmstart=true, madnlp_kwargs=(print_level=0,), retry_on_failure=true,
+)
+retried && @warn "solve required retry"
+```
+"""
+function _solve_with_retry!(state::_SolverState, nlp; warmstart::Bool, madnlp_kwargs, retry_on_failure::Bool)
+    result = _solve!(state, nlp; warmstart = warmstart, madnlp_kwargs = madnlp_kwargs)  # primary attempt
+    retried = false                                                                      # track whether retry was needed
+    if retry_on_failure && (!solve_succeeded(result) || !isfinite(result.objective))
+        retry_state = _make_solver(nlp, madnlp_kwargs)                                   # fresh solver, clean factorization
+        result = _solve!(retry_state, nlp; warmstart = false, madnlp_kwargs = madnlp_kwargs)  # cold-start retry
+        retried = true
+        if solve_succeeded(result)
+            state.last_good_x       = copy(retry_state.solver.x.x)
+            state.last_good_y       = copy(retry_state.solver.y)
+            state.last_good_zl_vals = copy(retry_state.solver.zl.values)
+            state.last_good_zu_vals = copy(retry_state.solver.zu.values)
+        end
+    end
+    return result, retried
 end
 
 # ── simulate_tsddr ────────────────────────────────────────────────────────────
@@ -118,10 +496,50 @@ end
 """
     simulate_tsddr(model, initial_state, det_equivalent,
                    p_x0, p_target, p_uncertainty,
-                   uncertainty_sampler; madnlp_kwargs, warmstart)
-        -> (objective, lambda) or nothing
+                   uncertainty_sampler;
+                   madnlp_kwargs, warmstart)
+        -> NamedTuple{(:objective, :lambda)} or nothing
 
-Single forward pass without a gradient update.
+Perform a single forward pass of the TS-DDR pipeline without a gradient
+update: roll out the policy to produce target states, solve the
+deterministic-equivalent NLP, and extract the envelope-theorem multipliers.
+
+The forward pass computes
+
+```math
+\\hat{x}_t = \\pi_\\theta(w_t, \\hat{x}_{t-1}), \\quad t = 1, \\ldots, T,
+```
+
+then solves ``\\min_z Q(z; \\hat{x}, w, x_0)`` and returns the objective value
+and the multipliers ``\\lambda = \\nabla_{\\hat{x}} Q`` from the target
+equality constraints.
+
+# Arguments
+- `model`: Flux policy network (LSTM or MLP).
+- `initial_state::AbstractVector`: initial state vector ``x_0``.
+- `det_equivalent`: ExaModels NLP with `.core`, `.model`, `.horizon`,
+  `.target_con_range`.
+- `p_x0`: ExaModels parameter handle for the initial state.
+- `p_target`: ExaModels parameter handle for policy targets.
+- `p_uncertainty`: ExaModels parameter handle for per-stage uncertainty.
+- `uncertainty_sampler`: `() -> w_flat` returning a flat vector of length
+  ``T \\times n_w``.
+
+# Keywords
+- `madnlp_kwargs`: `NamedTuple` forwarded to MadNLP (default `NamedTuple()`).
+- `warmstart::Bool`: warm-start MadNLP (default `true`).
+
+# Returns
+- A `NamedTuple` with fields `objective::Float64` and `lambda::Vector{F}`,
+  or `nothing` if the solve failed or the objective is non-finite.
+
+# Examples
+```julia
+result = simulate_tsddr(model, x0, de, p_x0, p_target, p_unc, sampler)
+if result !== nothing
+    @show result.objective
+end
+```
 """
 function simulate_tsddr(
     model,
@@ -134,60 +552,131 @@ function simulate_tsddr(
     madnlp_kwargs   = NamedTuple(),
     warmstart::Bool = true,
 )
-    T    = det_equivalent.horizon
-    F    = eltype(initial_state)
-    nx   = length(initial_state)
-    core = det_equivalent.core
-    nlp  = det_equivalent.model
+    T    = det_equivalent.horizon            # number of planning stages
+    F    = eltype(initial_state)             # element type (Float32 or Float64)
+    nx   = length(initial_state)             # state dimension
+    core = det_equivalent.core               # ExaModels core (for set_parameter!)
+    nlp  = det_equivalent.model              # ExaModels NLP model (for MadNLP)
 
-    state = _make_solver(nlp, madnlp_kwargs)
+    state = _make_solver(nlp, madnlp_kwargs)  # fresh solver — no warm-start cache
 
-    w_flat = uncertainty_sampler()
-    nw     = length(w_flat) ÷ T
+    # Sample one uncertainty scenario and move to the correct device.
+    w_flat = uncertainty_sampler()            # flat vector of length T * nw_per_stage
+    nw     = length(w_flat) ÷ T              # uncertainty dimension per stage
+    w_dev  = _adapt_array(F.(w_flat), initial_state)  # move to GPU if initial_state is on GPU
 
-    Flux.reset!(model)
-    xhat_stages = Vector{Vector{F}}(undef, T)
-    prev = F.(initial_state)
+    # Roll out the policy to produce target states (outside AD tape).
+    Flux.reset!(model)                       # reset LSTM hidden state
+    xhat_stages = Vector{AbstractVector{F}}(undef, T)  # allocate per-stage target storage
+    prev = initial_state                     # first policy input is x0
     for t in 1:T
-        wt             = F.(w_flat[(t-1)*nw+1 : t*nw])
-        xhat_stages[t] = model(vcat(wt, prev))
-        prev           = xhat_stages[t]
+        wt   = view(w_dev, (t-1)*nw+1 : t*nw)  # slice uncertainty for stage t
+        xhat_stages[t] = model(vcat(wt, prev))  # policy: [w_t; x̂_{t-1}] → x̂_t
+        prev = xhat_stages[t]                    # feed x̂_t to next stage
     end
-    xhat_flat = vcat(xhat_stages...)
+    xhat_flat = vcat(xhat_stages...)         # flatten targets to a single vector
 
+    # Set NLP parameters: initial state, uncertainty, and policy targets.
     ExaModels.set_parameter!(core, p_x0,          initial_state)
     ExaModels.set_parameter!(core, p_uncertainty,  w_flat)
-    ExaModels.set_parameter!(core, p_target,       Float64.(xhat_flat))
+    ExaModels.set_parameter!(core, p_target,       Float64.(xhat_flat))  # NLP uses Float64
+    prepare_solve!(det_equivalent, initial_state, w_flat, xhat_flat)
 
+    # Solve the deterministic equivalent (cold start for one-shot simulation).
     result = _solve!(state, nlp; warmstart = false, madnlp_kwargs = madnlp_kwargs)
 
+    # Reject failed or non-finite solves.
     solve_succeeded(result) || return nothing
     isfinite(result.objective) || return nothing
 
-    λ = result.multipliers[det_equivalent.target_con_range]
-    return (objective = result.objective, lambda = F.(Array(λ)))
+    # Extract envelope-theorem multipliers λ = ∇_{x̂} Q.
+    λ = target_multipliers(det_equivalent, result)
+    return (objective = result.objective, lambda = F.(λ))  # cast λ to match initial_state eltype
 end
 
+"""
+    _rollout_xhat_flat(model, initial_state, w_flat, T::Int, F) -> AbstractVector{F}
+
+Roll out the policy network over `T` stages and return the concatenated
+target trajectory as a single flat vector.
+
+This is the differentiable inner loop used inside `Zygote.gradient` blocks.
+Each stage evaluates
+
+```math
+\\hat{x}_t = \\pi_\\theta([w_t; \\hat{x}_{t-1}]), \\quad t = 1, \\ldots, T,
+```
+
+and the returned vector is ``[\\hat{x}_1; \\hat{x}_2; \\ldots; \\hat{x}_T]``.
+
+# Arguments
+- `model`: Flux policy (LSTM or MLP).
+- `initial_state`: state vector ``x_0`` fed to the first policy call.
+- `w_flat`: flat uncertainty vector of length ``T \\times n_w``.
+- `T::Int`: number of planning stages.
+- `F`: element type (e.g., `Float32`).
+
+# Returns
+- A flat vector of length ``T \\times n_x`` containing all stage targets.
+"""
 function _rollout_xhat_flat(model, initial_state, w_flat, T::Int, F)
-    nw = length(w_flat) ÷ T
-    nx = length(initial_state)
-    Flux.reset!(model)
-    buf = Zygote.Buffer(zeros(F, nx * T))
-    prev = F.(initial_state)
+    nw = length(w_flat) ÷ T                           # uncertainty dimension per stage
+    Flux.reset!(model)                                 # reset LSTM hidden state
+    prev = F.(initial_state)                           # cast initial state to element type F
+    # This runs INSIDE the actor's Zygote closure (critic term), so the flat
+    # trajectory cannot be built with raw setindex! (Zygote mutation error) nor
+    # with a shape-growing vcat loop variable (pullback accum mismatch:
+    # accum(1375, 11) at the first phase-2 gradient). Zygote.Buffer is the
+    # sanctioned mutation-safe accumulator for exactly this unroll pattern.
+    nx = length(prev)                                  # state dimension
+    buf = Zygote.Buffer(prev, nx * T)                  # AD-safe writable buffer
     for t in 1:T
-        wt = F.(w_flat[(t-1)*nw+1 : t*nw])
-        xt = model(vcat(wt, prev))
-        for i in 1:nx
-            buf[(t-1)*nx + i] = xt[i]
-        end
-        prev = xt
+        wt = view(w_flat, (t-1)*nw+1 : t*nw)          # slice uncertainty for stage t
+        xt = model(vcat(wt, prev))                     # policy forward pass
+        buf[(t-1)*nx+1 : t*nx] = xt                    # write stage into buffer
+        prev = xt                                      # feed target to next stage
     end
-    return copy(buf)
+    return copy(buf)                                   # differentiable flat trajectory
 end
 
-_has_critic(::NoCriticControlVariate) = false
-_has_critic(::AbstractCriticControlVariate) = true
+"""
+    _has_critic(control_variate::AbstractCriticControlVariate) -> Bool
 
+Return `true` if the control variate wraps an actual critic network, `false`
+for the no-op [`NoCriticControlVariate`](@ref).
+
+# Arguments
+- `control_variate`: an [`AbstractCriticControlVariate`](@ref) instance.
+
+# Returns
+- `false` for `NoCriticControlVariate` (recovers the original dual-only update).
+- `true` for any concrete critic (e.g., [`ScalarCriticControlVariate`](@ref)).
+"""
+_has_critic(::NoCriticControlVariate) = false            # no-op sentinel → no critic
+_has_critic(::AbstractCriticControlVariate) = true       # any concrete critic → active
+
+"""
+    _validate_critic_training_args(; kwargs...) -> Bool
+
+Validate critic/control-variate keyword arguments passed to [`train_tsddr`](@ref).
+
+# Keywords
+- `actor_gradient_mode`: must be `:control_variate` or `:surrogate`.
+- `critic_cv_weight`: nonnegative control-variate weight.
+- `dual_actor_weight`: nonnegative dual-gradient actor weight.
+- `critic_actor_weight`: nonnegative critic actor weight.
+- `critic_updates_per_batch`: nonnegative number of critic updates.
+- `critic_buffer_size`: nonnegative replay-buffer capacity.
+- `critic_rollout_samples_per_batch`: nonnegative integer or `nothing`.
+- `num_cheap_critic_samples_per_batch`: nonnegative number of extra policy
+  rollouts.
+
+# Returns
+- `true` when all arguments are valid.
+
+# Throws
+- `ErrorException` if any argument is outside its admissible set.
+"""
 function _validate_critic_training_args(;
     actor_gradient_mode,
     critic_cv_weight,
@@ -214,6 +703,25 @@ function _validate_critic_training_args(;
     return true
 end
 
+"""
+    _resolve_critic_training_target(target, has_critic::Bool)
+
+Resolve a user-facing critic target configuration to a concrete
+`AbstractCriticTrainingTarget`.
+
+# Arguments
+- `target`: critic target object or symbolic alias.
+- `has_critic::Bool`: whether critic training is active.
+
+# Returns
+- `DeterministicEquivalentCriticTarget()` when no critic is active or the user
+  selected deterministic-equivalent critic targets.
+- `target` unchanged when it is already an `AbstractCriticTrainingTarget`.
+
+# Throws
+- `ErrorException` when rollout critic training is requested without a
+  concrete [`RolloutCriticTarget`](@ref) configuration.
+"""
 function _resolve_critic_training_target(target, has_critic::Bool)
     has_critic || return DeterministicEquivalentCriticTarget()
     target isa AbstractCriticTrainingTarget && return target
@@ -226,6 +734,30 @@ function _resolve_critic_training_target(target, has_critic::Bool)
     end
 end
 
+"""
+    _critic_sample_from_rollout(model, initial_state, target, w_flat, lambda, F, solver_state)
+
+Build one [`CriticSample`](@ref) by rerunning a solved scenario through
+stage-wise rollout.
+
+# Arguments
+- `model`: Flux policy being trained.
+- `initial_state`: initial state vector.
+- `target::RolloutCriticTarget`: rollout critic-target configuration.
+- `w_flat`: uncertainty trajectory from a deterministic-equivalent sample.
+- `lambda`: target multipliers from the deterministic-equivalent solve.
+- `F`: element type used for critic sample arrays.
+- `solver_state`: optional reusable rollout solver state.
+
+# Returns
+- `CriticSample` when rollout succeeds.
+- `nothing` when rollout fails.
+
+# Notes
+The rollout objective supplies the critic value target. The deterministic
+equivalent multipliers are sliced to the rollout target length and used as the
+critic gradient target.
+"""
 function _critic_sample_from_rollout(
     model,
     initial_state,
@@ -237,11 +769,15 @@ function _critic_sample_from_rollout(
 )
     # Keep both rollout objective variants available; target.objective_value
     # below selects which one is used as the critic value target.
+    rollout_len = target.horizon * target.n_uncertainty
+    length(w_flat) >= rollout_len ||
+        error("rollout critic uncertainty has length $(length(w_flat)); expected at least $rollout_len")
+    w_rollout = view(w_flat, 1:rollout_len)
     result = rollout_tsddr(
         model,
         initial_state,
         target.stage_problem,
-        w_flat;
+        w_rollout;
         horizon = target.horizon,
         n_uncertainty = target.n_uncertainty,
         set_stage_parameters! = target.set_stage_parameters!,
@@ -252,15 +788,42 @@ function _critic_sample_from_rollout(
         policy_state = target.policy_state,
         solver_state = solver_state,
         reuse_solver = target.reuse_solver,
+        state_bounds = target.state_bounds,
+        project_state = target.project_state,
+        retry_on_failure = target.retry_on_failure,
     )
     result === nothing && return nothing
 
     objective = target.objective_value === :objective ?
         result.objective : result.objective_no_target_penalty
     xhat_flat = F.(vcat(result.target_trajectory...))
-    return CriticSample(F.(initial_state), F.(w_flat), xhat_flat, objective, F.(lambda))
+    λ_rollout = view(lambda, 1:length(xhat_flat))
+    return CriticSample(F.(initial_state), F.(w_rollout), xhat_flat, objective, F.(λ_rollout))
 end
 
+"""
+    _rollout_critic_samples(model, initial_state, target, de_samples, F, max_samples, solver_state)
+        -> Vector{CriticSample}
+
+Convert deterministic-equivalent training samples into rollout critic samples.
+
+# Arguments
+- `model`: Flux policy being trained.
+- `initial_state`: initial state vector.
+- `target::RolloutCriticTarget`: rollout critic-target configuration.
+- `de_samples`: deterministic-equivalent samples containing uncertainty and
+  target multipliers.
+- `F`: element type used for critic sample arrays.
+- `max_samples`: maximum number of solved scenarios to rerun, or `nothing`.
+- `solver_state`: optional reusable rollout solver state.
+
+# Returns
+- `Vector{CriticSample}` containing only successful rollout conversions.
+
+# Notes
+When `max_samples` is smaller than `length(de_samples)`, samples are selected
+without replacement using `randperm`.
+"""
 function _rollout_critic_samples(
     model,
     initial_state,
@@ -298,51 +861,69 @@ end
     train_tsddr(model, initial_state, det_equivalent,
                 p_x0, p_target, p_uncertainty,
                 uncertainty_sampler;
-                num_batches, num_train_per_batch, optimizer,
-                adjust_hyperparameters, record_loss,
-                madnlp_kwargs, warmstart,
-                problem_pool) -> model
+                num_batches=100,
+                num_train_per_batch=1,
+                optimizer,
+                adjust_hyperparameters,
+                record_loss,
+                madnlp_kwargs=NamedTuple(),
+                warmstart=true,
+                problem_pool=nothing,
+                kwargs...) -> model
 
-TS-DDR policy gradient training. Mirrors `train_multistage` from DecisionRules.jl.
+Train a TS-DDR policy with open-loop deterministic-equivalent solves.
 
-Arguments:
-- `model`              : Flux policy (LSTM or MLP)
-- `initial_state`      : initial state vector
-- `det_equivalent`     : any ExaModels NLP with fields `.core`, `.model`,
-                         `.horizon`, `.target_con_range`
-- `p_x0`               : ExaModels parameter for the initial state
-- `p_target`           : ExaModels parameter for policy targets
-- `p_uncertainty`      : ExaModels parameter for per-stage uncertainty
-- `uncertainty_sampler`: `() -> w_flat` — flat vector of length `T * nw_per_stage`.
-                         For multi-unit problems (e.g., hydro reservoirs) the sampler
-                         should draw one joint scenario index per stage to preserve
-                         spatial correlation; see `sample_scenario` in examples.
+The policy rolls out a target trajectory, the ExaModels problem projects that
+trajectory onto the feasible set, and target multipliers provide the actor
+gradient by the envelope theorem.
 
-Keyword arguments (mirror `train_multistage`):
-- `num_batches`             : total gradient steps (default 100)
-- `num_train_per_batch`     : scenarios averaged per step (default 1)
-- `optimizer`               : Flux.Optimisers optimizer
-- `adjust_hyperparameters`  : `(iter, opt_state, n) -> n`
-- `record_loss`             : `(iter, model, loss, tag) -> Bool`; return `true` to stop
-- `madnlp_kwargs`           : NamedTuple forwarded to MadNLP
-- `warmstart`               : warm-start MadNLP between solves (default `true`)
-- `problem_pool`            : vector of `(de, p_x0, p_target, p_uncertainty)` tuples
-                              for parallel GPU solves; each entry gets its own MadNLP solver
-                              and samples are distributed round-robin across the pool
-- `control_variate`         : optional `ScalarCriticControlVariate`; default
-                              `NoCriticControlVariate()` recovers the original update
-- `critic_training_target`  : `RolloutCriticTarget(...)` for rollout-objective
-                              critic fitting, or `DeterministicEquivalentCriticTarget()`
-                              / `:deterministic_equivalent` for DE ablations
-- `critic_rollout_samples_per_batch`: number of solved batch scenarios to rerun
-                              through stage-wise rollout for critic targets;
-                              `nothing` uses all successful solved scenarios
-- `actor_gradient_mode`     : `:control_variate` or `:surrogate`
-- `num_cheap_critic_samples_per_batch`: extra policy rollouts used only for
-                              critic actor terms; these do not trigger NLP solves
-- `external_critic_samples`  : mutable vector; `record_loss` can push
-                              `CriticSample`s (e.g. from `critic_samples_from_evaluation`)
-                              to feed the critic replay buffer without extra solves
+# Arguments
+- `model`: Flux policy.
+- `initial_state::AbstractVector`: initial state vector.
+- `det_equivalent`: ExaModels deterministic-equivalent problem.
+- `p_x0`: ExaModels parameter for the initial state.
+- `p_target`: ExaModels parameter for policy targets.
+- `p_uncertainty`: ExaModels parameter for uncertainty.
+- `uncertainty_sampler`: callable returning a flat uncertainty trajectory.
+
+# Keywords
+- `num_batches::Int`: number of gradient steps.
+- `num_train_per_batch::Int`: number of scenarios averaged per step.
+- `optimizer`: Flux optimizer or optimizer chain.
+- `adjust_hyperparameters`: callback `(iter, opt_state, n) -> n`.
+- `record_loss`: callback `(iter, model, loss, tag) -> Bool`; return `true`
+  to stop training.
+- `madnlp_kwargs`: keyword arguments forwarded to MadNLP.
+- `warmstart::Bool`: warm-start MadNLP between solves.
+- `retry_on_failure::Bool`: retry failed solves with a fresh solver state.
+- `problem_pool`: optional vector of `(de, p_x0, p_target, p_uncertainty)`
+  tuples for independent solves.
+- `control_variate`: optional critic control variate.
+- `actor_gradient_mode::Symbol`: `:control_variate` or `:surrogate`.
+- `critic_cv_weight`, `dual_actor_weight`, `critic_actor_weight`: actor loss
+  weights.
+- `critic_updates_per_batch::Int`: critic optimizer steps per batch.
+- `critic_buffer_size::Int`: replay-buffer capacity.
+- `critic_batch_size`: critic minibatch size, or `nothing` for all samples.
+- `critic_training_target`: rollout or deterministic-equivalent critic target.
+- `critic_rollout_samples_per_batch`: number of solved samples rerun through
+  rollout for critic targets; `nothing` uses all successful solved samples.
+- `num_cheap_critic_samples_per_batch::Int`: extra policy rollouts used only
+  for critic actor terms.
+- `critic_optimizer`: Flux optimizer for the critic.
+- `external_critic_samples`: optional mutable vector of externally produced
+  `CriticSample`s.
+- `batch_diagnostics`: callback `(iter, stats) -> nothing`.
+- `reuse_solver::Bool`: force solver reuse when fixed variables have constant
+  bounds across solves.
+
+# Returns
+- `model`, updated in place.
+
+# Notes
+For multi-unit stochastic processes, `uncertainty_sampler` should preserve
+within-stage spatial correlation, for example by drawing one joint scenario
+index per stage.
 """
 function train_tsddr(
     model,
@@ -365,6 +946,7 @@ function train_tsddr(
                                end,
     madnlp_kwargs            = NamedTuple(),
     warmstart::Bool          = true,
+    retry_on_failure::Bool   = true,
     problem_pool             = nothing,
     control_variate::AbstractCriticControlVariate = NoCriticControlVariate(),
     actor_gradient_mode::Symbol = :control_variate,
@@ -379,6 +961,10 @@ function train_tsddr(
     num_cheap_critic_samples_per_batch::Int = 0,
     critic_optimizer         = Flux.Adam(1f-3),
     external_critic_samples  = nothing,
+    batch_diagnostics        = (iter, stats) -> nothing,
+    reuse_solver::Bool       = false,
+    worker_devices           = nothing,
+    worker_problem_builder   = nothing,
 )
     T    = det_equivalent.horizon
     F    = eltype(initial_state)
@@ -401,15 +987,38 @@ function train_tsddr(
     )
 
     # ── Build worker pool ────────────────────────────────────────────────────
-    if problem_pool === nothing
-        _pool = [(det_equivalent, p_x0, p_target, p_uncertainty)]
+    # Two modes:
+    #  - `worker_problem_builder === nothing` (default): the caller supplies a
+    #    `problem_pool` of already-built DEs (single-device / CPU).
+    #  - `worker_problem_builder = (wi) -> (de, p_x0, p_target, p_uncertainty)`:
+    #    each worker builds its OWN DE INSIDE its task, after binding its GPU.
+    #    Required for multi-GPU: a DE built in the main task and solved from a
+    #    worker task deadlocks on the first cross-task solve (CUDSS/stream/event
+    #    ownership); building in-task keeps DE, solver, stream and events in one
+    #    task/device context. nworkers then comes from `worker_devices`.
+    _build_in_worker = worker_problem_builder !== nothing
+    if _build_in_worker
+        worker_devices !== nothing ||
+            throw(ArgumentError("worker_problem_builder requires worker_devices"))
+        _pool = nothing
+        nworkers = length(worker_devices)
     else
-        _pool = problem_pool
+        _pool = problem_pool === nothing ?
+            [(det_equivalent, p_x0, p_target, p_uncertainty)] : problem_pool
+        nworkers = length(_pool)
+        if worker_devices !== nothing
+            length(worker_devices) == nworkers ||
+                throw(ArgumentError("worker_devices has length $(length(worker_devices)) but there are $nworkers workers"))
+        end
     end
-    nworkers = length(_pool)
+    _worker_device(wi) = worker_devices === nothing ? nothing : worker_devices[wi]
 
     # Single-worker: create solver on main task (no threading needed)
-    single_state = nworkers == 1 ? _make_solver(_pool[1][1].model, madnlp_kwargs) : nothing
+    single_state = (nworkers == 1 && !_build_in_worker) ?
+        _make_solver(_pool[1][1].model, madnlp_kwargs) : nothing
+    if reuse_solver && single_state !== nothing
+        single_state.has_fixed_vars = false
+    end
 
     # Multi-worker: persistent worker threads via channels.
     # Each worker creates its own MadNLP solver on its own thread so that
@@ -419,28 +1028,91 @@ function train_tsddr(
     worker_tasks = Task[]
     if nworkers > 1
         for wi in 1:nworkers
-            (de, px, pt, pu) = _pool[wi]
+            _pooled = _build_in_worker ? nothing : _pool[wi]
+            _builder = worker_problem_builder
             in_ch  = in_channels[wi]
             out_ch = out_channels[wi]
-            t = Threads.@spawn begin
+            _reuse_solver = reuse_solver
+            _dev = _worker_device(wi)
+            _wi = wi
+            t = Threads.@spawn try
+                # Bind this worker to its GPU (multi-GPU). Must precede DE/solver
+                # creation so CUDA handles + all CuArray ops on this task target
+                # `_dev`. Diagnostics go to stderr (flushed) so a hang is
+                # localizable in the SLURM log even under the WandbLogger.
+                # The whole body runs under try/catch: a Threads.@spawn task that
+                # throws dies SILENTLY (exceptions surface only on wait/fetch), so
+                # without this the main task blocks forever on take!(out_ch) — the
+                # exact multi-GPU "hang" signature. On error we report loudly and
+                # close out_ch so the main loop fails fast instead of deadlocking.
+                println(stderr, "[worker $_wi] task started (dev=$_dev, thread=$(Threads.threadid()))"); flush(stderr)
+                if _dev !== nothing
+                    CUDA.device!(_dev)
+                    println(stderr, "[worker $_wi] bound to CUDA device $_dev (current=$(CUDA.device()))"); flush(stderr)
+                end
+                # Build the DE IN-TASK for multi-GPU (see _build_in_worker note):
+                # a main-task-built DE deadlocks on the first cross-task solve.
+                (de, px, pt, pu) = _builder === nothing ? _pooled : _builder(_wi)
+                _builder === nothing ||
+                    (println(stderr, "[worker $_wi] DE built in-task on device $_dev"); flush(stderr))
                 st = _make_solver(de.model, madnlp_kwargs)
+                _dev === nothing || (println(stderr, "[worker $_wi] solver ready on device $_dev"); flush(stderr))
+                if _reuse_solver
+                    st.has_fixed_vars = false
+                end
                 while true
                     msg = take!(in_ch)
                     msg === nothing && break
                     (s_idx, init_state, w_flat, xhat_flat) = msg
+                    # Multi-GPU: the main task marshals msg arrays through CPU;
+                    # upload them to THIS worker's device for the solve, but keep
+                    # the CPU w for the reply below — anything sent back must be
+                    # device-neutral (CPU), because the main task consumes it in
+                    # the device-0 gradient (a device-N CuArray there is the
+                    # CUDA-700 illegal access localized by job 10910905).
+                    w_reply = w_flat
+                    if _dev !== nothing
+                        init_state = CUDA.cu(init_state)
+                        w_flat = CUDA.cu(w_flat)
+                        xhat_flat = CUDA.cu(xhat_flat)
+                    end
                     ExaModels.set_parameter!(de.core, px, init_state)
                     ExaModels.set_parameter!(de.core, pu, w_flat)
                     ExaModels.set_parameter!(de.core, pt, Float64.(xhat_flat))
-                    result = _solve!(st, de.model; warmstart=warmstart, madnlp_kwargs=madnlp_kwargs)
-                    if solve_succeeded(result) && isfinite(result.objective)
-                        λ = result.multipliers[de.target_con_range]
+                    prepare_solve!(de, init_state, w_flat, xhat_flat)
+                    result, retried = _solve_with_retry!(
+                        st,
+                        de.model;
+                        warmstart = warmstart,
+                        madnlp_kwargs = madnlp_kwargs,
+                        retry_on_failure = retry_on_failure,
+                    )
+                    failure = nothing
+                    if !solve_succeeded(result)
+                        failure = "status_" * _status_key(result.status)
+                    elseif !isfinite(result.objective)
+                        failure = "nonfinite_objective"
+                    else
+                        # Solve succeeded with a finite objective (both negations
+                        # were tested above); only the multipliers remain to check.
+                        λ = target_multipliers(de, result)
                         if all(isfinite, λ)
-                            put!(out_ch, (s_idx, F.(w_flat), F.(Array(λ)), result.objective))
+                            # Reply with the CPU w (same types the single-GPU
+                            # worker path produces); λ adapts to it → CPU too.
+                            put!(out_ch, (s_idx, F.(w_reply), _adapt_array(F.(λ), w_reply),
+                                          result.objective, result.status, nothing, retried))
                             continue
                         end
+                        failure = "nonfinite_lambda"
                     end
-                    put!(out_ch, (s_idx, nothing, nothing, NaN))
+                    put!(out_ch, (s_idx, nothing, nothing, NaN, result.status, failure, retried))
                 end
+            catch err
+                # Loud failure + closed channel: the main task's take!(out_ch)
+                # throws immediately instead of blocking forever on a dead worker.
+                println(stderr, "[worker $_wi] FATAL: "); showerror(stderr, err, catch_backtrace()); println(stderr); flush(stderr)
+                close(out_ch)
+                rethrow()
             end
             push!(worker_tasks, t)
         end
@@ -461,24 +1133,36 @@ function train_tsddr(
 
         # ── Forward pass: rollout + solve (outside AD tape) ───────────────────
 
-        # Step 1: Roll out policy for all samples (CPU, sequential)
-        sample_data = Vector{Tuple{Vector{F}, Vector{F}}}(undef, num_train_per_batch)
+        # Step 1: Roll out policy for all samples
+        # Precision note: uncertainties are cast to F (typically Float32, the
+        # policy precision) here, and this F-cast array is later written into
+        # the Float64 NLP via set_parameter!. The round-trip through Float32 is
+        # intentional: the NLP must be solved for exactly the targets the policy
+        # produced from these Float32 inputs, so the resulting λ multipliers
+        # pair with the same Float32 rollout in the gradient step below
+        # (train/gradient consistency). Do not "fix" this by keeping w in
+        # Float64 for the NLP only.
+        sample_data = Vector{Tuple{AbstractVector{F}, AbstractVector{F}}}(undef, num_train_per_batch)
         for s in 1:num_train_per_batch
             w_flat = uncertainty_sampler()
             nw     = length(w_flat) ÷ T
+            w_dev  = _adapt_array(F.(w_flat), initial_state)
             Flux.reset!(model)
-            xhat_stages = Vector{Vector{F}}(undef, T)
-            prev = F.(initial_state)
+            xhat_stages = Vector{AbstractVector{F}}(undef, T)
+            prev = initial_state
             for t in 1:T
-                wt             = F.(w_flat[(t-1)*nw+1 : t*nw])
+                wt   = view(w_dev, (t-1)*nw+1 : t*nw)
                 xhat_stages[t] = model(vcat(wt, prev))
-                prev           = xhat_stages[t]
+                prev = xhat_stages[t]
             end
-            sample_data[s] = (F.(w_flat), vcat(xhat_stages...))
+            sample_data[s] = (w_dev, vcat(xhat_stages...))
         end
 
         # Step 2: Solve — parallel across workers if pool provided
-        solve_ok  = Vector{Union{Nothing, Tuple{Vector{F}, Vector{F}, Float64}}}(nothing, num_train_per_batch)
+        solve_ok  = Vector{Union{Nothing, Tuple{AbstractVector{F}, AbstractVector{F}, Float64}}}(nothing, num_train_per_batch)
+        status_counts = Dict{String, Int}()
+        failure_counts = Dict{String, Int}()
+        retry_counts = Dict{String, Int}()
 
         if nworkers == 1
             (de, px, pt, pu) = _pool[1]
@@ -488,12 +1172,30 @@ function train_tsddr(
                 ExaModels.set_parameter!(de.core, px, initial_state)
                 ExaModels.set_parameter!(de.core, pu, w_flat)
                 ExaModels.set_parameter!(de.core, pt, Float64.(xhat_flat))
-                result = _solve!(st, de.model; warmstart=warmstart, madnlp_kwargs=madnlp_kwargs)
-                solve_succeeded(result) || continue
-                isfinite(result.objective) || continue
-                λ = result.multipliers[de.target_con_range]
-                all(isfinite, λ) || continue
-                solve_ok[s] = (F.(w_flat), F.(Array(λ)), result.objective)
+                prepare_solve!(de, initial_state, w_flat, xhat_flat)
+                result, retried = _solve_with_retry!(
+                    st,
+                    de.model;
+                    warmstart = warmstart,
+                    madnlp_kwargs = madnlp_kwargs,
+                    retry_on_failure = retry_on_failure,
+                )
+                retried && _inc_count!(retry_counts, solve_succeeded(result) && isfinite(result.objective) ? "retry_success" : "retry_failure")
+                _inc_status!(status_counts, result.status)
+                if !solve_succeeded(result)
+                    _inc_count!(failure_counts, "status_" * _status_key(result.status))
+                    continue
+                end
+                if !isfinite(result.objective)
+                    _inc_count!(failure_counts, "nonfinite_objective")
+                    continue
+                end
+                λ = target_multipliers(de, result)
+                if !all(isfinite, λ)
+                    _inc_count!(failure_counts, "nonfinite_lambda")
+                    continue
+                end
+                solve_ok[s] = (F.(w_flat), _adapt_array(F.(λ), initial_state), result.objective)
             end
         else
             for round_start in 1:nworkers:num_train_per_batch
@@ -502,19 +1204,47 @@ function train_tsddr(
                 for s in round_start:round_end
                     wi = s - round_start + 1
                     w_flat, xhat_flat = sample_data[s]
-                    put!(in_channels[wi], (s, initial_state, w_flat, xhat_flat))
+                    if worker_devices === nothing
+                        put!(in_channels[wi], (s, initial_state, w_flat, xhat_flat))
+                    else
+                        # Multi-GPU workers run with different current devices.
+                        # Never send a CuArray allocated on device 0 to a worker
+                        # bound to device 1/2; materialize through CPU and let
+                        # the worker copy onto its own device.
+                        put!(in_channels[wi], (s, Array(initial_state), Array(w_flat), Array(xhat_flat)))
+                    end
                 end
                 for wi in 1:round_size
-                    (s_idx, w_out, λ_out, obj_out) = take!(out_channels[wi])
+                    msg = take!(out_channels[wi])
+                    if length(msg) == 7
+                        (s_idx, w_out, λ_out, obj_out, status_out, failure_out, retried_out) = msg
+                        _inc_status!(status_counts, status_out)
+                        failure_out !== nothing && _inc_count!(failure_counts, failure_out)
+                        retried_out && _inc_count!(retry_counts, w_out === nothing ? "retry_failure" : "retry_success")
+                    elseif length(msg) == 6
+                        (s_idx, w_out, λ_out, obj_out, status_out, failure_out) = msg
+                        _inc_status!(status_counts, status_out)
+                        failure_out !== nothing && _inc_count!(failure_counts, failure_out)
+                    else
+                        (s_idx, w_out, λ_out, obj_out) = msg
+                    end
                     if w_out !== nothing
-                        solve_ok[s_idx] = (w_out, λ_out, obj_out)
+                        # Workers reply device-neutral (CPU) arrays; the actor
+                        # gradient below mixes them with `initial_state`-device
+                        # arrays (vcat/broadcast), so land them on that device
+                        # here — the exact analogue of the single-worker path's
+                        # `_adapt_array(F.(λ), initial_state)`. No-op when the
+                        # types already match (single-GPU pool replies GPU w).
+                        solve_ok[s_idx] = (_adapt_array(w_out, initial_state),
+                                           _adapt_array(λ_out, initial_state),
+                                           obj_out)
                     end
                 end
             end
         end
 
         # Step 3: Collect valid results
-        valid   = Vector{Tuple{Vector{F}, Vector{F}}}()
+        valid   = Tuple{AbstractVector{F}, AbstractVector{F}}[]
         de_samples = CriticSample[]
         obj_sum = 0.0
         for (s, r) in enumerate(solve_ok)
@@ -528,6 +1258,13 @@ function train_tsddr(
         end
         n_ok     = length(valid)
         mean_obj = n_ok > 0 ? obj_sum / n_ok : NaN
+        batch_diagnostics(iter, Dict{String, Any}(
+            "n_ok" => n_ok,
+            "n_total" => num_train_per_batch,
+            "status_counts" => copy(status_counts),
+            "failure_counts" => copy(failure_counts),
+            "retry_counts" => copy(retry_counts),
+        ))
 
         if has_critic && n_ok > 0 && critic_updates_per_batch > 0
             valid_samples = if resolved_critic_training_target isa RolloutCriticTarget
@@ -574,18 +1311,18 @@ function train_tsddr(
                     for (w_flat_s, λf) in valid
                         nw = length(w_flat_s) ÷ T
                         Flux.reset!(m)
-                        prev_ad = F.(initial_state)
+                        prev_ad = initial_state
                         for t in 1:T
-                            wt      = F.(w_flat_s[(t-1)*nw+1 : t*nw])
+                            wt      = view(w_flat_s, (t-1)*nw+1 : t*nw)
                             xt      = m(vcat(wt, prev_ad))
-                            total   = total + sum(λf[(t-1)*nx+1 : t*nx] .* xt)
+                            total   = total + sum(view(λf, (t-1)*nx+1 : t*nx) .* xt)
                             prev_ad = xt
                         end
                     end
                     total / F(n_ok)
                 end
             else
-                solved_weights = Vector{Tuple{Vector{F}, Vector{F}}}()
+                solved_weights = Tuple{AbstractVector{F}, AbstractVector{F}}[]
                 for sample in de_samples
                     λf = F.(sample.target_multipliers)
                     if actor_gradient_mode === :control_variate
@@ -618,12 +1355,12 @@ function train_tsddr(
                     for (w_flat_s, actor_weight) in solved_weights
                         nw = length(w_flat_s) ÷ T
                         Flux.reset!(m)
-                        prev_ad = F.(initial_state)
+                        prev_ad = initial_state
                         for t in 1:T
-                            wt      = F.(w_flat_s[(t-1)*nw+1 : t*nw])
+                            wt      = view(w_flat_s, (t-1)*nw+1 : t*nw)
                             xt      = m(vcat(wt, prev_ad))
                             residual_total =
-                                residual_total + sum(actor_weight[(t-1)*nx+1 : t*nx] .* xt)
+                                residual_total + sum(view(actor_weight, (t-1)*nx+1 : t*nx) .* xt)
                             prev_ad = xt
                         end
                     end
@@ -637,7 +1374,7 @@ function train_tsddr(
                             xhat_ad = _rollout_xhat_flat(m, initial_state, w_flat_s, T, F)
                             critic_total = critic_total + critic_value(
                                 control_variate,
-                                F.(initial_state),
+                                initial_state,
                                 w_flat_s,
                                 xhat_ad,
                             )
@@ -659,13 +1396,192 @@ function train_tsddr(
     end
 
     finally
-        # Shut down worker threads
-        for ch in in_channels
-            put!(ch, nothing)
+        # Shut down worker threads. A worker that already died never drains its
+        # input channel, so an unconditional put! on a full Channel{Any}(1)
+        # would block forever; only signal workers that are still running, and
+        # guard the put! itself against the check-then-put race.
+        for (i, ch) in enumerate(in_channels)
+            if !istaskdone(worker_tasks[i])            # skip dead workers (nobody consumes)
+                try
+                    put!(ch, nothing)                  # normal shutdown sentinel
+                catch err
+                    # Worker died between the istaskdone check and the put!
+                    # (or the channel was closed) — nothing left to signal.
+                    @warn "train_tsddr worker $i shutdown signal failed" exception=(err, catch_backtrace())
+                end
+            end
         end
-        for t in worker_tasks
-            wait(t)
+        for (i, t) in enumerate(worker_tasks)
+            try
+                wait(t)                                # join worker task
+            catch err
+                # A failed worker rethrows on wait; log instead of masking the
+                # original in-flight exception during cleanup.
+                @warn "train_tsddr worker $i failed" exception=(err, catch_backtrace())
+            end
         end
+    end
+
+    return model
+end
+
+# ── train_tsddr_embedded ─────────────────────────────────────────────────────
+
+"""
+    train_tsddr_embedded(model, initial_state, embedded_de,
+                         uncertainty_sampler; kwargs...) -> model
+
+Train a TS-DDR policy embedded directly in the NLP.
+
+Unlike [`train_tsddr`](@ref), this function does not roll out targets
+externally. The NLP oracle evaluates `model` inline, the solve returns
+closed-loop multipliers and realized states, and the actor gradient is computed
+from those realized states.
+
+# Arguments
+- `model`: Flux policy captured by the embedded oracle closures.
+- `initial_state::AbstractVector`: initial state vector.
+- `embedded_de`: embedded deterministic-equivalent problem.
+- `uncertainty_sampler`: callable returning a flat uncertainty trajectory.
+
+# Keywords
+- `num_batches::Int`: number of gradient steps.
+- `num_train_per_batch::Int`: number of scenarios averaged per step.
+- `optimizer`: Flux optimizer or optimizer chain.
+- `adjust_hyperparameters`: callback `(iter, opt_state, n) -> n`.
+- `record_loss`: callback `(iter, model, loss, tag) -> Bool`; return `true`
+  to stop training.
+- `madnlp_kwargs`: keyword arguments forwarded to MadNLP.
+- `warmstart::Bool`: warm-start MadNLP between solves.
+- `retry_on_failure::Bool`: retry failed solves with a fresh solver state.
+- `get_realized_states`: optional callback `(prob, result) -> x_flat`.
+- `batch_diagnostics`: callback `(iter, stats) -> nothing`.
+
+# Returns
+- `model`, updated in place.
+
+# Notes
+The gradient uses
+`sum_t dot(lambda_t, pi_theta(w_t, x^*_{t-1}))`, where `x^*` is the realized
+state trajectory from the coupled NLP solution.
+"""
+function train_tsddr_embedded(
+    model,
+    initial_state::AbstractVector,
+    embedded_de,
+    uncertainty_sampler;
+    num_batches::Int         = 100,
+    num_train_per_batch::Int = 1,
+    optimizer                = Flux.Optimisers.OptimiserChain(
+                                   Flux.Optimisers.ClipGrad(1.0f0),
+                                   Flux.Adam(1f-3),
+                               ),
+    adjust_hyperparameters   = (iter, opt_state, n) -> n,
+    record_loss              = (iter, model, loss, tag) -> begin
+                                   println("$tag  iter=$iter  loss=$(round(loss; digits=4))")
+                                   return false
+                               end,
+    madnlp_kwargs            = NamedTuple(),
+    warmstart::Bool          = true,
+    retry_on_failure::Bool   = true,
+    get_realized_states      = nothing,
+    batch_diagnostics        = (iter, stats) -> nothing,
+)
+    T  = embedded_de.horizon
+    F  = eltype(initial_state)
+    nx = embedded_de.nx
+
+    _get_states = get_realized_states === nothing ?
+        (prob, res) -> res.solution[1 : prob.horizon * prob.nx] :
+        get_realized_states
+
+    state = _make_solver(embedded_de.model, madnlp_kwargs)
+    opt_state = Flux.setup(optimizer, model)
+
+    for iter in 1:num_batches
+        num_train_per_batch = adjust_hyperparameters(iter, opt_state, num_train_per_batch)
+
+        valid   = Tuple{AbstractVector{F}, AbstractVector{F}, AbstractVector{F}}[]
+        obj_sum = 0.0
+        status_counts = Dict{String, Int}()
+        failure_counts = Dict{String, Int}()
+        retry_counts = Dict{String, Int}()
+
+        for s in 1:num_train_per_batch
+            w_flat = uncertainty_sampler()
+
+            set_x0!(embedded_de, initial_state)
+            set_uncertainty!(embedded_de, w_flat)
+
+            result, retried = _solve_with_retry!(
+                state,
+                embedded_de.model;
+                warmstart = warmstart,
+                madnlp_kwargs = madnlp_kwargs,
+                retry_on_failure = retry_on_failure,
+            )
+            retried && _inc_count!(retry_counts, solve_succeeded(result) && isfinite(result.objective) ? "retry_success" : "retry_failure")
+
+            _inc_status!(status_counts, result.status)
+            if !solve_succeeded(result)
+                _inc_count!(failure_counts, "status_" * _status_key(result.status))
+                continue
+            end
+            if !isfinite(result.objective)
+                _inc_count!(failure_counts, "nonfinite_objective")
+                continue
+            end
+
+            λ = target_multipliers(embedded_de, result)
+            if !all(isfinite, λ)
+                _inc_count!(failure_counts, "nonfinite_lambda")
+                continue
+            end
+
+            x_sol = _get_states(embedded_de, result)
+
+            λf    = _adapt_array(F.(λ), initial_state)
+            xf    = _adapt_array(F.(x_sol), initial_state)
+            w_dev = _adapt_array(F.(w_flat), initial_state)
+            push!(valid, (w_dev, λf, xf))
+            obj_sum += result.objective
+        end
+
+        n_ok     = length(valid)
+        mean_obj = n_ok > 0 ? obj_sum / n_ok : NaN
+        batch_diagnostics(iter, Dict{String, Any}(
+            "n_ok" => n_ok,
+            "n_total" => num_train_per_batch,
+            "status_counts" => copy(status_counts),
+            "failure_counts" => copy(failure_counts),
+            "retry_counts" => copy(retry_counts),
+        ))
+
+        if n_ok > 0
+            gs = Zygote.gradient(model) do m
+                total = zero(F)
+                for (w_flat_s, λf, x_realized) in valid
+                    nw = length(w_flat_s) ÷ T
+                    Flux.reset!(m)
+                    for t in 1:T
+                        wt = view(w_flat_s, (t-1)*nw+1 : t*nw)
+                        x_prev = (t == 1) ?
+                            initial_state :
+                            view(x_realized, (t-2)*nx+1 : (t-1)*nx)
+                        xt = m(vcat(wt, x_prev))
+                        total = total + sum(view(λf, (t-1)*nx+1 : t*nx) .* xt)
+                    end
+                end
+                total / F(n_ok)
+            end
+
+            grad = materialize_tangent(gs[1])
+            if grad !== nothing && _all_finite_gradient(grad)
+                Flux.update!(opt_state, model, grad)
+            end
+        end
+
+        record_loss(iter, model, mean_obj, "metrics/training_loss") && break
     end
 
     return model

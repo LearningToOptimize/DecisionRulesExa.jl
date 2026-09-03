@@ -1,0 +1,5 @@
+# Cases are CONSTRUCTED, never committed. Every artifact under case/ is a pure
+# function of the builder in `build_battery_case.jl` plus its recorded seeds, so
+# committing it would ship a second, drifting source of truth for the case.
+# The manifest hashes belong in the phase record, not in git.
+case/
