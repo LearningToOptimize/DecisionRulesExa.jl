@@ -126,15 +126,31 @@ gradient against centered finite differences at `T = 4` and `T = 24`. Each has a
 
 Two settings of this engine are load-bearing and neither is a model choice.
 
-`DEFAULT_SOLVER_OPTIONS` pins `tol = 1e-10` **and** `bound_relax_factor = 0.0`.
-MadNLP's default relaxes every variable bound by `1e-8` before solving, so it
-converges on a slightly larger feasible set than the model declares and reports
-the primal infeasibility of the RELAXED problem. Measured on
-`pglib_opf_case1354_pegase`: MadNLP reported `1.18e-12` while the residual
-recomputed from its own solution by the shared schema was `2.92e-06` — four
-orders above the study's `1e-7` gate. Tightening `tol` does not touch it, because
-the solver already believes it has converged. Zeroing the relaxation takes the
-residual to `2.11e-12` and ran `5.7×` faster.
+`DEFAULT_SOLVER_OPTIONS` pins `tol = 1e-10` **and**
+`bound_relax_factor = ACP_BOUND_RELAX_FACTOR`, which
+`battery_solution_schema.jl` sets to `1e-8` for both engines.
+
+The factor is stated explicitly rather than inherited, and that is the point of
+it. MadNLP relaxes every variable bound by this factor before solving, so it
+converges on a slightly larger feasible set than the model declares and then
+reports the primal infeasibility of the RELAXED problem — a number that can be
+several orders of magnitude smaller than the residual of the model actually
+posed. Left to the default, the CPU and GPU paths of this engine did not even
+resolve the same value, so two runs of the same case could be solving two
+slightly different feasible sets while reporting the same options. Naming one
+value at every true-ACP site removes that, and it is the value the JuMP suite
+and the frozen panel were produced at.
+
+It is not a free parameter to tune per case, and a smaller value is not
+automatically better: this model's `MadNLPGPU`/CUDSS path does not tolerate an
+exactly zero relaxation, returning `RESTORATION_FAILED` within a couple of
+iterations where a strictly positive factor converges normally.
+
+What this setting therefore does NOT give is an accuracy guarantee. The
+guarantee comes from `physical_stage_cost` recomputing the residual from the
+solver's own reported solution and checking it against the study's gate; the
+solver's self-reported infeasibility describes the relaxed problem and cannot
+establish either.
 
 `physical_stage_cost`, from the byte-identical `battery_solution_schema.jl`, is
 the only function that may produce a headline cost. This engine parks the two
@@ -308,7 +324,34 @@ Schema `battery_storage_opf/checkpoint/3`: the trainable state, the
 **architecture**, the optimizer state and the training trajectory. Reachability
 metadata is deliberately not restored from it — that belongs to the frozen case,
 and a checkpoint that could override a battery rating would let a stale file
-silently redefine the problem.
+silently redefine the problem. This is enforced, not merely intended: the file
+stores the encoder and the head **only**, and the loader restores those two
+sub-models rather than the policy as a whole. A full-policy state payload (an
+older file, or one written by hand) can therefore be loaded without its
+metadata reaching the reconstructed constants.
+
+### The physical-arithmetic tag, and migrating an older checkpoint
+
+Every checkpoint records `reachability_arithmetic`. A file that does not carry
+the current value was written by a policy whose physical state arithmetic
+differed, so the same parameters generate different targets — and, at the
+margin, different solve outcomes. `load_checkpoint!` **refuses** such a file by
+default. Loading it anyway is an explicit request:
+
+```julia
+load_checkpoint!(policy, path; case = case, allow_precision_upgrade = true)
+```
+
+and the returned metadata carries `reachability_precision_upgraded = true`.
+`portfolio_runner.jl` exposes the same decision as `--precision-upgrade`.
+
+This is a **changed forward map, not an identical resume**, and the distinction
+has a consequence beyond bookkeeping: the parent's `best_cost` was measured
+under the other arithmetic and is not a score for the policy now being run. The
+runner therefore drops it as an incumbent (`resumed_best_score`) and records it
+as historical, so the resumed run has to earn a selection on a complete
+admissible panel of its own. Comparing an upgraded policy's old recorded cost
+with a freshly measured one is comparing two different experiments.
 
 `load_checkpoint!` refuses three things rather than continuing while reporting
 something untrue: a file without the schema tag (it predates the architecture
@@ -393,18 +436,71 @@ reached.
 
 ## Devices and precision
 
-`DR_BAT_DEVICE=gpu` moves the policy with `Flux.gpu`, builds the ExaModels core
-on a CUDA backend and selects `MadNLPGPU.CUDSSSolver`. Three failure modes are
+`DR_BAT_DEVICE=gpu` moves the policy to the GPU, builds the ExaModels core on a
+CUDA backend and selects `MadNLPGPU.CUDSSSolver`. Three failure modes are
 checked rather than assumed:
 
-- `Flux.gpu` is a silent no-op without cuDNN, so `cuDNN` is imported and
+- a device move can be a silent no-op without cuDNN, so `cuDNN` is imported and
   `assert_device` verifies that every trainable array and the recurrent state
   really are device arrays;
 - `MadNLPGPU.CUDSSSolver` is `nothing` unless CUDSS.jl has been loaded, which is
   checked before it is passed to the solver;
-- the ExaModels model stays in `Float64` on both devices; the policy is
+- the ExaModels model stays in `Float64` on both devices; the *network* is
   `Float32` for training and can be promoted with `Flux.f64` for
   finite-difference work.
+
+### Two precisions, on purpose
+
+The network and the physics do not share an element type, and the boundary
+between them is explicit.
+
+**The network** is whatever it was constructed as — `Float32` by default — and
+stays that way. Nothing here promotes it.
+
+**The physical state is `Float64`, everywhere.** The five reachability
+constants (`energy_min`, `energy_max`, `charge_gain`, `discharge_drop`,
+`alpha`), the initial energy, the reachable interval, the interpolation that
+lands the target inside it, and the rollout buffer that carries the state from
+one stage to the next are all `Float64`, matching the stage NLP. The learned
+head still contributes a `Float32` fraction in `[0, 1−1e-3]`; only the arithmetic
+that turns that fraction into an energy is done in the model's precision.
+
+The reason is that reachability is a *hard equality* in the stage problem, not a
+soft preference. The emitted target must satisfy
+
+```
+r̲_t(e_{t-1}) ≤ ê_t ≤ r̄_t(e_{t-1})
+```
+
+in the arithmetic the solver uses. Computing the interval in `Float32` and
+handing the result to a `Float64` model makes the endpoints disagree at around
+`1e-8` relative — far below any modelling tolerance, and far ABOVE the point
+where an interior-point method has an interior to work in. A target a few times
+`1e-8` outside the true interval does not look infeasible; it produces a stage
+problem whose feasible set is empty by a margin the solver spends its whole
+iteration budget failing to close, and the visible symptom is
+`MAXIMUM_ITERATIONS_EXCEEDED` on scenarios that are physically unremarkable.
+Errors also compound along the horizon, because each stage's interval is
+computed from the previous stage's target.
+
+Three consequences worth knowing when reading or extending this code:
+
+- device transfer moves leaves individually and **preserves each array's element
+  type**. `Flux.gpu` and `CUDA.cu` both narrow `Float64` to `Float32` by
+  default, which would undo the above the moment a policy reached a GPU — so
+  neither is used for this move, and the worker upload path uses `CuArray`
+  directly for the same reason;
+- `_adapt_metadata(x, ref)` is the one way physical vectors reach a device. It
+  borrows `ref`'s device and nothing else. Use it, not the element-type-taking
+  helper, for anything that is state rather than activations;
+- `feasible_target` refuses a policy whose metadata is not `Float64` instead of
+  quietly computing in the narrower type. Reconstruct such a policy from its
+  case.
+
+`test/reachability_precision.jl` covers all of it — metadata element types, the
+CPU and GPU moves, both endpoints over a 24-stage horizon against an
+independently computed interval, checkpoint isolation, the legacy upgrade, and a
+finite-difference check that the state path is still differentiable.
 
 On a cluster whose NVIDIA driver is newer than the runtime CUDA.jl can
 auto-select, `CUDA.functional()` returns false with a "JLLs were precompiled

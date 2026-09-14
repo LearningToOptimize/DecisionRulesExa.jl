@@ -60,12 +60,11 @@ possible, or discharge as hard as possible). The gentle 6.4 % stretch attains
 exactly 0 for ``\\sigma(x) \\le 0.03`` while keeping the interior mapping close
 to the sigmoid's shape.
 
-The upper end stops a hair short of 1 on purpose. An exact upper endpoint forces
-the charge control to sit exactly at its bound with the discharge control
-exactly at zero — a measure-zero face that an interior-point solver cannot
-converge into once the strict equality pins the state there. The lower endpoint
-has no such problem, because the discharge control retains a strict interior
-there, so 0 is attained exactly.
+The upper cap is retained as part of this activation's definition. At a
+power-limited endpoint, either maximal charging or maximal discharging may pin
+controls to their bounds. Endpoint solvability must be assessed with the actual
+model and solver; an activation cap does not establish that one endpoint has
+a strict interior while the other does not.
 """
 function stretchedsigmoid(x::Real)
     T = float(typeof(x))
@@ -159,11 +158,12 @@ Flux.@layer BatteryReachablePolicy trainable=(encoder, combiner)
 """
     _adapt_metadata(x, ref) -> AbstractVector
 
-Return the frozen metadata vector `x` with `ref`'s element type and device.
+Return the frozen metadata vector `x` on `ref`'s device, preserving its precision.
 
 # Notes
-The returned VALUES are `x`, frozen policy metadata; `ref` contributes only an
-element type and a device family. The map is therefore constant in both
+The returned VALUES are `x`, frozen policy metadata; `ref` contributes only a
+device family. Physical constants must not be rounded to the network's parameter
+precision. The map is therefore constant in both
 arguments and the `Zygote.@nograd` declaration below is EXACT rather than an
 approximation. It is needed because the device adaptation goes through
 `similar` + `copyto!` and Zygote refuses to differentiate array mutation —
@@ -172,8 +172,8 @@ all. This is the ONLY thing hidden from the tape in this file.
 """
 function _adapt_metadata(x::AbstractVector, ref::AbstractArray)
     typeof(x) === typeof(ref) && return x
-    y = similar(ref, length(x))
-    copyto!(y, convert.(eltype(ref), x))
+    y = similar(ref, eltype(x), length(x))
+    copyto!(y, x)
     return y
 end
 Zygote.@nograd _adapt_metadata
@@ -214,13 +214,16 @@ verifier rejects; the clamp keeps the affine map well defined rather than
 papering over data that got that far.
 """
 function reachable_bounds(policy::BatteryReachablePolicy, e_prev, ref)
+    eltype(policy.alpha) === Float64 || throw(ArgumentError(
+        "physical reachability metadata must retain Float64 precision; reconstruct " *
+        "the policy from its case and use a precision-preserving device transfer"))
     e_min = _adapt_metadata(policy.energy_min, ref)
     e_max = _adapt_metadata(policy.energy_max, ref)
     gain = _adapt_metadata(policy.charge_gain, ref)
     drop = _adapt_metadata(policy.discharge_drop, ref)
     α = _adapt_metadata(policy.alpha, ref)
 
-    decayed = α .* e_prev
+    decayed = α .* Float64.(e_prev)
     lower = max.(e_min, decayed .- drop)
     upper = min.(e_max, decayed .+ gain)
     return lower, max.(upper, lower)
@@ -299,7 +302,7 @@ emitted target — through the reachable interval, in the feasibility layer, whi
 is exactly where a decision rule with feasibility restoration puts it.
 """
 _head_input(m::BatteryReachablePolicy, h, ξ, e_prev) =
-    m.architecture === :tsldr_recurrent_linear ? vcat(h, ξ) : vcat(h, e_prev)
+    m.architecture === :tsldr_recurrent_linear ? vcat(h, ξ) : vcat(h, eltype(h).(e_prev))
 
 """
     _bounded_fraction(policy, z) -> y ∈ [0, 1 − 1e-3]
@@ -359,7 +362,10 @@ consecutive stages — see the note at the top of this file.
 function feasible_target(m::BatteryReachablePolicy, z, e_prev)
     y = _bounded_fraction(m, z)
     lower, upper = reachable_bounds(m, e_prev, y)
-    return lower .+ (upper .- lower) .* y
+    # The neural map may be Float32; physical state arithmetic matches the
+    # Float64 NLP. Clamp only to the computed endpoints to contain roundoff
+    # in the affine interpolation, without introducing an interior margin.
+    return clamp.(lower .+ (upper .- lower) .* Float64.(y), lower, upper)
 end
 
 """
@@ -511,7 +517,10 @@ is a structural accident, not a guarantee — the guarantee is the explicit
 architecture check in `load_checkpoint!`.
 """
 function load_stateconditioned_policy!(policy::BatteryReachablePolicy, state)
-    Flux.loadmodel!(policy, state)
+    # Flux.state includes non-trainable arrays too. Never restore physical
+    # metadata from an old checkpoint over the authoritative case constants.
+    Flux.loadmodel!(policy.encoder, state.encoder)
+    Flux.loadmodel!(policy.combiner, state.combiner)
     Flux.reset!(policy)
     return policy
 end
@@ -633,10 +642,10 @@ function battery_reachable_policy(case::BatteryCase, encoder_layers::AbstractVec
         DecisionRulesExa._init_recurrent_state(encoder),
         architecture,
         n_context, n_observation, nBat,
-        Float32[b.energy_min for b in batteries],
-        Float32[b.energy_max for b in batteries],
-        Float32[b.charge_efficiency * Δt * b.charge_max for b in batteries],
-        Float32[Δt * b.discharge_max / b.discharge_efficiency for b in batteries],
-        Float32[b.self_discharge for b in batteries],
+        Float64[b.energy_min for b in batteries],
+        Float64[b.energy_max for b in batteries],
+        Float64[b.charge_efficiency * Δt * b.charge_max for b in batteries],
+        Float64[(Δt / b.discharge_efficiency) * b.discharge_max for b in batteries],
+        Float64[b.self_discharge for b in batteries],
     )
 end

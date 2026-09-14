@@ -37,6 +37,14 @@
 #   --attempt <int>        (default 1)
 #   --stop-file <path>     (default <output>/STOP)
 #   --max-seconds <float>  (default 1e9)
+#   --final-evaluation     (default false) measure the panel once at the last
+#                          completed index, for a run being retired on budget
+#   --precision-upgrade    (default false) accept a parent checkpoint written
+#                          under the older physical-state arithmetic. This is a
+#                          CHANGED FORWARD MAP, not an identical resume: the
+#                          parent's best cost is dropped as an incumbent and
+#                          recorded as historical, and the run must re-earn a
+#                          selection on a complete admissible panel.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # THE FROZEN CONFIGURATION  (`--config`, TOML)
@@ -659,6 +667,15 @@ function run_segment(a::AbstractDict)
     attempt   = parse(Int, get(a, "attempt", "1"))
     stop_file = get(a, "stop-file", joinpath(output, "STOP"))
     max_secs  = parse(Float64, get(a, "max-seconds", "1e9"))
+    # The THIRD and last permitted evaluation point: a terminal measurement the
+    # caller asks for once, when it is retiring the run. Default off, so an
+    # ordinary segment can never introduce an evaluation the schedule did not
+    # already contain.
+    final_eval = get(a, "final-evaluation", "false") in ("true", "1")
+    # Resuming a checkpoint written under the OLD physical-state precision. It
+    # is off by default, so a legacy parent stops the segment instead of
+    # continuing under a forward map that is not the one that produced it.
+    precision_upgrade = get(a, "precision-upgrade", "false") in ("true", "1")
 
     # ---- method ownership, before anything is loaded -----------------------
     # Refused BY NAME and pointed at the engine that owns it, the same way
@@ -754,12 +771,19 @@ function run_segment(a::AbstractDict)
     checksum = 0.0
     index_from = 0
     parent_sha = "none"
+    # Set only when the parent was written under the old physical-state
+    # arithmetic. Both go into the result record, so a reader can see that the
+    # incumbent was dropped and what it used to be.
+    precision_upgraded = false
+    legacy_best_cost = NaN
+    legacy_best_index = 0
 
     # ---- resume ------------------------------------------------------------
     if resume != "none" && !isempty(resume)
         data, meta = load_segment_checkpoint(resume)
         assert_identity(ident, Dict{String,Any}(meta["identity"]), "parent checkpoint")
-        load_checkpoint!(policy, resume; case = case)
+        loaded = load_checkpoint!(policy, resume; case = case,
+                                  allow_precision_upgrade = precision_upgrade)
         # `load_checkpoint!` returns the host copy of the optimizer state; it has
         # to travel to the policy's device or the first update mixes memories.
         st = get(data, "opt_state", nothing)
@@ -773,8 +797,32 @@ function run_segment(a::AbstractDict)
         best_index = Int(meta["best_index"])
         rng.state  = parse(UInt128, String(meta["rng_state"]))
         parent_sha = sha256_file(resume)
-        @printf("  resumed from index %d · checksum %.10e · best %.6f\n",
-                index_from, checksum, best_cost)
+        # A PRECISION UPGRADE CHANGES THE FORWARD MAP, so the parent's best cost
+        # is a measurement of a policy this segment is not running. Carrying it
+        # would let a score that was never observed under this arithmetic win
+        # the selection against costs that were — and, because selection keeps
+        # the incumbent on a tie, an inherited number can also suppress every
+        # later checkpoint without a single panel ever confirming it. The
+        # incumbent is therefore dropped and the run must EARN a best cost
+        # again on a complete admissible panel. The historical value is kept
+        # beside it, labelled, so nothing is lost.
+        precision_upgraded = Bool(get(loaded.meta, "reachability_precision_upgraded", false))
+        legacy_best_cost, legacy_best_index = best_cost, best_index
+        best_cost, best_index = resumed_best_score(best_cost, best_index, precision_upgraded)
+        # `@printf` takes a LITERAL format string: a `*` concatenation of
+        # literals is an expression, and the macro rejects it while the file is
+        # being macroexpanded — which happens at load time, so a runner with one
+        # of those in it does not start at all. Long messages are built with
+        # string interpolation instead.
+        if precision_upgraded
+            println("  parent uses legacy physical-state precision; its best ",
+                    @sprintf("%.6f", legacy_best_cost), " at index ",
+                    legacy_best_index, " is HISTORICAL and is not carried as a ",
+                    "validated score — this run re-earns its own")
+        end
+        println("  resumed from index ", index_from, " · checksum ",
+                @sprintf("%.10e", checksum), " · best ",
+                best_index == 0 ? "unset" : @sprintf("%.6f", best_cost))
     end
 
     stop_target = min(target_index, index_from + segment_updates)
@@ -796,7 +844,7 @@ function run_segment(a::AbstractDict)
     worst_deficit = 0.0
     e0 = initial_energy(case)
     like = _policy_array(policy)
-    e0_dev = _to_like(like, e0)
+    e0_dev = _adapt_metadata(e0, like)
 
     # Persistent workers for the whole segment: each binds the device and then
     # builds its OWN problem and solver inside its own task. They are shut down
@@ -890,13 +938,24 @@ function run_segment(a::AbstractDict)
 
         # ---- fixed-panel evaluation and checkpoint selection ---------------
         panel_value = NaN
-        if eval_every > 0 && (idx % eval_every == 0 || idx == stop_target)
+        # SEGMENTATION-INVARIANT SCHEDULE. The panel is measured at global
+        # indices the CONFIG names, and at the run's target — never because this
+        # process happened to reach `segment_updates`. Evaluating at a segment
+        # boundary made the schedule depend on where the run was cut: on the
+        # certified gate the uninterrupted run did NOT evaluate at index 1 while
+        # the split run did, and that extra evaluation became its selected
+        # checkpoint. A preemption must not be able to change what was measured.
+        if eval_every > 0 && (idx % eval_every == 0 || idx == target_index ||
+                              (final_eval && idx == stop_target))
             _t_eval = time()
             ev = evaluate_panel(policy, prob, case, eval_columns;
                                 max_recourse = max_recourse, solver_kwargs = solver_kwargs)
             evaluation_seconds += time() - _t_eval
             panel_value = ev.mean_cost
-            selected = ev.complete && ev.mean_cost < best_cost
+            # Strict improvement BEYOND the tie band, so two segmentations of
+            # one run order the same two policies identically; on a tie the
+            # EARLIER global index is retained by simply not replacing.
+            selected = ev.complete && improves(ev.mean_cost, best_cost)
             selected && (best_cost = ev.mean_cost; best_index = idx)
             push!(evaluations, (index = idx, protocol = String(ev.protocol),
                                 mean_cost = ev.mean_cost, worst_recourse = ev.worst_recourse,
@@ -937,11 +996,19 @@ function run_segment(a::AbstractDict)
     close(hist_io)
 
     # ---- the richer local artifacts ----------------------------------------
-    ma = moving_average(losses_seen, ma_window)
+    # The moving average is computed over the CUMULATIVE global loss history
+    # carried in the checkpoint, not over this segment's rows. A window that
+    # restarted at every resume would make the reported curve a function of the
+    # preemption pattern rather than of the run.
+    global_losses = [Float64(h.loss) for h in history]
+    global_index = [Int(h.step) for h in history]
+    ma_all = moving_average(global_losses, ma_window)
+    ma_by_index = Dict(global_index[k] => ma_all[k] for k in eachindex(global_index))
     open(joinpath(output, "trajectory.csv"), "w") do io
         println(io, "index,train_loss,train_loss_ma$(ma_window),lr,wall_seconds")
-        for (k, r) in enumerate(traj_rows)
-            @printf(io, "%d,%.10f,%.10f,%.6e,%.3f\n", r[1], r[2], ma[k], r[3], r[4])
+        for r in traj_rows
+            @printf(io, "%d,%.10f,%.10f,%.6e,%.3f\n", r[1], r[2],
+                    get(ma_by_index, r[1], NaN), r[3], r[4])
         end
     end
     open(joinpath(output, "evaluation.csv"), "w") do io
@@ -995,6 +1062,13 @@ function run_segment(a::AbstractDict)
         "identity_digest"      => ident["identity_sha256"],
         "parent_checkpoint"    => resume,
         "parent_sha256"        => parent_sha,
+        # A resume across the physical-precision repair is a CHANGED FORWARD
+        # MAP, not an identical continuation. Recorded so a reader never reads
+        # this segment's numbers as the same experiment as its parent's, and so
+        # the dropped incumbent is auditable rather than merely absent.
+        "parent_precision_upgraded"  => precision_upgraded,
+        "legacy_best_cost_historical" => precision_upgraded ? legacy_best_cost : "none",
+        "legacy_best_index_historical" => precision_upgraded ? legacy_best_index : 0,
         "child_checkpoint"     => last_ck_path,
         "child_sha256"         => last_ck_sha,
         "index_from"           => index_from,

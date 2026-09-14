@@ -36,6 +36,8 @@ no case at $CASE_DIR. Build and mirror it from the JuMP package first:
   DR_BAT_MIRROR=$(dirname(EXAMPLE))/$(basename(EXAMPLE)) julia --project=. build_battery_case.jl
 """)
 const DEVICE = get(ENV, "DR_BAT_DEVICE", "cpu")
+include("reachability_precision.jl")
+test_reachability_precision(read_battery_case(CASE_DIR), DEVICE)
 
 @testset "battery storage OPF (Exa engine)" begin
 
@@ -531,8 +533,14 @@ const DEVICE = get(ENV, "DR_BAT_DEVICE", "cpu")
         matrix, _ = evaluation_protocol(case)
         atoms = matrix[1:3, 1]
         lk = _policy_array(ppol)
+        # The initial energy is PHYSICAL state, so it reaches the rollout the
+        # same way `evaluate_panel` sends it: moved to the policy's device with
+        # its own precision intact. Narrowing it to the network's element type
+        # here would make this a recomputation of a DIFFERENT trajectory, and
+        # the two costs below would then differ by the rounding rather than
+        # agree by construction.
         tg = rollout_targets(ppol, rollout_features(case, pprob.net, atoms; like = lk),
-                             _to_like(lk, initial_energy(case)))
+                             _adapt_metadata(initial_energy(case), lk))
         _, psol, _ = strict_solve!(pprob, case, atoms, tg; solver_kwargs = solver_kwargs)
         pc = stage_costs(pprob, psol)
         @test ev.mean_cost ≈ sum(pc.generation) + sum(pc.throughput) atol = 1e-9
@@ -995,6 +1003,37 @@ const DEVICE = get(ENV, "DR_BAT_DEVICE", "cpu")
     # drifted from the JuMP package's originals — a drifted `battery_case.jl`
     # would let the two engines read one frozen case as two different problems
     # while both reported success.
+    # ── The segment runner LOADS ────────────────────────────────────────────
+    #
+    # Until now nothing in this suite so much as read `portfolio_runner.jl`, so
+    # an edit that stopped the file from loading at all passed a full green run
+    # and only failed when a study segment tried to start. That is the worst
+    # place to find it: the runner is what every long training goes through, and
+    # a load error there costs an allocation rather than a test.
+    #
+    # A `*`-concatenated `@printf` format is the concrete way it happened — the
+    # macro demands a literal and rejects the expression during macroexpansion,
+    # which is load time, not call time — but the check is deliberately generic:
+    # it loads the file and asserts the public entry points exist. The runner's
+    # own `PROGRAM_FILE` guard keeps the include from starting a training run.
+    @testset "the segment runner loads" begin
+        runner = joinpath(EXAMPLE, "portfolio_runner.jl")
+        @test isfile(runner)
+        mod = Module(:RunnerLoadProbe)
+        Core.eval(mod, :(include(path) = Base.include(@__MODULE__, path)))
+        @test (Base.include(mod, runner); true)
+        for name in (:run_segment, :main, :parse_args, :run_identity,
+                     :assert_identity, :write_segment_checkpoint,
+                     :load_segment_checkpoint, :runner_code_digest)
+            @test isdefined(mod, name)
+        end
+        # The boundary this phase added, reachable from the runner's namespace.
+        @test Core.eval(mod, :(resumed_best_score(5.0, 3, true))) == (Inf, 0)
+        @test Core.eval(mod, :(resumed_best_score(5.0, 3, false))) == (5.0, 3)
+        # The flag is documented where a user looks for it.
+        @test occursin("--precision-upgrade", read(runner, String))
+    end
+
     @testset "shared files and the portfolio manifest" begin
         peer = get(ENV, "DR_BAT_PEER",
                    normpath(joinpath(EXAMPLE, "..", "..", "..",

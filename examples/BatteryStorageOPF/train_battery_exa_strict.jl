@@ -162,8 +162,8 @@ function rollout_targets(policy::BatteryReachablePolicy, features::AbstractMatri
     T = size(features, 2)
     nBat = policy.n_battery
     state = DecisionRulesExa._init_recurrent_state(policy.encoder)
-    e_prev = e0
-    buf = Zygote.Buffer(similar(e0, T * nBat))
+    e_prev = Float64.(e0)
+    buf = Zygote.Buffer(similar(e0, Float64, T * nBat))
     for i in 1:T
         target, state = policy_step(policy, state, vcat(features[:, i], e_prev))
         buf[((i - 1) * nBat + 1):(i * nBat)] = target
@@ -313,7 +313,7 @@ function evaluate_panel(policy::BatteryReachablePolicy, prob::BatteryExaProblem,
     for c in columns
         atoms = matrix[1:prob.horizon, c]
         features = rollout_features(case, prob.net, atoms; like = like)
-        targets = rollout_targets(policy, features, _to_like(like, e0))
+        targets = rollout_targets(policy, features, _adapt_metadata(e0, like))
         result, sol, _ = strict_solve!(prob, case, atoms, targets;
                                        solver_kwargs = solver_kwargs)
         if !solve_succeeded(result)
@@ -416,6 +416,7 @@ resume a run with a fresh Adam moment estimate while reporting that it had
 resumed — so it is refused by tag rather than adapted.
 """
 const BATTERY_CHECKPOINT_SCHEMA = "battery_storage_opf/checkpoint/3"
+const BATTERY_REACHABILITY_ARITHMETIC = "float64-v1"
 
 """
     save_checkpoint(path, policy, meta; opt_state=nothing, history=nothing)
@@ -444,8 +445,10 @@ function save_checkpoint(path::AbstractString, policy::BatteryReachablePolicy, m
     record = Dict{String,Any}(meta)
     record["schema"] = BATTERY_CHECKPOINT_SCHEMA
     record["architecture"] = String(policy.architecture)
+    record["reachability_arithmetic"] = BATTERY_REACHABILITY_ARITHMETIC
     JLD2.jldsave(path;
-                 state = Flux.state(Flux.cpu(policy)),
+                 state = (encoder = Flux.state(Flux.cpu(policy.encoder)),
+                          combiner = Flux.state(Flux.cpu(policy.combiner))),
                  opt_state = opt_state === nothing ? nothing : Flux.cpu(opt_state),
                  history = history === nothing ? nothing : collect(history),
                  meta = record)
@@ -477,7 +480,8 @@ something untrue:
   a single array is touched.
 """
 function load_checkpoint!(policy::BatteryReachablePolicy, path::AbstractString;
-                          case::Union{Nothing,BatteryCase} = nothing)
+                          case::Union{Nothing,BatteryCase} = nothing,
+                          allow_precision_upgrade::Bool = false)
     data = JLD2.load(path)
     meta = data["meta"]
     get(meta, "schema", "") == BATTERY_CHECKPOINT_SCHEMA || error(
@@ -492,9 +496,51 @@ function load_checkpoint!(policy::BatteryReachablePolicy, path::AbstractString;
         meta["network_sha256"] == want || error(
             "checkpoint $path was trained on network $(meta["network_sha256"]) but the case in hand is $want")
     end
+    old_arithmetic = get(meta, "reachability_arithmetic", "legacy")
+    upgraded = old_arithmetic != BATTERY_REACHABILITY_ARITHMETIC
+    if upgraded
+        old_arithmetic == "legacy" || error("unknown reachability arithmetic $old_arithmetic")
+        allow_precision_upgrade && case !== nothing || error(
+            "legacy checkpoint uses different physical-state precision; supply its " *
+            "verified case and allow_precision_upgrade=true for an explicit repair. " *
+            "Re-evaluate the policy before comparing or retaining its old best cost.")
+    end
     load_stateconditioned_policy!(policy, data["state"])
-    return (meta = meta, opt_state = get(data, "opt_state", nothing),
+    loaded_meta = copy(meta)
+    loaded_meta["reachability_precision_upgraded"] = upgraded
+    return (meta = loaded_meta, opt_state = get(data, "opt_state", nothing),
             history = get(data, "history", nothing))
+end
+
+"""
+    resumed_best_score(best_cost, best_index, upgraded) -> (cost, index)
+
+The incumbent a resumed run may carry: the parent's own `(best_cost, best_index)`
+for an identical continuation, and `(Inf, 0)` across a physical-precision
+upgrade.
+
+# Notes
+A selection metric is only meaningful against the forward map that produced it.
+A precision upgrade changes that map — the same parameters now generate
+different targets and therefore different panel costs — so the parent's number
+is a measurement of a policy the resumed run is not executing. Two failures
+follow from carrying it, and they point in opposite directions, which is why
+neither is caught by "the number looks about right":
+
+  * an inherited score that happens to be LOW is never re-observed, yet it wins
+    every comparison against costs that were actually measured under the new
+    arithmetic, so the run can finish having selected a checkpoint no panel
+    ever validated;
+  * because selection keeps the incumbent on a tie, an inherited score can also
+    suppress every genuine later improvement, and the run reports no selection
+    at all rather than an obviously wrong one.
+
+Dropping it costs one panel evaluation and makes the selected checkpoint mean
+what it says. The historical value is not deleted — the caller records it
+alongside, marked historical.
+"""
+function resumed_best_score(best_cost::Real, best_index::Integer, upgraded::Bool)
+    return upgraded ? (Inf, 0) : (Float64(best_cost), Int(best_index))
 end
 
 
@@ -550,7 +596,7 @@ function cuda_device_binder(device::AbstractString)
     # Element type is PRESERVED: the serial path handed `strict_solve!` whatever
     # `rollout_targets` produced, and changing precision here would change the
     # solve rather than only where it runs.
-    upload = x -> Base.invokelatest(cuda.cu, x)
+    upload = x -> Base.invokelatest(cuda.CuArray, x)
     return (bind!, describe, upload)
 end
 
@@ -790,7 +836,7 @@ function trajectory_batch!(pool::BatteryWorkerPool, policy::BatteryReachablePoli
         push!(accepted, sid)
         push!(losses, Float64(r.loss))
         worst = max(worst, Float64(r.worst_recourse))
-        _, g = actor_gradient(policy, features_by_sid[sid], _to_like(like, r.lambda), e0_dev)
+        _, g = actor_gradient(policy, features_by_sid[sid], _adapt_metadata(r.lambda, like), e0_dev)
         grads = grads === nothing ? g : _add_grads(grads, g)
     end
     pool.peak = max(pool.peak, peak)
@@ -876,7 +922,7 @@ function train_strict(; case_dir::AbstractString = get(ENV, "DR_BAT_CASE_DIR",
     opt_state = Optimisers.setup(Optimisers.Adam(Float64(lr)), policy)
     e0 = initial_energy(case)
     like = _policy_array(policy)
-    e0_dev = _to_like(like, e0)
+    e0_dev = _adapt_metadata(e0, like)
 
     total_steps = epochs * batches
     # Resolved ONCE, before the first update, so a run that would have selected
@@ -989,7 +1035,12 @@ function configure_device(device::AbstractString)
     madnlpgpu = Base.invokelatest(getglobal, Main, :MadNLPGPU)
     linear_solver = Base.invokelatest(getglobal, madnlpgpu, :CUDSSSolver)
     linear_solver === nothing && error("MadNLPGPU.CUDSSSolver is nothing; CUDSS.jl did not load")
-    return backend, x -> Base.invokelatest(Flux.gpu, x), (linear_solver = linear_solver,)
+    # CUDA.cu / Flux.gpu can narrow Float64 arrays to Float32. Move leaves
+    # explicitly so physical constants, energy paths and optimizer state retain
+    # their supplied element types.
+    to_device = x -> Flux.fmap(a -> a isa AbstractArray ?
+                              Base.invokelatest(cuda.CuArray, a) : a, x)
+    return backend, to_device, (linear_solver = linear_solver,)
 end
 
 """
