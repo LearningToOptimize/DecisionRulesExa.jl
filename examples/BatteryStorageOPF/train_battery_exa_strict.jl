@@ -47,6 +47,7 @@ using Optimisers
 using JLD2
 using Random
 using StableRNGs
+using SHA
 using Statistics
 using Printf
 using LinearAlgebra
@@ -73,14 +74,41 @@ midnight, which a raw hour index would introduce. This is DETERMINISTIC
 information — knowing the clock is not knowing the future demand — so it does
 not violate nonanticipativity.
 """
-function stage_context(case::BatteryCase, t::Integer)
+function stage_context(case::BatteryCase, t::Integer,
+                       forecast::AbstractVector{<:Real} = Float64[])
     P = profile_period(case.demand)
     θ = 2π * (t - 1) / P
-    return [sin(θ), cos(θ)]
+    return vcat([sin(θ), cos(θ)], Float64.(forecast))
 end
 
-"Width of the context block."
-const N_CONTEXT = 2
+"""
+Width of the CLOCK part of the context block: the two phase features.
+
+The full context width is this plus the length of the forecast-context vector,
+which is a property of the run rather than of the code — see
+[`n_context_width`](@ref). It is kept separate because the clock features
+describe WHERE IN THE DAY a stage sits and are available on every case, while the
+forecast context describes WHICH DEMAND LAW the episode is drawn from and exists
+only on a contextual run.
+"""
+const N_CLOCK_CONTEXT = 2
+
+"""
+    n_context_width(n_forecast) -> Int
+
+The policy's context-row count for a run carrying `n_forecast` forecast-context
+coordinates. `n_forecast = 0` reproduces the unconditional runs exactly, at width
+2, so a reference run's architecture is unchanged.
+"""
+n_context_width(n_forecast::Integer) = N_CLOCK_CONTEXT + Int(n_forecast)
+
+"""
+Width of the context block on an UNCONDITIONAL run.
+
+Retained under its original name and value so every existing caller, checkpoint
+and recorded identity keeps the number it already had.
+"""
+const N_CONTEXT = N_CLOCK_CONTEXT
 
 """
     stage_observation(net, case, t, atom) -> Vector{Float64}
@@ -121,9 +149,15 @@ it makes explicit that nothing in the observation depends on the parameters.
 function rollout_features(case::BatteryCase, net::ExaNetwork,
                           atoms::AbstractVector{<:Integer};
                           stage_offset::Integer = 0,
+                          forecast::AbstractVector{<:Real} = Float64[],
                           like::AbstractArray)
     T = length(atoms)
-    cols = [vcat(stage_context(case, stage_offset + i),
+    # `forecast` is the episode's context: revealed before the episode and FIXED
+    # throughout it, so the same value appears in every column. That is the
+    # information contract — the context describes the conditional law of future
+    # demand, not any future realization — and repeating it per stage is how a
+    # stage-indexed policy reads it without any of it leaking backwards in time.
+    cols = [vcat(stage_context(case, stage_offset + i, forecast),
                  stage_observation(net, case, stage_offset + i, atoms[i])) for i in 1:T]
     host = reduce(hcat, cols)
     device = similar(like, size(host)...)
@@ -298,6 +332,7 @@ what a screening-panel mean is.
 """
 function evaluate_panel(policy::BatteryReachablePolicy, prob::BatteryExaProblem,
                         case::BatteryCase, columns::AbstractVector{<:Integer};
+                        forecast::AbstractVector{<:Real} = Float64[],
                         max_recourse::Real = 1e-6, solver_kwargs = NamedTuple())
     matrix, kind = evaluation_protocol(case)
     size(matrix, 1) >= prob.horizon ||
@@ -312,7 +347,7 @@ function evaluate_panel(policy::BatteryReachablePolicy, prob::BatteryExaProblem,
     bus_id = [b.id for b in prob.net.buses]
     for c in columns
         atoms = matrix[1:prob.horizon, c]
-        features = rollout_features(case, prob.net, atoms; like = like)
+        features = rollout_features(case, prob.net, atoms; forecast = forecast, like = like)
         targets = rollout_targets(policy, features, _adapt_metadata(e0, like))
         result, sol, _ = strict_solve!(prob, case, atoms, targets;
                                        solver_kwargs = solver_kwargs)
@@ -446,12 +481,18 @@ function save_checkpoint(path::AbstractString, policy::BatteryReachablePolicy, m
     record["schema"] = BATTERY_CHECKPOINT_SCHEMA
     record["architecture"] = String(policy.architecture)
     record["reachability_arithmetic"] = BATTERY_REACHABILITY_ARITHMETIC
-    JLD2.jldsave(path;
+    # ATOMIC: write a sibling temporary and rename(2) it into place. A job preempted
+    # part-way through a multi-megabyte JLD2 write would otherwise leave a truncated
+    # file under the real name — and on a preemptible queue that is the file the next
+    # run would try to resume from.
+    tmp = string(path, ".tmp.", getpid(), ".", time_ns())
+    JLD2.jldsave(tmp;
                  state = (encoder = Flux.state(Flux.cpu(policy.encoder)),
                           combiner = Flux.state(Flux.cpu(policy.combiner))),
                  opt_state = opt_state === nothing ? nothing : Flux.cpu(opt_state),
                  history = history === nothing ? nothing : collect(history),
                  meta = record)
+    mv(tmp, path; force = true)
     return path
 end
 
@@ -601,6 +642,97 @@ function cuda_device_binder(device::AbstractString)
 end
 
 """
+    ContextSet
+
+The forecast contexts a contextual run trains and is evaluated on.
+
+# Fields
+- `cases::Vector{BatteryCase}`: one frozen case per context. Every case carries
+  the SAME network, fleet and recourse prices and differs only in its demand
+  support, which is what makes the context a statement about the demand law and
+  nothing else.
+- `coords::Vector{Vector{Float64}}`: the context vector handed to the policy for
+  each case, in the same order.
+- `labels::Vector{String}`, `roles::Vector{Symbol}`: `:train` or `:heldout`.
+- `train::Vector{Int}`, `heldout::Vector{Int}`: index sets into the above.
+
+# Notes
+An unconditional run is the empty context set, and every code path below treats
+it as the case it always had: one case, a zero-length context vector, and a
+policy of exactly the original width.
+
+The constructor ASSERTS that the network digest is identical across contexts.
+Without that, a "context" could quietly be a different physical problem, and a
+cost difference between two contexts would not be attributable to the forecast.
+"""
+struct ContextSet
+    cases::Vector{BatteryCase}
+    coords::Vector{Vector{Float64}}
+    labels::Vector{String}
+    roles::Vector{Symbol}
+    train::Vector{Int}
+    heldout::Vector{Int}
+end
+
+"Number of forecast-context coordinates; 0 for an unconditional run."
+n_forecast(cs::ContextSet) = isempty(cs.coords) ? 0 : length(first(cs.coords))
+
+"""
+    context_set(cases, coords, labels, roles) -> ContextSet
+
+Build and validate a context set.
+"""
+function context_set(cases::AbstractVector{BatteryCase},
+                     coords::AbstractVector, labels::AbstractVector,
+                     roles::AbstractVector)
+    n = length(cases)
+    (length(coords) == n && length(labels) == n && length(roles) == n) ||
+        throw(ArgumentError("context set fields have mismatched lengths"))
+    n >= 1 || throw(ArgumentError("a context set needs at least one context"))
+    w = length(first(coords))
+    all(c -> length(c) == w, coords) ||
+        throw(ArgumentError("context vectors have differing widths"))
+
+    # The physical problem must be the SAME across contexts.
+    ref = cases[1].manifest["artifacts"]["network.json"]
+    for (i, c) in enumerate(cases)
+        c.manifest["artifacts"]["network.json"] == ref || throw(ArgumentError(
+            "context $(labels[i]) carries a different network than context $(labels[1]); " *
+            "a context may change the demand law and nothing else"))
+    end
+    # Two contexts with the same support are the same context under two names,
+    # and a "held-out" one that duplicates a trained one is not held out at all.
+    digs = [support_digest(c.demand) for c in cases]
+    allunique(digs) || throw(ArgumentError(
+        "two contexts share a demand support digest; they are the same context"))
+
+    tr = [i for i in 1:n if roles[i] === :train]
+    ho = [i for i in 1:n if roles[i] === :heldout]
+    isempty(tr) && throw(ArgumentError("a context set needs at least one :train context"))
+    return ContextSet(collect(cases), [Float64.(c) for c in coords],
+                      String.(labels), Symbol.(roles), tr, ho)
+end
+
+"""
+    unconditional_context(case) -> ContextSet
+
+The one-context set that reproduces a non-contextual run exactly: a zero-length
+context vector, so the policy width is the original `N_CONTEXT`.
+"""
+unconditional_context(case::BatteryCase) =
+    ContextSet([case], [Float64[]], ["reference"], [:train], [1], Int[])
+
+"""
+    draw_context(rng, cs) -> Int
+
+Draw one TRAINING context index, uniformly. Training coverage is uniform over
+declared contexts on purpose: a context is a sampling unit, and weighting them by
+anything measured later would make the training distribution depend on the
+result.
+"""
+draw_context(rng, cs::ContextSet) = cs.train[rand(rng, 1:length(cs.train))]
+
+"""
     BatteryWorkerPool
 
 Persistent per-segment workers, each owning its own problem and solver.
@@ -647,9 +779,10 @@ without this the main task would block forever on `take!`, which is exactly what
 a "hang" looks like from the outside. On error the worker reports loudly and
 closes its outbox so the main loop fails fast instead of deadlocking.
 """
-function battery_worker_pool(case::BatteryCase, num_stages::Integer,
+function battery_worker_pool(ctx::ContextSet, num_stages::Integer,
                              device::AbstractString, solver_kwargs;
                              workers::Integer = BATTERY_DEFAULT_WORKERS)
+    case = ctx.cases[1]
     workers = Int(workers)
     workers >= 1 || throw(ArgumentError("workers must be at least 1, got $workers"))
     pool = BatteryWorkerPool(workers, Channel{Any}[], Channel{Any}[], Task[], Any[], 0, 0)
@@ -672,6 +805,10 @@ function battery_worker_pool(case::BatteryCase, num_stages::Integer,
         push!(pool.inbox, inb); push!(pool.outbox, outb)
         t = Threads.@spawn try
             bind!()                                   # BEFORE anything is built
+            # ONE problem per worker, built from the first context. Every context
+            # shares the frozen network, fleet and recourse prices — `context_set`
+            # asserts it — so the ExaModels structure is common and only the
+            # realized demand differs, which enters as data at solve time.
             prob_w = build_battery_exa(case, Int(num_stages); backend = backend)
             d = describe()
             put!(ready, (worker = wi, device = d.device, stream = d.stream,
@@ -680,9 +817,13 @@ function battery_worker_pool(case::BatteryCase, num_stages::Integer,
             while true
                 msg = take!(inb)
                 msg === nothing && break
-                (sid, atoms, targets_cpu) = msg
+                # The CONTEXT INDEX travels with the scenario. Without it a worker
+                # would solve every scenario against whichever single case it was
+                # built with, so a contextual run would train one policy against
+                # one demand law while believing it had seen several.
+                (sid, cid, atoms, targets_cpu) = msg
                 targets_w = upload(targets_cpu)      # onto THIS worker's device
-                result, sol, λ = strict_solve!(prob_w, case, atoms, targets_w;
+                result, sol, λ = strict_solve!(prob_w, ctx.cases[cid], atoms, targets_w;
                                                solver_kwargs = solver_kwargs)
                 ok = solve_succeeded(result)
                 # Everything sent back is DEVICE-NEUTRAL. A device array replied
@@ -753,7 +894,7 @@ as rejected and excluded from the reduction, never rescued by changing the
 problem.
 """
 function trajectory_batch!(pool::BatteryWorkerPool, policy::BatteryReachablePolicy,
-                           prob::BatteryExaProblem, case::BatteryCase, rng,
+                           prob::BatteryExaProblem, ctx::ContextSet, rng,
                            num_stages::Integer, e0_dev, like;
                            solver_kwargs = NamedTuple(), trajectories::Integer = 2,
                            index::Integer = 0)
@@ -762,9 +903,19 @@ function trajectory_batch!(pool::BatteryWorkerPool, policy::BatteryReachablePoli
         "trajectories ($n) must be at least workers ($(pool.workers)): a worker " *
         "with no scenario to solve would idle for the whole segment"))
 
-    # (1) draw every scenario up front, in order
-    atoms_by_sid = [sample_atoms(rng, case, Int(num_stages)) for _ in 1:n]
-    features_by_sid = [rollout_features(case, prob.net, a; like = like) for a in atoms_by_sid]
+    # (1) draw every scenario up front, in order.
+    #
+    # The CONTEXT IS DRAWN FIRST and the stage atoms are then drawn from THAT
+    # context's support, which is what makes the episode a sample from the
+    # conditional law rather than from a pooled mixture. Pooling contexts without
+    # retaining which one was drawn would induce apparent cross-stage dependence
+    # that is really just uncertainty about the context — and would make the
+    # comparison against a context-observing baseline unfair.
+    cid_by_sid = [draw_context(rng, ctx) for _ in 1:n]
+    atoms_by_sid = [sample_atoms(rng, ctx.cases[cid_by_sid[i]], Int(num_stages)) for i in 1:n]
+    features_by_sid = [rollout_features(ctx.cases[cid_by_sid[i]], prob.net, atoms_by_sid[i];
+                                       forecast = ctx.coords[cid_by_sid[i]], like = like)
+                       for i in 1:n]
     targets_by_sid = [rollout_targets(policy, f, e0_dev) for f in features_by_sid]
 
     results = Vector{Any}(undef, n)
@@ -772,7 +923,8 @@ function trajectory_batch!(pool::BatteryWorkerPool, policy::BatteryReachablePoli
 
     if pool.workers == 1
         for sid in 1:n
-            results[sid] = _solve_one_inline(prob, case, atoms_by_sid[sid],
+            results[sid] = _solve_one_inline(prob, ctx.cases[cid_by_sid[sid]],
+                                             atoms_by_sid[sid],
                                              targets_by_sid[sid], sid, solver_kwargs)
         end
         peak = 1
@@ -785,7 +937,8 @@ function trajectory_batch!(pool::BatteryWorkerPool, policy::BatteryReachablePoli
         while next <= n || !isempty(busy)
             while next <= n && !isempty(free)
                 wi = pop!(free)
-                put!(pool.inbox[wi], (next, atoms_by_sid[next], Array(targets_by_sid[next])))
+                put!(pool.inbox[wi], (next, cid_by_sid[next], atoms_by_sid[next],
+                                      Array(targets_by_sid[next])))
                 busy[wi] = next
                 next += 1
                 inflight += 1
@@ -903,23 +1056,180 @@ function train_strict(; case_dir::AbstractString = get(ENV, "DR_BAT_CASE_DIR",
                         max_recourse::Real = parse(Float64, get(ENV, "DR_BAT_MAX_RECOURSE", "1e-6")),
                         checkpoint::AbstractString = get(ENV, "DR_BAT_CHECKPOINT",
                                                          joinpath(@__DIR__, "battery_policy.jld2")),
+                        contexts::Union{Nothing,ContextSet} = nothing,
+                        resume_from::AbstractString = get(ENV, "DR_BAT_RESUME_FROM", ""),
+                        recovery_checkpoint::AbstractString =
+                            get(ENV, "DR_BAT_RECOVERY_CHECKPOINT", ""),
+                        recovery_every::Integer =
+                            parse(Int, get(ENV, "DR_BAT_RECOVERY_EVERY", "0")),
                         verbose::Bool = true)
 
     case = read_battery_case(case_dir)
+    # A run with no declared contexts is the unconditional run it always was: one
+    # case, a zero-length context vector, and a policy of the original width.
+    ctx = contexts === nothing ? unconditional_context(case) : contexts
     backend, to_device, solver_kwargs = configure_device(device)
 
-    prob = build_battery_exa(case, Int(num_stages); backend = backend)
+    prob = build_battery_exa(ctx.cases[1], Int(num_stages); backend = backend)
 
     Random.seed!(seed)
     rng = StableRNG(seed)
     policy = to_device(battery_reachable_policy(case, collect(Int, encoder_layers);
                                                 n_observation = prob.nBus,
-                                                n_context = N_CONTEXT,
+                                                n_context = n_context_width(n_forecast(ctx)),
                                                 head_layers = collect(Int, head_layers),
                                                 architecture = architecture))
     assert_device(policy, device)
 
     opt_state = Optimisers.setup(Optimisers.Adam(Float64(lr)), policy)
+
+    # ── RESUME from a saved state ────────────────────────────────────────────
+    # A preemptible queue ends runs mid-training, and restarting from random
+    # weights throws away every update that was already paid for. `resume_from`
+    # restores the policy, the optimizer state, the loss history and the
+    # incumbent selection, so a resumed run continues rather than begins.
+    #
+    # The incumbent matters as much as the weights: without it the first
+    # evaluation after a resume would overwrite a better earlier selection
+    # simply because `best` had been reset to `Inf`.
+    resumed_from = ""
+    resumed_history = NamedTuple[]
+    resumed_best = (cost = Inf, step = 0)
+    resumed_updates = 0
+    resume_mode = "none"
+    resume_resets = String[]
+    resume_parent_sha256 = ""
+    if !isempty(resume_from)
+        isfile(resume_from) || error("resume_from does not exist: $resume_from")
+        # A recovery/selection artifact must never be resumed FROM and written TO
+        # in the same run: the first write would destroy the only copy of the state
+        # this run depends on.
+        abspath(resume_from) == abspath(checkpoint) && error(
+            "resume_from and checkpoint are the same file ($resume_from); resume from an " *
+            "immutable copy so the parent survives this run's first write")
+        isempty(recovery_checkpoint) || abspath(resume_from) != abspath(recovery_checkpoint) ||
+            error("resume_from and recovery_checkpoint are the same file ($resume_from)")
+
+        loaded = load_checkpoint!(policy, resume_from; case = case)
+        resumed_from = resume_from
+        lm = loaded.meta
+
+        # ── IDENTITY: the context set must be the one the parent trained on ────
+        # `load_checkpoint!` already checks schema, architecture and network digest.
+        # It knows nothing about contexts, so a policy trained on one context family
+        # could otherwise be resumed under another and nothing would say so.
+        if haskey(lm, "context_support_sha256")
+            want = [support_digest(c.demand) for c in ctx.cases]
+            got = String.(lm["context_support_sha256"])
+            Set(got) == Set(want) || error(
+                "resume identity mismatch: checkpoint context support digests $(got) " *
+                "do not match this run's $(want)")
+        else
+            push!(resume_resets, "context_support_sha256 absent from parent; identity unverified")
+        end
+        if haskey(lm, "n_forecast")
+            Int(lm["n_forecast"]) == n_forecast(ctx) || error(
+                "resume identity mismatch: parent n_forecast $(lm["n_forecast"]) vs $(n_forecast(ctx))")
+        end
+        if haskey(lm, "n_observation")
+            Int(lm["n_observation"]) == prob.nBus || error(
+                "resume identity mismatch: parent n_observation $(lm["n_observation"]) vs $(prob.nBus)")
+        end
+
+        # ── OPTIMIZER STATE: required, and verified by USE, not by assignment ──
+        # Assigning a loaded tree cannot throw, so the previous version's try/catch
+        # around the assignment proved nothing. The restore is instead verified by
+        # applying it to a zero gradient: if the tree is incompatible with this
+        # policy, `Optimisers.update!` raises HERE, before any real update.
+        if loaded.opt_state === nothing
+            push!(resume_resets, "optimizer state absent from parent; fresh Adam (moments and step count reset)")
+        else
+            try
+                # THE OPTIMIZER STATE COMES BACK ON THE HOST — `load_checkpoint!`
+                # says so in its own docstring, and `save_checkpoint` writes it
+                # through `Flux.cpu`. The policy, by contrast, was moved to the
+                # device at construction. Restoring the tree without moving it
+                # leaves Adam's moment buffers as host `Matrix{Float32}` beside
+                # `CuArray` parameters, and `Optimisers.update!` then falls back to
+                # scalar indexing of a GPU array and raises. That is precisely how
+                # job 13347962 died.
+                #
+                # `to_device` is the run's OWN mover: an `fmap` that converts array
+                # leaves and leaves everything else alone, chosen over `Flux.gpu`
+                # because it does not narrow Float64. Moving the state here — before
+                # the trial update — is also what makes that trial verify the tree
+                # that will ACTUALLY be used, rather than a host copy that happens
+                # to match a host policy.
+                cand = to_device(loaded.opt_state)
+                assert_opt_state_device(cand, device)
+                # Verified by USE on throwaway copies: a zero "gradient" shaped like
+                # the policy is pushed through `Optimisers.update!`. If the restored
+                # tree does not match this policy's trainable structure, that call
+                # raises HERE — before any real update — and the copies mean the
+                # check cannot perturb the policy or the state it is checking.
+                trial_state = deepcopy(cand)
+                trial_policy = deepcopy(policy)
+                zero_grad = Flux.fmap(x -> x isa AbstractArray ? zero(x) : x, trial_policy)
+                Optimisers.update!(trial_state, trial_policy, zero_grad)
+                opt_state = cand
+                verbose && println("  resume: optimizer state restored AND verified by a trial update")
+            catch err
+                error("resume: optimizer state present but UNUSABLE with this policy " *
+                      "($(sprint(showerror, err))). Refusing to continue silently — rerun " *
+                      "with resume_from pointing at a compatible checkpoint, or accept a " *
+                      "documented warm start by removing the optimizer state requirement.")
+            end
+        end
+
+        loaded.history === nothing || (resumed_history = collect(loaded.history))
+        if haskey(lm, "panel_mean_cost") && haskey(lm, "step")
+            resumed_best = (cost = Float64(lm["panel_mean_cost"]), step = Int(lm["step"]))
+        else
+            push!(resume_resets, "parent carried no (panel_mean_cost, step); incumbent starts at Inf")
+        end
+
+        # ── UPDATE COUNT and SAMPLER STATE ────────────────────────────────────
+        haskey(lm, "updates") ? (resumed_updates = Int(lm["updates"])) :
+            push!(resume_resets, "parent carried no global update count; counting restarts at 0")
+        if haskey(lm, "rng_state") && hasproperty(rng, :state)
+            try
+                # StableRNG's LehmerRNG carries one integer state. It is stored as a
+                # decimal STRING so the record does not depend on how JLD2 chooses to
+                # serialise a UInt128.
+                rng.state = parse(typeof(rng.state), String(lm["rng_state"]))
+                verbose && println("  resume: sampler RNG state restored (", lm["rng_state"], ")")
+            catch err
+                push!(resume_resets, "parent RNG state unreadable ($(sprint(showerror, err))); sampler reseeded")
+            end
+        else
+            push!(resume_resets,
+                  "parent carried no RNG state; the demand sampler REPLAYS from its seed, " *
+                  "so early post-resume atoms repeat the parent's")
+        end
+        # The cosine schedule is a function of (step, total_steps). A resumed run
+        # starts its own step at 1, so the schedule RESTARTS unless the parent's
+        # position is known and this run is configured to continue it.
+        push!(resume_resets,
+              "learning-rate schedule restarts: cosine_lr is evaluated on this run's own " *
+              "step 1:$(epochs * batches), not continued from the parent's position")
+
+        resume_parent_sha256 = try
+            open(resume_from, "r") do io; bytes2hex(SHA.sha256(io)); end
+        catch; "" end
+        resume_mode = isempty(resume_resets) ? "exact_continuation" : "warm_start"
+        verbose && begin
+            @printf("  resume: from %s — mode %s\n", basename(resume_from), uppercase(resume_mode))
+            @printf("          parent step %d, incumbent %.4f, %d history entries, updates %d\n",
+                    resumed_best.step, resumed_best.cost, length(resumed_history), resumed_updates)
+            for r in resume_resets
+                println("          RESET: ", r)
+            end
+            resume_mode == "warm_start" && println(
+                "          → this is a WARM-START LINEAGE, not an exact continuation.")
+            flush(stdout)
+        end
+    end
+
     e0 = initial_energy(case)
     like = _policy_array(policy)
     e0_dev = _adapt_metadata(e0, like)
@@ -934,18 +1244,45 @@ function train_strict(; case_dir::AbstractString = get(ENV, "DR_BAT_CASE_DIR",
     verbose && @printf("selection panel: %s protocol, %d columns of %d\n",
                        eval_protocol, length(eval_columns), size(eval_matrix, 2))
 
-    history = NamedTuple[]
-    best = (cost = Inf, step = 0)
-    updates = 0
+    # The child's durable identity. Written into EVERY checkpoint this run produces,
+    # so a file alone answers "what is this, and what was retained from what parent?"
+    # without reference to a log that a preemption may have destroyed.
+    identity_block() = Dict{String,Any}(
+        "continuation_kind" => resume_mode,
+        "parent_checkpoint_path" => resumed_from,
+        "parent_checkpoint_sha256" => resume_parent_sha256,
+        "retained_from_parent" => resume_mode == "none" ? String[] :
+            ["trainable_parameters",
+             any(occursin("optimizer state absent", x) for x in resume_resets) ?
+                 "optimizer_state_ABSENT" : "optimizer_state_verified",
+             "loss_history", "incumbent_selection"],
+        "reset_from_parent" => collect(String, resume_resets),
+        "sampler_seed" => Int(seed),
+        "sampler_rng_reset" => any(occursin("RNG", x) for x in resume_resets),
+        "incumbent_panel_mean_cost" => best.cost,
+        "incumbent_step" => best.step,
+        "incumbent_panel_protocol" => String(eval_protocol),
+        "incumbent_panel_columns" => collect(Int, eval_columns),
+        "held_out_contexts_are_diagnostic_only" => true)
+
+    isempty(recovery_checkpoint) || abspath(recovery_checkpoint) != abspath(checkpoint) ||
+        error("recovery_checkpoint and checkpoint are the same file ($checkpoint); the " *
+              "latest-state artifact must never be able to overwrite the best-selection one")
+
+    history = resumed_history
+    best = resumed_best
+    # The GLOBAL count continues across a resume; it is what "how much training has
+    # this policy had" means, and a per-run counter would understate it.
+    updates = resumed_updates
     t_start = time()
 
     # ONE batch implementation, shared with the segment driver. `workers == 1`
     # runs it inline, which is the path this function always took.
-    pool = battery_worker_pool(case, num_stages, device, solver_kwargs; workers = workers)
+    pool = battery_worker_pool(ctx, num_stages, device, solver_kwargs; workers = workers)
     try
     for step in 1:total_steps
         Optimisers.adjust!(opt_state, cosine_lr(step, total_steps, lr, lr_final))
-        batch = trajectory_batch!(pool, policy, prob, case, rng, num_stages, e0_dev, like;
+        batch = trajectory_batch!(pool, policy, prob, ctx, rng, num_stages, e0_dev, like;
                                   solver_kwargs = solver_kwargs,
                                   trajectories = trajectories, index = step)
         grads = batch.grads
@@ -958,15 +1295,73 @@ function train_strict(; case_dir::AbstractString = get(ENV, "DR_BAT_CASE_DIR",
                         lr = cosine_lr(step, total_steps, lr, lr_final)))
         verbose && @printf("step %4d  loss %14.4f  lr %.3e\n", step, mean(losses),
                            cosine_lr(step, total_steps, lr, lr_final))
+        # Julia block-buffers stdout into a file, so on a preemptible queue an
+        # unflushed buffer is lost with the job and a run can do real work while
+        # leaving no record of it. Flushing per step costs nothing measurable
+        # against a multi-second update.
+        verbose && flush(stdout)
+
+        # ── RECOVERY checkpoint: LATEST state, not best ───────────────────────
+        # Written unconditionally on its own cadence, to its own path. The
+        # selection checkpoint above is the BEST policy and is only written when a
+        # complete panel improves; those are different objects and conflating them
+        # means a preempted run can only resume from a selection it may never have
+        # earned. This one exists purely so training can continue.
+        if !isempty(recovery_checkpoint) && recovery_every > 0 &&
+           (step % recovery_every == 0 || step == total_steps)
+            save_checkpoint(recovery_checkpoint, policy, merge(identity_block(), Dict(
+                "case" => case.name,
+                "network_sha256" => case.manifest["artifacts"]["network.json"],
+                "num_stages" => Int(num_stages),
+                "step" => step,
+                "kind" => "recovery_latest",
+                "updates" => updates,
+                # Counters and sampler state travel WITH the recovery state, not only
+                # to stdout, so a resume can continue rather than approximate.
+                "rng_state" => hasproperty(rng, :state) ? string(rng.state) : nothing,
+                "total_steps_this_run" => total_steps,
+                "resume_mode" => resume_mode,
+                "encoder_layers" => collect(Int, encoder_layers),
+                "head_layers" => collect(Int, head_layers),
+                "n_observation" => prob.nBus,
+                "n_context" => n_context_width(n_forecast(ctx)),
+                "n_forecast" => n_forecast(ctx),
+                "context_labels" => ctx.labels,
+                "context_coords" => ctx.coords,
+                "context_roles" => String.(ctx.roles),
+                "context_support_sha256" => [support_digest(c.demand) for c in ctx.cases],
+                "context_train" => collect(ctx.train),
+                "context_heldout" => collect(ctx.heldout),
+                # The incumbent travels with it, so a resume does not forget which
+                # selection it had already earned.
+                "incumbent_panel_mean_cost" => best.cost,
+                "incumbent_step" => best.step,
+                "resumed_from" => resumed_from,
+            )); opt_state = opt_state, history = history)
+            verbose && (@printf("  recovery checkpoint written at step %d\n", step);
+                        flush(stdout))
+        end
 
         if eval_every > 0 && (step % eval_every == 0 || step == total_steps)
-            ev = evaluate_panel(policy, prob, case, collect(Int, eval_columns);
-                                max_recourse = max_recourse, solver_kwargs = solver_kwargs)
+            evs = [evaluate_panel(policy, prob, ctx.cases[i], collect(Int, eval_columns);
+                                  forecast = ctx.coords[i],
+                                  max_recourse = max_recourse, solver_kwargs = solver_kwargs)
+                   for i in ctx.train]
+            # A contextual policy is selected on its mean over the TRAINING
+            # contexts, and only when EVERY one of them produced a complete
+            # admissible panel. Selecting on one context would let a policy that
+            # is excellent there and unusable elsewhere become the incumbent, and
+            # averaging over incomplete panels would let a context drop out of the
+            # mean precisely when it was hardest.
+            ev = (mean_cost = mean(e.mean_cost for e in evs),
+                  worst_recourse = maximum(e.worst_recourse for e in evs),
+                  complete = all(e.complete for e in evs),
+                  protocol = first(evs).protocol)
             verbose && @printf("  %s panel: mean %14.4f  worst recourse %.3e  complete %s\n",
                                ev.protocol, ev.mean_cost, ev.worst_recourse, ev.complete)
             if ev.complete && ev.mean_cost < best.cost
                 best = (cost = ev.mean_cost, step = step)
-                save_checkpoint(checkpoint, policy, Dict(
+                save_checkpoint(checkpoint, policy, merge(identity_block(), Dict(
                     "case" => case.name,
                     "network_sha256" => case.manifest["artifacts"]["network.json"],
                     "num_stages" => Int(num_stages),
@@ -974,11 +1369,29 @@ function train_strict(; case_dir::AbstractString = get(ENV, "DR_BAT_CASE_DIR",
                     "panel_columns" => collect(Int, eval_columns),
                     "panel_mean_cost" => ev.mean_cost,
                     "step" => step,
+                    # Provenance of a resumed run, so a selection made after a
+                    # preemption is not mistaken for one made from scratch.
+                    "resumed_from" => resumed_from,
+                    "kind" => "selection_best",
+                    "updates" => updates,
+                    "rng_state" => hasproperty(rng, :state) ? string(rng.state) : nothing,
+                    "total_steps_this_run" => total_steps,
+                    "resume_mode" => resume_mode,
                     "encoder_layers" => collect(Int, encoder_layers),
                     "head_layers" => collect(Int, head_layers),
                     "n_observation" => prob.nBus,
-                    "n_context" => N_CONTEXT,
-                ); opt_state = opt_state, history = history)
+                    "n_context" => n_context_width(n_forecast(ctx)),
+                    # The CONTEXT IDENTITY travels with the checkpoint. Without
+                    # it a policy could later be evaluated under a context set it
+                    # was never trained on, and nothing in the file would say so.
+                    "n_forecast" => n_forecast(ctx),
+                    "context_labels" => ctx.labels,
+                    "context_coords" => ctx.coords,
+                    "context_roles" => String.(ctx.roles),
+                    "context_support_sha256" => [support_digest(c.demand) for c in ctx.cases],
+                    "context_train" => ctx.train,
+                    "context_heldout" => ctx.heldout,
+                )); opt_state = opt_state, history = history)
             end
         end
     end
@@ -990,11 +1403,16 @@ function train_strict(; case_dir::AbstractString = get(ENV, "DR_BAT_CASE_DIR",
         close_worker_pool!(pool)
     end
 
-    return (policy = policy, problem = prob, case = case,
+    return (policy = policy, problem = prob, case = case, contexts = ctx,
             architecture = architecture, opt_state = opt_state,
             protocol = eval_protocol, workers = workers,
             worker_report = pool.report, peak_inflight = pool.peak,
             history = history, best = best, updates = updates,
+            # Resume provenance travels with the result, so a caller cannot report a
+            # warm start as an exact continuation without contradicting its own record.
+            resumed_from = resumed_from, resume_mode = resume_mode,
+            resume_resets = resume_resets,
+            recovery_checkpoint = recovery_checkpoint,
             elapsed = time() - t_start, checkpoint = checkpoint)
 end
 
@@ -1067,6 +1485,38 @@ function assert_device(policy::BatteryReachablePolicy, device::AbstractString)
     end
     return nothing
 end
+
+"""
+    assert_opt_state_device(opt_state, device)
+
+Assert that every ARRAY inside an optimizer state tree sits on `device`.
+
+# Notes
+[`assert_device`](@ref) checks the policy and says nothing about the optimizer,
+and the two can disagree: the policy is moved to the device when it is built,
+while a restored optimizer tree arrives on the host. That disagreement does not
+fail at the call site — it fails much later, inside `Optimisers.update!`, as a
+scalar-indexing error whose stack trace names neither the checkpoint nor the
+restore. Checking the arrays here turns a confusing runtime failure into a
+statement about state.
+
+Adam's per-parameter moments are arrays and are checked; its scalar
+hyperparameters and the beta powers are not arrays and are ignored.
+"""
+function assert_opt_state_device(opt_state, device::AbstractString)
+    want_gpu = lowercase(device) == "gpu"
+    arrays = Any[]
+    Flux.fmap(x -> (x isa AbstractArray && push!(arrays, x); x), opt_state)
+    isempty(arrays) && error("assert_opt_state_device found no arrays in the optimizer state")
+    for a in arrays
+        on_gpu = !(a isa Array)
+        on_gpu == want_gpu || error(
+            "optimizer-state array of type $(typeof(a)) is $(on_gpu ? "on the GPU" : "on the CPU") " *
+            "but device=$device; the restored optimizer state was not moved with the policy")
+    end
+    return nothing
+end
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Small helpers
