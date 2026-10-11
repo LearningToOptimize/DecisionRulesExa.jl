@@ -285,6 +285,13 @@ const _ACT_TAG   = ACTIVATION === sigmoid ? "" :
 # Demand-noise tag: runs with stochastic demand are a different experiment
 # family (different SP and different policy input width) — mark them.
 const _DN_TAG    = DEMAND_NOISE ? "-dnoise$(value_tag(DEMAND_SPREAD))" : ""
+# DR_ARCH=tsldr trains the time-series LINEAR decision rule baseline; the default
+# is the published nonlinear TS-DDR. Tagged so the two never share a checkpoint name.
+const ARCH = let a = lowercase(strip(get(ENV, "DR_ARCH", "tsddr")))
+    a in ("tsddr", "tsldr") || throw(ArgumentError("DR_ARCH must be tsddr or tsldr; got $a"))
+    a == "tsldr" ? :tsldr_recurrent_linear : :tsddr_nonlinear
+end
+const _ARCH_TAG  = ARCH === :tsldr_recurrent_linear ? "-tsldr" : ""
 # Track identity. RUN_NAME is otherwise built only from case/architecture/tags plus a
 # to-the-second timestamp, and the LEARNING RATE is not part of it — so two lineages that
 # differ only in LR and start in the same second get the SAME RUN_NAME, hence the same
@@ -297,7 +304,38 @@ const _DN_TAG    = DEMAND_NOISE ? "-dnoise$(value_tag(DEMAND_SPREAD))" : ""
 const _TRACK_TAG = let t = strip(get(ENV, "DR_OUTPUT_TAG", ""))
     isempty(t) ? (haskey(ENV, "SLURM_JOB_ID") ? "-j$(ENV["SLURM_JOB_ID"])" : "") : "-$(t)"
 end
-const RUN_NAME  = "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-deteq-strict-gpu$(_CLIP_TAG)$(_ENC_TAG)$(_HEAD_TAG)$(_NT_TAG)$(_CTX_TAG)$(_EV_TAG)$(_SAVE_TAG)$(_WARM_TAG)$(_RQ_TAG)$(_ACT_TAG)$(_DN_TAG)$(_TRACK_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
+# ── Exact continuation (DR_RESUME_STATE) ──────────────────────────────────────
+# A preemptible queue cancels jobs mid-stage. With DR_RESUME_STATE=<file>, the full
+# training state (weights, optimizer state, iteration, sampler RNG, best value,
+# stage counters, epoch losses, elapsed training time) is written there atomically
+# every DR_SAVE_LATEST_EVERY updates, and a process that finds the file CONTINUES
+# the run from it under the same RUN_NAME instead of starting over. Everything the
+# trajectory depends on is restored except MadNLP's warm start (the first resumed
+# solves are cold-started and agree to the solver tolerance). The file is refused
+# if any DR_* setting differs from the run that wrote it, or if the in-trainer
+# scheduler is on (its internal state is not saved).
+const RESUME_PATH = strip(get(ENV, "DR_RESUME_STATE", ""))
+# DR_TEST_* switches exist only for the continuation test and do not identify a run.
+const RESUME_FINGERPRINT = Dict(k => v for (k, v) in ENV
+                                if startswith(k, "DR_") && k != "DR_RESUME_STATE" &&
+                                   !startswith(k, "DR_TEST_"))
+# Continuation test only: exit right after the resume state of this update is
+# written, i.e. a preemption at the worst point that still has a saved state.
+const TEST_EXIT_AFTER_ITER = parse(Int, get(ENV, "DR_TEST_EXIT_AFTER_ITER", "0"))
+# Continuation test only: print every update's training loss at full precision.
+const TEST_PRINT_LOSS = get(ENV, "DR_TEST_PRINT_LOSS", "0") == "1"
+const RESUMING = !isempty(RESUME_PATH) && isfile(RESUME_PATH)
+if RESUMING
+    let saved = JLD2.load(RESUME_PATH, "fingerprint")
+        if saved != RESUME_FINGERPRINT
+            diff = sort([k for k in union(keys(saved), keys(RESUME_FINGERPRINT))
+                         if get(saved, k, nothing) != get(RESUME_FINGERPRINT, k, nothing)])
+            error("DR_RESUME_STATE $RESUME_PATH was written with different settings " *
+                  "($(join(diff, ", "))); refusing to continue a different run")
+        end
+    end
+end
+const RUN_NAME  = RESUMING ? JLD2.load(RESUME_PATH, "run_name") : "$(CASE_NAME)-$(FORM_LABEL)-h$(NUM_STAGES)-r$(NUM_ROLLOUT_STAGES)-deteq-strict-gpu$(_CLIP_TAG)$(_ENC_TAG)$(_HEAD_TAG)$(_NT_TAG)$(_CTX_TAG)$(_EV_TAG)$(_SAVE_TAG)$(_WARM_TAG)$(_RQ_TAG)$(_ACT_TAG)$(_DN_TAG)$(_ARCH_TAG)$(_TRACK_TAG)-$(Dates.format(now(), "yyyymmdd-HHMMSS"))"
 const MODEL_DIR = joinpath(CASE_DIR, FORM_LABEL, "models")
 mkpath(MODEL_DIR)
 const MODEL_PATH = joinpath(MODEL_DIR, RUN_NAME * ".jld2")
@@ -499,6 +537,7 @@ Random.seed!(42)
 base_policy = hydro_reachable_policy(hydro_data, ENCODER_LAYERS;
                                      activation       = ACTIVATION,
                                      encoder_type     = Flux.LSTM,
+                                     architecture     = ARCH,
                                      combiner_layers  = HEAD_LAYERS,
                                      n_context        = N_CONTEXT,
                                      # Demand noise: the encoder additionally
@@ -512,6 +551,12 @@ if HAS_PRETRAINED
     @info "Loading pre-trained policy checkpoint" PRE_TRAINED
     load_stateconditioned_policy!(policy, JLD2.load(PRE_TRAINED, "model_state"))
     Flux.reset!(policy)
+end
+if RESUMING
+    # The continuation's weights replace the parent's (which only initialised the run).
+    load_stateconditioned_policy!(policy, JLD2.load(RESUME_PATH, "model_state"))
+    Flux.reset!(policy)
+    @info "RESUMING from $RESUME_PATH" iter = JLD2.load(RESUME_PATH, "iter") RUN_NAME
 end
 
 """
@@ -580,6 +625,35 @@ result0 = MadNLP.madnlp(prob.model; SOLVER_KWARGS..., print_level = MadNLP.WARN)
 @info "  Status: $(result0.status)   Objective: $(round(result0.objective; digits=4))"
 isfinite(result0.objective) || error("Smoke test returned non-finite objective")
 solve_succeeded(result0) || @warn "Smoke test did not fully converge; proceeding anyway"
+
+# DR_TIMING_ONLY=1: wall-clock time of ONE warm solve of the strict problem, on the
+# GPU and on the CPU, for the full T-stage training problem and for a single stage,
+# at the smoke-test instance (mean inflows, this policy's reachable targets). Each
+# problem is solved once untimed (compilation, memory set-up), then timed. Exits.
+if get(ENV, "DR_TIMING_ONLY", "") == "1"
+    for (Tt, lab) in ((T, "full $(T)-stage problem"), (1, "single stage"))
+        w_t = w_mean[1:(length(w_mean) ÷ T) * Tt]
+        x_t = xhat_mean[1:nHyd * Tt]
+        for (dev, be) in (("GPU", CUDA.CUDABackend()), ("CPU", nothing))
+            p = build_hydro_de(power_data, hydro_data, Tt; backend = be, float_type = Float64,
+                               formulation = FORMULATION, target_penalty = TARGET_PEN_ARG,
+                               deficit_cost = DEFICIT_COST,
+                               demand_matrix = demand_mat === nothing ? nothing : demand_mat[1:Tt, :],
+                               reactive_demand_matrix = reactive_mat === nothing ? nothing : reactive_mat[1:Tt, :],
+                               load_scaler = load_scaler, strict_targets = true,
+                               reactive_deficit_cost = REACTIVE_DEFICIT_COST, demand_spread = DEMAND_SPREAD)
+            ExaModels.set_parameter!(p.core, p.p_x0, x0_init)    # as the smoke test does
+            ExaModels.set_parameter!(p.core, p.p_inflow, w_t)
+            ExaModels.set_parameter!(p.core, p.p_target, x_t)
+            prepare_solve!(p, x0_init, w_t, x_t)
+            MadNLP.madnlp(p.model; SOLVER_KWARGS...)                       # warm-up, untimed
+            secs = @elapsed r = MadNLP.madnlp(p.model; SOLVER_KWARGS...)
+            @info "[timing] $lab on $dev" status = r.status iterations = r.iter seconds = round(secs; digits = 3)
+            flush(stderr)
+        end
+    end
+    exit(0)
+end
 
 Flux.reset!(policy)
 
@@ -831,6 +905,15 @@ else
     () -> sample_scenario(hydro_data, T)
 end
 
+# Continuation test only: fingerprint every training draw, so an interrupted and an
+# uninterrupted run can be shown to see the SAME scenarios (the losses themselves
+# differ run to run because which solves fail is not deterministic).
+if get(ENV, "DR_TEST_PRINT_LOSS", "0") == "1"
+    train_sampler = let f = train_sampler
+        () -> (w = f(); println("[sample] ", string(hash(w); base = 16)); w)
+    end
+end
+
 rollout_evaluation = RolloutEvaluation(
     rollout_prob,
     x0_init,
@@ -922,7 +1005,9 @@ rollout_evaluation.active_scenarios = current_eval_scenarios[]
 # Skip it by default: best_obj stays Inf and the first periodic eval sets the
 # baseline, letting the 12 workers engage all GPUs immediately.
 const SKIP_INITIAL_EVAL = parse(Bool, get(ENV, "DR_SKIP_INITIAL_EVAL", "true"))
-if SAVE_METRIC == "rollout" && !SKIP_INITIAL_EVAL
+if RESUMING
+    @info "Initial rollout evaluation skipped: continuing a run (best value restored from the resume file)"
+elseif SAVE_METRIC == "rollout" && !SKIP_INITIAL_EVAL
     rollout_evaluation(EVAL_EVERY, policy)
     best_obj = rollout_evaluation.last_objective_no_target_penalty
     @info "Initial rollout evaluation (checkpoint baseline)" best_obj rollout_evaluation.last_violation_share rollout_evaluation.last_n_ok
@@ -984,7 +1069,7 @@ const STAGE_SUMMARY = strip(get(ENV, "DR_STAGE_SUMMARY", ""))
 # recorded value. That is a hard stop, not a warning — every downstream number
 # would be attributed to the wrong policy.
 const PARENT_REPRO_TOL = parse(Float64, get(ENV, "DR_PARENT_REPRO_TOL", "1e-3"))
-if isfinite(SEED_BEST) && SAVE_METRIC == "rollout" && !SKIP_INITIAL_EVAL
+if !RESUMING && isfinite(SEED_BEST) && SAVE_METRIC == "rollout" && !SKIP_INITIAL_EVAL
     observed = rollout_evaluation.last_objective_no_target_penalty
     if !isfinite(observed) || abs(observed - SEED_BEST) > PARENT_REPRO_TOL
         error("CHECKPOINT REPRODUCTION FAILURE: parent value $SEED_BEST but the " *
@@ -1050,7 +1135,82 @@ function _merge_batch_stats!(metrics, stats)
     return metrics
 end
 
-TRAIN_T0[] = time()
+# ── Continuation state ────────────────────────────────────────────────────────
+RESUMING && SCHED_MODE != "" &&
+    error("DR_RESUME_STATE cannot continue a DR_SCHED_MODE run: the scheduler's state is not saved")
+const RESUME_STATE = RESUMING ? JLD2.load(RESUME_PATH) : nothing
+const START_ITER = RESUMING ? RESUME_STATE["iter"] + 1 : 1
+if RESUMING
+    global best_obj = RESUME_STATE["best_obj"]
+    merge!(STAGE_STATE, RESUME_STATE["stage_state"])
+    append!(epoch_losses, RESUME_STATE["epoch_losses"])
+    current_num_train[] = RESUME_STATE["current_num_train"]
+    current_eval_scenarios[] = RESUME_STATE["current_eval_scenarios"]
+    rollout_evaluation.active_scenarios = current_eval_scenarios[]
+end
+"""
+    map_opt_arrays(f, tree)
+
+Apply `f` to every numeric array of an Optimisers state tree (nested Tuples and
+NamedTuples of `Optimisers.Leaf`), rebuilding each `Leaf` explicitly, so moving the
+state between devices does not depend on a generic move reaching inside `Leaf`.
+"""
+map_opt_arrays(f, x::Flux.Optimisers.Leaf) =
+    Flux.Optimisers.Leaf(x.rule, map_opt_arrays(f, x.state), x.frozen)
+map_opt_arrays(f, x::AbstractArray{<:Number}) = f(x)
+map_opt_arrays(f, x::Union{Tuple,NamedTuple}) = map(y -> map_opt_arrays(f, y), x)
+map_opt_arrays(f, x) = x
+
+const RESUME_OPT_STATE = RESUMING ?
+    (USE_GPU ? map_opt_arrays(CUDA.cu, RESUME_STATE["opt_state"]) : RESUME_STATE["opt_state"]) : nothing
+# The sampler draws from the task's default RNG. It is restored at the START of the
+# first resumed iteration (inside adjust_hyperparameters, before any draw), so no
+# setup work between here and the loop can perturb it.
+const RNG_PENDING = Ref(RESUMING)
+function restore_rng_once!()
+    RNG_PENDING[] || return
+    copy!(Random.default_rng(), RESUME_STATE["rng"])
+    RNG_PENDING[] = false
+    @info "sampler RNG restored; continuing at iteration $START_ITER of $TOTAL_ITERS"
+    # Evidence that the optimizer was restored, not re-created: Adam's moment
+    # estimates are zero in a fresh state.
+    if TEST_PRINT_LOSS
+        tot = Ref(0.0)
+        map_opt_arrays(x -> (tot[] += sum(abs, Array(x)); x), RESUME_OPT_STATE)
+        println("[resume] sum|optimizer state arrays| = ", tot[])
+    end
+end
+
+"""
+    save_resume_state!(iter, m, opt_state)
+
+Write the full continuation state after update `iter` to DR_RESUME_STATE, via a
+temporary file and a rename so a preemption during the write cannot leave a
+truncated file where the last valid state was.
+"""
+function save_resume_state!(iter, m, opt_state)
+    (isempty(RESUME_PATH) || SAVE_LATEST_EVERY <= 0 || iter % SAVE_LATEST_EVERY != 0) && return
+    tmp = RESUME_PATH * ".tmp"
+    jldsave(tmp;
+            run_name = RUN_NAME, iter = iter, fingerprint = RESUME_FINGERPRINT,
+            model_state = checkpoint_policy_state(m), opt_state = map_opt_arrays(Array, opt_state),
+            rng = copy(Random.default_rng()), best_obj = best_obj,
+            stage_state = copy(STAGE_STATE), epoch_losses = copy(epoch_losses),
+            current_num_train = current_num_train[],
+            current_eval_scenarios = current_eval_scenarios[],
+            train_seconds = time() - TRAIN_T0[])
+    mv(tmp, RESUME_PATH; force = true)
+    @info "  resume state @ iter $iter -> $RESUME_PATH"
+    if iter == TEST_EXIT_AFTER_ITER
+        @info "DR_TEST_EXIT_AFTER_ITER=$iter: exiting to simulate a preemption"
+        lg === nothing || close(lg)
+        exit(0)
+    end
+    return
+end
+
+# The wall-time budget is cumulative over the continued run.
+TRAIN_T0[] = time() - (RESUMING ? RESUME_STATE["train_seconds"] : 0.0)
 train_tsddr(
     policy,
     x0_init,
@@ -1071,6 +1231,9 @@ train_tsddr(
     problem_pool           = problem_pool,
     worker_devices         = WORKER_DEVICES,
     worker_problem_builder = worker_de_builder,
+    initial_opt_state    = RESUME_OPT_STATE,
+    start_iter           = START_ITER,
+    after_iteration      = save_resume_state!,
     batch_diagnostics    = (iter, stats) -> begin
         last_batch_stats[] = stats
         n_ok = get(stats, "n_ok", 0)
@@ -1083,6 +1246,7 @@ train_tsddr(
     end,
     adjust_hyperparameters = SCHED_MODE != "" ?
         ((iter, opt_state, n) -> begin
+            restore_rng_once!()
             Flux.Optimisers.adjust!(opt_state, sched_lr(iter))
             n_next = sched_nt!(iter)
             if n_next != current_num_train[]
@@ -1099,6 +1263,7 @@ train_tsddr(
         end) :
         (LR_WARMUP == 0 && LR_FINAL == LR) ?
         ((iter, opt_state, n) -> begin
+            restore_rng_once!()
             n_next = schedule_value(NUM_TRAIN_SCHEDULE, iter, n)
             if n_next != current_num_train[]
                 current_num_train[] = n_next
@@ -1113,6 +1278,7 @@ train_tsddr(
             n_next
         end) :
         ((iter, opt_state, n) -> begin
+            restore_rng_once!()
             Flux.Optimisers.adjust!(opt_state, lr_schedule(iter, TOTAL_ITERS))
             n_next = schedule_value(NUM_TRAIN_SCHEDULE, iter, n)
             if n_next != current_num_train[]
@@ -1129,6 +1295,7 @@ train_tsddr(
         end),
     record_loss          = (iter, m, loss, tag) -> begin
         SCHED_MODE == "" || sched_observe!(Float64(loss))
+        TEST_PRINT_LOSS && println("[loss] iter $iter $(repr(Float64(loss)))")
         metrics = Dict{String, Any}(
             tag => loss,
             "batch" => iter,

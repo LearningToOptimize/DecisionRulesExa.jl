@@ -52,3 +52,6 @@ examples/HydroPowerModels/results/
 # examples/HydroPowerModels/bolivia/case_manifest.json, which is tracked.
 examples/**/audit/
 examples/**/results/
+# Per-stage records written by run_tsddr_lineage.jl (absolute checkpoint paths of
+# one machine); the lineage CONFIG files beside the driver are what is tracked.
+examples/**/lineage_*/

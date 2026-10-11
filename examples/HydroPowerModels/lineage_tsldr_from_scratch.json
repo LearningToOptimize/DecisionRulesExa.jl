@@ -1,0 +1,79 @@
+{
+    "name": "bolivia_tsldr_from_scratch",
+    "description": "TS-LDR baseline: the time-series LINEAR decision rule (affine recurrence over inflow, affine head over [encoding; current inflow], squashing in the feasibility layer) trained with EXACTLY the published TS-DDR schedule (same phases, samples, learning rates, evaluation panel). Only DR_ARCH differs.",
+    "trainer": "train_hydro_exa_strict.jl",
+    "reference": {},
+    "common": {
+        "DR_NUM_STAGES": "126",
+        "DR_NUM_ROLLOUT_STAGES": "96",
+        "DR_NUM_TRAIN_SCHEDULE": "",
+        "DR_SCHED_MODE": "",
+        "DR_CONTEXT": "",
+        "DR_ENCODER_LAYERS": "128,128",
+        "DR_HEAD_LAYERS": "256,256",
+        "DR_ACTIVATION": "stretched",
+        "DR_REACTIVE_DEFICIT": "hard",
+        "DR_SAVE_METRIC": "rollout",
+        "DR_EVAL_PROTOCOL_IDS": "2,39,81,119,130,156,200,206,378,493",
+        "DR_NUM_EVAL_SCENARIOS": "10",
+        "DR_EVAL_SCHEDULE": "",
+        "DR_SKIP_INITIAL_EVAL": "false",
+        "DR_SAVE_LATEST_EVERY": "25",
+        "DR_NUM_WORKERS": "5",
+        "DR_MAX_DEFICIT_PU": "1e-6",
+        "DR_PARENT_REPRO_TOL": "1e-2",
+        "DR_STOP_AFTER_STALE_EVALS": "0",
+        "DR_ABORT_IF_NO_IMPROVE_BY": "0",
+        "DR_ROLLOUT_RETRY_FAILED": "true",
+        "DR_ARCH": "tsldr"
+    },
+    "stages": [
+        {
+            "tag": "phase1",
+            "parent": null,
+            "comment": "From random initialisation. nt is held low and the learning rate high: on the repaired gradient this is the fastest descent regime, and starting at a high nt is flat. Rollout evaluation is pooled here because the stage has no parent value to reproduce.",
+            "env": {
+                "DR_NUM_TRAIN_PER_BATCH": "16",
+                "DR_LR": "1e-3",
+                "DR_LR_FINAL": "1e-4",
+                "DR_LR_WARMUP": "20",
+                "DR_NUM_EPOCHS": "40",
+                "DR_NUM_BATCHES": "10",
+                "DR_EVAL_EVERY": "30",
+                "DR_ROLLOUT_PARALLEL": "true"
+            }
+        },
+        {
+            "tag": "phase2",
+            "parent": "phase1",
+            "comment": "Same sampling and learning-rate band, restarted from the previous phase's selected policy. A restart resets Adam, the cosine phase and the warm-up, which is the point: the stage is a fresh descent from a better initialisation, not a continuation.",
+            "env": {
+                "DR_NUM_TRAIN_PER_BATCH": "16",
+                "DR_LR": "1e-3",
+                "DR_LR_FINAL": "1e-4",
+                "DR_LR_WARMUP": "20",
+                "DR_NUM_EPOCHS": "40",
+                "DR_NUM_BATCHES": "10",
+                "DR_EVAL_EVERY": "50",
+                "DR_MAX_TRAIN_SECONDS": "27296",
+                "DR_ROLLOUT_PARALLEL": "true"
+            }
+        },
+        {
+            "tag": "phase3",
+            "parent": "phase2",
+            "comment": "The convergence stage: nt is raised and the learning rate dropped an order of magnitude, so the gradient is precise and the step small. Rollout evaluation is SEQUENTIAL \u2014 this is the stage whose checkpoint is published, and the sequential path is the one whose reproducibility is established. NOTE that DR_MAX_TRAIN_SECONDS binds before the cosine completes: the published run stopped near iteration 100 of the scheduled 150, so the learning rate reached about 5e-5 rather than the 3e-5 the schedule targets. That is a property of the run being time-capped, not a different schedule, and reproducing this file reproduces it.",
+            "env": {
+                "DR_NUM_TRAIN_PER_BATCH": "24",
+                "DR_LR": "1e-4",
+                "DR_LR_FINAL": "3e-5",
+                "DR_LR_WARMUP": "10",
+                "DR_NUM_EPOCHS": "15",
+                "DR_NUM_BATCHES": "10",
+                "DR_EVAL_EVERY": "25",
+                "DR_MAX_TRAIN_SECONDS": "7700",
+                "DR_ROLLOUT_PARALLEL": "false"
+            }
+        }
+    ]
+}

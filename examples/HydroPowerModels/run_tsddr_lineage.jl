@@ -36,6 +36,11 @@
 # * Re-running the driver RESUMES: a stage whose record exists and whose
 #   checkpoint still hashes correctly is skipped, so an interrupted lineage
 #   continues rather than restarting.
+# * A stage interrupted MID-RUN (e.g. preempted) continues exactly where it
+#   stopped: the trainer keeps its full state in `<out>/resume_<tag>.jld2`
+#   (DR_RESUME_STATE) and a re-run picks it up, so the stage's trajectory is the
+#   uninterrupted one up to solver warm starts. This is the stage's OWN state, not
+#   a `_latest` warm start, and the file is deleted when the stage completes.
 #
 # ── What it records ───────────────────────────────────────────────────────────
 #
@@ -166,6 +171,14 @@ function run_stage(config, stage, parent_record, out_dir; dry_run::Bool)
     end
     env["DR_OUTPUT_TAG"] = tag
     env["DR_STAGE_SUMMARY"] = summary_path
+    # EXACT CONTINUATION of an interrupted stage. The trainer writes its full state
+    # (weights, optimizer, iteration, sampler RNG, best value, counters) here every
+    # DR_SAVE_LATEST_EVERY updates and, when this file exists, continues from it
+    # instead of restarting the stage. It is not a `_latest` warm start: the stage
+    # resumes its own trajectory, and the file is removed once the stage completes.
+    resume_path = joinpath(out_dir, "resume_$(tag).jld2")
+    env["DR_RESUME_STATE"] = resume_path
+    isfile(resume_path) && println("  stage $tag: continuing from $resume_path")
 
     if parent_record === nothing
         # From scratch. Explicitly cleared rather than merely absent, so an
@@ -236,6 +249,9 @@ function run_stage(config, stage, parent_record, out_dir; dry_run::Bool)
     open(stage_record_path(out_dir, tag), "w") do io
         JSON.print(io, record, 2)
     end
+    # The stage is complete and recorded; its continuation state must never be
+    # picked up by a later run of the same tag.
+    rm(resume_path; force = true)
     @printf("  -> selected %s\n     sha256 %s\n     best %s after %s updates in %.1f s\n",
             basename(record["checkpoint"]), record["checkpoint_sha256"],
             record["best_validation"], record["updates_run"], wall)

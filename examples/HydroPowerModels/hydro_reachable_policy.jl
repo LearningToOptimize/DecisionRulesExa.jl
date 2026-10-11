@@ -135,6 +135,9 @@ mutable struct HydroReachablePolicy{E,C,RS,V,S,I}
     cascade_turn_only::V
     cascade_k_max_turn::V
     cascade_reservoir_ids::I
+    # :tsddr_nonlinear (the published policy) or :tsldr_recurrent_linear, the
+    # time-series linear decision rule used as a baseline. See `hydro_reachable_policy`.
+    architecture::Symbol
 end
 
 Flux.@layer HydroReachablePolicy trainable=(encoder, combiner)
@@ -456,7 +459,13 @@ function (m::HydroReachablePolicy)(input)
     # Thread the recurrent state to the next call.
     m.state = new_state
 
-    y = m.combiner(vcat(h, x_prev))
+    # TS-LDR reads [h_t; ξ_t] — the affine encoding and the CURRENT uncertainty,
+    # never the previous state — and squashes in the feasibility layer, so the
+    # raw target z_t = C h_t + D ξ_t + d stays affine in the observed history.
+    # The state still reaches the target through the reachable bounds below.
+    y = m.architecture === :tsldr_recurrent_linear ?
+        stretchedsigmoid.(m.combiner(vcat(h, T.(encoder_input)))) :
+        m.combiner(vcat(h, x_prev))
     # Diagnostic eval-time snap (no-op at ε = 0): near-boundary normalized
     # targets become exact boundary points, which plain sigmoid cannot attain.
     ε = DecisionRulesExa._state_eltype(m.state)(TARGET_SNAP_EPS[])
@@ -548,7 +557,17 @@ function hydro_reachable_policy(
     combiner_layers = Int[],
     n_context::Int = 0,
     n_extra_uncertainty::Int = 0,
+    architecture::Symbol = :tsddr_nonlinear,
 )
+    architecture in (:tsddr_nonlinear, :tsldr_recurrent_linear) ||
+        throw(ArgumentError("architecture must be :tsddr_nonlinear or :tsldr_recurrent_linear"))
+    linear = architecture === :tsldr_recurrent_linear
+    # TS-LDR (the battery study's definition): an affine recurrence
+    # h_t = A h_{t-1} + B ξ_t + b (Flux.RNN with identity activation) over the
+    # uncertainty, and an affine head over [h_t; ξ_t]. The bounded squashing
+    # moves to the feasibility layer (forward pass), so the trainable map is
+    # affine end to end.
+    linear && (encoder_type = p -> Flux.RNN(p, identity))
     any(a -> activation === a, _BOUNDED_ACTIVATIONS) ||
         throw(ArgumentError("hydro_reachable_policy requires a [0,1]-bounded activation (sigmoid, hardsigmoid, or stretchedsigmoid) so normalized targets stay in [0, 1]"))
     nHyd = hydro_data.nHyd
@@ -562,12 +581,19 @@ function hydro_reachable_policy(
                   for i in 1:length(layers)]
     encoder  = Flux.Chain(enc_layers...)
     encoder_width = isempty(layers) ? nHyd + n_extra_uncertainty + n_context : layers[end]
-    combiner = DecisionRulesExa._dense_policy_head(
-        encoder_width + nHyd,
-        nHyd,
-        collect(Int, combiner_layers);
-        activation = activation,
-    )
+    combiner = linear ?
+        DecisionRulesExa._dense_policy_head(
+            encoder_width + nHyd + n_extra_uncertainty + n_context,
+            nHyd,
+            collect(Int, combiner_layers);
+            activation = identity,
+        ) :
+        DecisionRulesExa._dense_policy_head(
+            encoder_width + nHyd,
+            nHyd,
+            collect(Int, combiner_layers);
+            activation = activation,
+        )
     spill_vec = spill_max === nothing ? nothing : Float32.(collect(spill_max))
     if spill_vec !== nothing && length(spill_vec) != nHyd
         throw(ArgumentError("spill_max length must be nHyd=$nHyd"))
@@ -619,5 +645,6 @@ function hydro_reachable_policy(
         Float32[c.turn_only for c in cascade],
         Float32[c.K_max_turn for c in cascade],
         collect(1:nHyd),
+        architecture,
     )
 end

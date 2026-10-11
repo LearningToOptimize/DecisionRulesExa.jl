@@ -213,7 +213,12 @@ policy = hydro_reachable_policy(hydro_data, ENCODER_LAYERS;
                                 encoder_type    = Flux.LSTM,
                                 combiner_layers = HEAD_LAYERS,
                                 n_context       = 0,
-                                n_extra_uncertainty = 0)
+                                n_extra_uncertainty = 0,
+                                # DR_ARCH=tsldr evaluates a TS-LDR checkpoint; the
+                                # weights only load into the architecture they were
+                                # trained with.
+                                architecture = lowercase(strip(get(ENV, "DR_ARCH", "tsddr"))) == "tsldr" ?
+                                               :tsldr_recurrent_linear : :tsddr_nonlinear)
 load_stateconditioned_policy!(policy, JLD2.load(CKPT, "model_state"))
 # The rollout's state and uncertainty live on the device, so the weights must
 # too; `Flux.reset!` after the move re-derives the recurrent state there.

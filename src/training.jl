@@ -916,11 +916,24 @@ gradient by the envelope theorem.
 - `batch_diagnostics`: callback `(iter, stats) -> nothing`.
 - `reuse_solver::Bool`: force solver reuse when fixed variables have constant
   bounds across solves.
+- `initial_opt_state`: optimizer state to continue from (as passed to a previous
+  run's `after_iteration`), or `nothing` to start from `Flux.setup(optimizer, model)`.
+- `start_iter::Int`: first iteration to run; iterations `start_iter:num_batches`
+  are run, so a run interrupted after iteration `k` continues with `start_iter = k+1`.
+- `after_iteration`: callback `(iter, model, opt_state) -> nothing`, called at the
+  end of every iteration that did not stop training (after `record_loss`); it is
+  the only place the optimizer state is visible to the caller, e.g. to checkpoint
+  it for an exact continuation.
 
 # Returns
 - `model`, updated in place.
 
 # Notes
+A continuation with `initial_opt_state`, `start_iter` and the caller's sampler RNG
+restored reproduces the uninterrupted run up to solver warm starts, which are not
+part of the saved state (a cold-started solve agrees to the solver tolerance). The
+critic's optimizer state and replay buffer are not carried across a continuation.
+
 For multi-unit stochastic processes, `uncertainty_sampler` should preserve
 within-stage spatial correlation, for example by drawing one joint scenario
 index per stage.
@@ -965,8 +978,12 @@ function train_tsddr(
     reuse_solver::Bool       = false,
     worker_devices           = nothing,
     worker_problem_builder   = nothing,
+    initial_opt_state        = nothing,
+    start_iter::Int          = 1,
+    after_iteration          = (iter, model, opt_state) -> nothing,
 )
     T    = det_equivalent.horizon
+    start_iter >= 1 || throw(ArgumentError("start_iter must be >= 1, got $start_iter"))
     F    = eltype(initial_state)
     nx   = length(initial_state)
 
@@ -1118,7 +1135,7 @@ function train_tsddr(
         end
     end
 
-    opt_state = Flux.setup(optimizer, model)
+    opt_state = initial_opt_state === nothing ? Flux.setup(optimizer, model) : initial_opt_state
     critic_opt_state = has_critic ? Flux.setup(critic_optimizer, control_variate.critic) : nothing
     critic_buffer = CriticReplayBuffer(critic_buffer_size)
     critic_rollout_solver_state = resolved_critic_training_target isa RolloutCriticTarget &&
@@ -1128,7 +1145,7 @@ function train_tsddr(
 
     try
 
-    for iter in 1:num_batches
+    for iter in start_iter:num_batches
         num_train_per_batch = adjust_hyperparameters(iter, opt_state, num_train_per_batch)
 
         # ── Forward pass: rollout + solve (outside AD tape) ───────────────────
@@ -1393,6 +1410,7 @@ function train_tsddr(
         end
 
         record_loss(iter, model, mean_obj, "metrics/training_loss") && break
+        after_iteration(iter, model, opt_state)
     end
 
     finally
