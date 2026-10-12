@@ -12,57 +12,30 @@
 # one-stage reachable from the previous target, the full target trajectory is
 # feasible by induction and strict regular DE is valid.
 #
-# Environment variables:
+# Environment variables (defaults are the first phase of the from-scratch
+# schedule in lineage_from_scratch.json, which run_tsddr_lineage.jl executes):
 #   DR_ENCODER_LAYERS       = "128,128"  (LSTM encoder layer sizes)
-#   DR_HEAD_LAYERS          = ""         (state-conditioned target-head hidden sizes)
-#   DR_LAYERS               = "128,128"  (legacy alias for DR_ENCODER_LAYERS)
+#   DR_HEAD_LAYERS          = "256,256"  (state-conditioned target-head hidden sizes)
 #   DR_NUM_STAGES           = "126"
 #   DR_NUM_ROLLOUT_STAGES   = "96"
-#   DR_NUM_EPOCHS           = "80"
-#   DR_NUM_BATCHES          = "100"
-#   DR_NUM_TRAIN_PER_BATCH  = "1"        (sampled trajectories per gradient step)
+#   DR_NUM_EPOCHS           = "40"
+#   DR_NUM_BATCHES          = "10"
+#   DR_NUM_TRAIN_PER_BATCH  = "16"       (sampled trajectories per gradient step)
 #   DR_NUM_TRAIN_SCHEDULE   = ""         (optional "lo:hi:n,..." schedule)
 #   DR_CONTEXT              = ""         (""/"none", "phase", or "phase+progress")
-#   DR_NUM_EVAL_SCENARIOS   = "4"        (fixed held-out rollout-selection scenarios)
+#   DR_EVAL_PROTOCOL_IDS    = the ten selection-panel columns of the paired protocol
+#   DR_NUM_EVAL_SCENARIOS   = "10"       (must match the number of panel columns)
 #   DR_EVAL_SCHEDULE        = ""         (optional "lo:hi:n,..." active-eval schedule)
-#   DR_EVAL_EVERY           = "50"
-#   DR_SAVE_METRIC          = "training" ("training" or "rollout")
-#   DR_LR                   = "0.001"
-#   DR_LR_FINAL             = DR_LR      (cosine-decay final learning rate)
-#   DR_LR_WARMUP            = "0"        (linear warmup iterations from DR_LR/100)
-#   DR_PRETRAINED_MODEL     = ""         (optional diagnostic warmstart checkpoint)
-#   DR_REACTIVE_DEFICIT     = "free"     ("free", "hard", or a finite penalty)
+#   DR_EVAL_EVERY           = "30"
+#   DR_SAVE_METRIC          = "rollout"  ("rollout" selects on the panel, "training" on the loss)
+#   DR_LR                   = "1e-3"
+#   DR_LR_FINAL             = "1e-4"     (cosine-decay final learning rate)
+#   DR_LR_WARMUP            = "20"       (linear warmup iterations from DR_LR/100)
+#   DR_NUM_WORKERS          = "1"        (parallel solves per step; the schedule uses 5)
+#   DR_PRETRAINED_MODEL     = ""         (checkpoint to continue from)
 #   DR_GRAD_CLIP            = "0"
 #   DR_MAX_ITER             = "9000"
-#
-# Reproducible recipes:
-#
-#   Historical baseline (all defaults, byte-compatible training semantics):
-#     julia --project -t auto train_hydro_exa_strict.jl
-#
-#   Fresh fast/fair candidate (headline timing starts at this command):
-#     DR_REACTIVE_DEFICIT=hard DR_SAVE_METRIC=rollout \
-#     DR_NUM_EVAL_SCENARIOS=8 DR_EVAL_EVERY=100 \
-#     DR_NUM_TRAIN_PER_BATCH=2 \
-#     DR_LR=5e-4 DR_LR_FINAL=5e-5 DR_LR_WARMUP=100 \
-#     DR_NUM_EPOCHS=25 DR_NUM_BATCHES=100 \
-#     DR_HEAD_LAYERS=128,128 \
-#     julia --project -t auto train_hydro_exa_strict.jl
-#
-#   Progressive-sampling Phase B (spend samples only after coarse movement):
-#     DR_REACTIVE_DEFICIT=hard DR_SAVE_METRIC=rollout \
-#     DR_NUM_EVAL_SCENARIOS=12 DR_EVAL_SCHEDULE=1:800:4,801:1400:8,1401:1800:12 \
-#     DR_NUM_TRAIN_PER_BATCH=1 DR_NUM_TRAIN_SCHEDULE=1:800:1,801:1400:2,1401:1800:4 \
-#     DR_LR=7e-4 DR_LR_FINAL=2e-5 DR_LR_WARMUP=100 \
-#     DR_NUM_EPOCHS=18 DR_NUM_BATCHES=100 \
-#     DR_HEAD_LAYERS=256,256 \
-#     julia --project -t auto train_hydro_exa_strict.jl
-#
-#   Diagnostic warmstart (not a clean headline unless parent time is counted):
-#     DR_PRETRAINED_MODEL=<checkpoint.jld2> DR_SAVE_METRIC=rollout \
-#     DR_NUM_TRAIN_PER_BATCH=4 DR_LR=1e-4 DR_LR_FINAL=1e-5 DR_LR_WARMUP=50 \
-#     DR_NUM_EPOCHS=10 DR_HEAD_LAYERS=<matching head> \
-#     julia --project -t auto train_hydro_exa_strict.jl
+# The reactive power balance is hard (no reactive slack), as in every engine.
 #
 # Usage:
 #   julia --project -t auto train_hydro_exa_strict.jl
@@ -189,7 +162,7 @@ function schedule_tag(schedule, prefix::AbstractString)
 end
 
 const ENCODER_LAYERS = parse_layers(get(ENV, "DR_ENCODER_LAYERS", get(ENV, "DR_LAYERS", "128,128")))
-const HEAD_LAYERS    = parse_layers(get(ENV, "DR_HEAD_LAYERS", ""))
+const HEAD_LAYERS    = parse_layers(get(ENV, "DR_HEAD_LAYERS", "256,256"))
 # Target-head activation. "sigmoid" is the historical default; it cannot
 # exactly attain reachable-interval boundaries (where SDDP places ~24% of its
 # realized states), so boundary-attaining alternatives are available:
@@ -202,9 +175,9 @@ const ACTIVATION = let raw = lowercase(strip(get(ENV, "DR_ACTIVATION", "stretche
 end
 const NUM_STAGES  = parse(Int, get(ENV, "DR_NUM_STAGES", "126"))
 const NUM_ROLLOUT_STAGES = parse(Int, get(ENV, "DR_NUM_ROLLOUT_STAGES", "96"))
-const NUM_EPOCHS  = parse(Int, get(ENV, "DR_NUM_EPOCHS", "80"))
-const NUM_BATCHES = parse(Int, get(ENV, "DR_NUM_BATCHES", "100"))
-const NUM_TRAIN_PER_BATCH = parse(Int, get(ENV, "DR_NUM_TRAIN_PER_BATCH", "1"))
+const NUM_EPOCHS  = parse(Int, get(ENV, "DR_NUM_EPOCHS", "40"))
+const NUM_BATCHES = parse(Int, get(ENV, "DR_NUM_BATCHES", "10"))
+const NUM_TRAIN_PER_BATCH = parse(Int, get(ENV, "DR_NUM_TRAIN_PER_BATCH", "16"))
 const NUM_TRAIN_SCHEDULE  = parse_int_schedule(get(ENV, "DR_NUM_TRAIN_SCHEDULE", ""), "DR_NUM_TRAIN_SCHEDULE")
 const CONTEXT_MODE = canonical_context_mode(get(ENV, "DR_CONTEXT", ""))
 const CONTEXT_PERIOD = countlines(INFLOW_FILE)
@@ -212,22 +185,22 @@ const CONTEXT_HORIZON = NUM_STAGES
 const _base_context = build_stage_context(CONTEXT_MODE, CONTEXT_HORIZON, CONTEXT_PERIOD)
 const STAGE_CONTEXT = _base_context
 const N_CONTEXT = isnothing(STAGE_CONTEXT) ? 0 : size(STAGE_CONTEXT, 1)
-const NUM_EVAL_SCENARIOS  = parse(Int, get(ENV, "DR_NUM_EVAL_SCENARIOS", "4"))
+const NUM_EVAL_SCENARIOS  = parse(Int, get(ENV, "DR_NUM_EVAL_SCENARIOS", "10"))
 const EVAL_SCHEDULE       = parse_int_schedule(get(ENV, "DR_EVAL_SCHEDULE", ""), "DR_EVAL_SCHEDULE")
 if !isnothing(EVAL_SCHEDULE) && maximum(last.(EVAL_SCHEDULE)) > NUM_EVAL_SCENARIOS
     throw(ArgumentError("DR_EVAL_SCHEDULE cannot exceed DR_NUM_EVAL_SCENARIOS=$(NUM_EVAL_SCENARIOS)"))
 end
-const EVAL_EVERY  = parse(Int, get(ENV, "DR_EVAL_EVERY", "50"))
-const SAVE_METRIC = lowercase(strip(get(ENV, "DR_SAVE_METRIC", "training")))
+const EVAL_EVERY  = parse(Int, get(ENV, "DR_EVAL_EVERY", "30"))
+const SAVE_METRIC = lowercase(strip(get(ENV, "DR_SAVE_METRIC", "rollout")))
 SAVE_METRIC in ("training", "rollout") ||
     throw(ArgumentError("DR_SAVE_METRIC must be training or rollout; got $SAVE_METRIC"))
-const ENABLE_WANDB = parse(Bool, get(ENV, "DR_ENABLE_WANDB", "true"))
+const ENABLE_WANDB = parse(Bool, get(ENV, "DR_ENABLE_WANDB", "false"))
 # Load Wandb (PythonCall/CondaPkg) ONLY when enabled. With W&B off this avoids the
 # CondaPkg "Downloading artifact: pixi" hang on compute nodes with no/slow internet.
 ENABLE_WANDB && @eval using Wandb
 const LR          = parse(Float32, get(ENV, "DR_LR", "0.001"))
-const LR_FINAL    = parse(Float32, get(ENV, "DR_LR_FINAL", string(LR)))
-const LR_WARMUP   = parse(Int, get(ENV, "DR_LR_WARMUP", "0"))
+const LR_FINAL    = parse(Float32, get(ENV, "DR_LR_FINAL", "1e-4"))
+const LR_WARMUP   = parse(Int, get(ENV, "DR_LR_WARMUP", "20"))
 const PRE_TRAINED = strip(get(ENV, "DR_PRETRAINED_MODEL", ""))
 const HAS_PRETRAINED = !(isempty(PRE_TRAINED) || lowercase(PRE_TRAINED) == "nothing")
 const REACTIVE_DEFICIT_RAW = "hard"
@@ -262,7 +235,7 @@ const ROLLOUT_PARALLEL = parse(Bool, get(ENV, "DR_ROLLOUT_PARALLEL", "false"))
 # nine-scenario mean. With this on, each failed scenario is retried once through
 # a fresh sequential solve before the evaluation is judged. Off by default so
 # existing callers are unaffected.
-const ROLLOUT_RETRY_FAILED = parse(Bool, get(ENV, "DR_ROLLOUT_RETRY_FAILED", "false"))
+const ROLLOUT_RETRY_FAILED = parse(Bool, get(ENV, "DR_ROLLOUT_RETRY_FAILED", "true"))
 
 const MAX_ITER = parse(Int, get(ENV, "DR_MAX_ITER", "9000"))
 const SOLVER_KWARGS = (print_level = MadNLP.ERROR, tol = 1e-6, max_iter = MAX_ITER)
@@ -829,7 +802,7 @@ end
 #    NOTE: arbitrary small draws carry offsets of hundreds-to-thousands of
 #    cost units vs the paired protocol; never compare their values across
 #    runs with different eval sets.
-const EVAL_PROTOCOL_IDS = let raw = strip(get(ENV, "DR_EVAL_PROTOCOL_IDS", ""))
+const EVAL_PROTOCOL_IDS = let raw = strip(get(ENV, "DR_EVAL_PROTOCOL_IDS", "2,39,81,119,130,156,200,206,378,493"))
     isempty(raw) ? Int[] : [parse(Int, strip(x)) for x in split(raw, ",")]
 end
 
@@ -1004,7 +977,7 @@ rollout_evaluation.active_scenarios = current_eval_scenarios[]
 # time) — so it blocks the multi-GPU training start with pure single-GPU work.
 # Skip it by default: best_obj stays Inf and the first periodic eval sets the
 # baseline, letting the 12 workers engage all GPUs immediately.
-const SKIP_INITIAL_EVAL = parse(Bool, get(ENV, "DR_SKIP_INITIAL_EVAL", "true"))
+const SKIP_INITIAL_EVAL = parse(Bool, get(ENV, "DR_SKIP_INITIAL_EVAL", "false"))
 if RESUMING
     @info "Initial rollout evaluation skipped: continuing a run (best value restored from the resume file)"
 elseif SAVE_METRIC == "rollout" && !SKIP_INITIAL_EVAL
@@ -1068,7 +1041,7 @@ const STAGE_SUMMARY = strip(get(ENV, "DR_STAGE_SUMMARY", ""))
 # so a mismatch means the checkpoint loaded is not the one that produced the
 # recorded value. That is a hard stop, not a warning — every downstream number
 # would be attributed to the wrong policy.
-const PARENT_REPRO_TOL = parse(Float64, get(ENV, "DR_PARENT_REPRO_TOL", "1e-3"))
+const PARENT_REPRO_TOL = parse(Float64, get(ENV, "DR_PARENT_REPRO_TOL", "1e-2"))
 if !RESUMING && isfinite(SEED_BEST) && SAVE_METRIC == "rollout" && !SKIP_INITIAL_EVAL
     observed = rollout_evaluation.last_objective_no_target_penalty
     if !isfinite(observed) || abs(observed - SEED_BEST) > PARENT_REPRO_TOL

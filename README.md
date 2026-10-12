@@ -288,9 +288,15 @@ Choose DecisionRules.jl when:
 
 ## Examples
 
-- [`examples/end_to_end_cpu.jl`](examples/end_to_end_cpu.jl) — minimal CPU demo with a linear tracking problem
-- [`examples/end_to_end_gpu.jl`](examples/end_to_end_gpu.jl) — same demo on GPU with CUDSS
-- [`examples/BatteryStorageOPF/`](examples/BatteryStorageOPF/) — reproducible PGLib AC-OPF cases with linear battery storage
+`examples/end_to_end_cpu.jl` and `examples/end_to_end_gpu.jl` train a policy on a
+small linear tracking problem on the CPU and on a GPU. The two case studies of the
+paper, `examples/HydroPowerModels/` and `examples/BatteryStorageOPF/`, hold the GPU
+trainers and the training schedules; the cases, the SDDP baselines and the JuMP
+engines are in the same directories of DecisionRules.jl. To reproduce a case
+study, start from the
+[examples README](https://github.com/LearningToOptimize/DecisionRules.jl/tree/main/examples)
+of DecisionRules.jl. How the code of both packages is organized is described in
+[Reading the code](https://LearningToOptimize.github.io/DecisionRules.jl/dev/guide/reading_the_code/).
 
 ## Repository Map
 
@@ -306,7 +312,8 @@ Choose DecisionRules.jl when:
 | `src/utils.jl` | Indexing and small shared utilities |
 | `examples/end_to_end_cpu.jl` | Minimal CPU training demo |
 | `examples/end_to_end_gpu.jl` | Minimal GPU training demo |
-| `examples/BatteryStorageOPF/` | PGLib AC-OPF battery-storage example |
+| `examples/HydroPowerModels/` | Bolivian hydrothermal case study: GPU trainer, lineage driver, training schedules |
+| `examples/BatteryStorageOPF/` | Battery-storage AC-OPF case study: GPU trainer |
 | `test/runtests.jl` | Unit and smoke tests |
 
 ## Citation

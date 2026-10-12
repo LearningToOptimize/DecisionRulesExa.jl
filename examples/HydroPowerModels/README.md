@@ -1,8 +1,11 @@
 # Bolivia hydro — ExaModels engine
 
 The GPU half of the long-term hydrothermal planning case study: this directory
-trains and evaluates the policy. The case, the SDDP baseline and the figures live
-in the companion package, `DecisionRules.jl/examples/HydroPowerModels`.
+trains and evaluates the TS-DDR policy and the linear decision rule. The case, the
+SDDP and reinforcement-learning baselines and the figures live in the companion
+package, `DecisionRules.jl/examples/HydroPowerModels`. A run of the shipped
+schedule reaches a policy of the same quality as the published one, not the same
+policy: the stage problems are nonconvex and training is stochastic.
 
 **The science is in the documentation** of that package, under *Case studies →
 Long-term hydrothermal planning*. This file is the operating manual.
@@ -26,7 +29,8 @@ their solutions in the same format, without either depending on the other.
 | `hydro_training_utils.jl` | small shared helpers for the training scripts |
 | `train_hydro_exa_strict.jl` | ONE training stage, fully parameterized by environment variables |
 | `run_tsddr_lineage.jl` | the lineage driver: runs a declared multi-stage schedule end to end, chaining only selected checkpoints |
-| `lineage_from_scratch.json` | the published from-scratch training schedule, as data: one entry per phase |
+| `lineage_from_scratch.json` | the from-scratch TS-DDR training schedule, as data: one entry per phase |
+| `lineage_tsldr_from_scratch.json` | the same schedule for the linear decision rule; only the architecture differs |
 | `eval_paired_exa.jl` | paired evaluation of a checkpoint, with per-stage physical recording and an optional full-solution dump |
 | `generate_canonical_case_artifacts.jl` | the frozen-case contract and its verifier |
 
@@ -47,17 +51,18 @@ GPU stack (MadNLPGPU + CUDSS + cuDNN) is working before committing hours:
 DR_NUM_STAGES=8 DR_NUM_ROLLOUT_STAGES=8 \
 DR_NUM_EPOCHS=1 DR_NUM_BATCHES=3 DR_NUM_TRAIN_PER_BATCH=2 \
 DR_NUM_EVAL_SCENARIOS=2 DR_EVAL_PROTOCOL_IDS=2,39 DR_EVAL_EVERY=3 \
-DR_ENABLE_WANDB=false \
   julia --project=. -t auto train_hydro_exa_strict.jl
 ```
 
-**3. The full from-scratch training recipe.** This is the published schedule,
-declared in `lineage_from_scratch.json` and executed stage by stage:
+**3. The full from-scratch training recipe.** The schedule is declared in
+`lineage_from_scratch.json` and executed stage by stage; the linear decision rule
+runs the same schedule from its own file:
 
 ```bash
 julia --project=. run_tsddr_lineage.jl                 # full lineage
 julia --project=. run_tsddr_lineage.jl --dry-run       # print the plan only
 julia --project=. run_tsddr_lineage.jl --stages=phase3  # resume one phase
+julia --project=. run_tsddr_lineage.jl --config=lineage_tsldr_from_scratch.json
 ```
 
 Each stage runs as its own process, so a stage boundary is a real restart: the
@@ -66,15 +71,17 @@ begin again. The driver chains only checkpoints that a COMPLETE, non-shedding
 panel evaluation selected, hashes every parent before use, refuses `_latest`
 snapshots outright, and stops the lineage — rather than falling back — if a
 stage produces nothing selectable. Re-running resumes: a stage whose record
-exists and whose checkpoint still hashes correctly is skipped.
+exists and whose checkpoint still hashes correctly is skipped, and a stage that
+was interrupted continues its own trajectory from the full training state it
+saved, rather than starting the phase again.
 
 Records land in `bolivia/ACPPowerModel/lineage/`: one JSON per stage with the
 resolved environment, ancestry, checkpoint hashes, update count and both the
 process wall time and the trainer's own training-loop seconds, plus a
 lineage-level ledger.
 
-Neither W&B nor a workload manager is required. `DR_ENABLE_WANDB=false` turns
-logging off; nothing in the driver reads a scheduler variable.
+Neither W&B nor a workload manager is required. W&B logging is off unless
+`DR_ENABLE_WANDB=true`; nothing in the driver reads a scheduler variable.
 
 **4. Paired evaluation of a checkpoint.**
 
@@ -95,8 +102,9 @@ evaluators, which have them directly.)
 
 ## Configuration surface of one training stage
 
-`train_hydro_exa_strict.jl` is driven entirely by environment variables; the
-lineage driver simply sets them. The ones that define a stage:
+`train_hydro_exa_strict.jl` is driven entirely by environment variables, whose
+defaults are the first phase of the from-scratch schedule; the lineage driver
+simply sets them. The ones that define a stage:
 
 | variable | meaning |
 |---|---|
