@@ -211,7 +211,7 @@ const TARGET_PEN_ARG = :auto
 const HYDRO_TARGET_PENALTY_MULT = 8.0
 # MAIN: 60 USD/MWh × 100 MVA = 6000 USD/(pu·stage).
 const DEFICIT_COST   = 6000.0
-const USE_GPU        = true
+const USE_GPU        = get(ENV, "DR_USE_GPU", "true") != "false"   # DR_USE_GPU=false: CPU-only timing runs
 const load_scaler    = 0.6
 const qd_scaler      = 0.6
 # Parallel-sample training: solve the `num_train_per_batch` per-gradient DEs
@@ -599,6 +599,45 @@ result0 = MadNLP.madnlp(prob.model; SOLVER_KWARGS..., print_level = MadNLP.WARN)
 isfinite(result0.objective) || error("Smoke test returned non-finite objective")
 solve_succeeded(result0) || @warn "Smoke test did not fully converge; proceeding anyway"
 
+# DR_TIMING_ONLY=3: wall-clock time of the NETWORK part of one training update — the
+# rollout of the policy over T stages for S scenarios and its reverse-mode gradient
+# against the target duals, written exactly as the training closure — and of one
+# decision (a single-stage forward pass). CPU always, GPU when CUDA is functional.
+# Warm (one untimed call first), minimum of 5. Exits.
+if get(ENV, "DR_TIMING_ONLY", "") == "3"
+    nw = length(w_mean) ÷ T                                   # inflow entries per stage
+    function net_update(m, x0, ws, λ)
+        Flux.withgradient(m) do mm
+            tot = zero(eltype(λ))
+            for w in ws
+                Flux.reset!(mm); prev = x0
+                for t in 1:T
+                    xt = mm(vcat(view(w, (t-1)*nw+1:t*nw), prev))
+                    tot += sum(view(λ, (t-1)*nHyd+1:t*nHyd) .* xt); prev = xt
+                end
+            end
+            tot / length(ws)
+        end
+    end
+    devices = [("CPU", identity)]
+    isdefined(Main, :CUDA) && getglobal(Main, :CUDA).functional() && push!(devices, ("GPU", getglobal(Main, :CUDA).cu))
+    for (dev, mv) in devices
+        m = policy isa ContextualPolicy ? ContextualPolicy(mv(policy.policy), mv(policy.context)) : mv(policy)
+        x0 = mv(Float32.(x0_init)); w = mv(Float32.(w_mean)); λ = mv(randn(Float32, nHyd * T))
+        for S in (1, 16, 24)
+            ws = [w for _ in 1:S]
+            net_update(m, x0, ws, λ)                                         # warm-up
+            secs = minimum(@elapsed(net_update(m, x0, ws, λ)) for _ in 1:5)
+            @info "[nettiming] update network time on $dev" S T seconds = round(secs; digits = 4)
+        end
+        Flux.reset!(m); m(vcat(view(w, 1:nw), x0))                           # warm-up
+        dsec = minimum(@elapsed((Flux.reset!(m); m(vcat(view(w, 1:nw), x0)))) for _ in 1:20)
+        @info "[nettiming] one decision (single-stage forward) on $dev" seconds = round(dsec; digits = 6)
+        flush(stderr)
+    end
+    exit(0)
+end
+
 # DR_TIMING_ONLY=1: wall-clock time of ONE warm solve of the strict problem, on the
 # GPU and on the CPU, for the full T-stage training problem and for a single stage,
 # at the smoke-test instance (mean inflows, this policy's reachable targets). Each
@@ -624,6 +663,41 @@ if get(ENV, "DR_TIMING_ONLY", "") == "1"
             @info "[timing] $lab on $dev" status = r.status iterations = r.iter seconds = round(secs; digits = 3)
             flush(stderr)
         end
+    end
+    exit(0)
+end
+
+# DR_TIMING_ONLY=2: the strict problem separates by stage (every state is pinned to
+# its target), so an update can solve its T stages independently. This times EVERY
+# stage t alone — incoming state x̂_{t-1}, inflow w_t, target x̂_t — warm, on the GPU
+# and on the CPU, and reports the slowest and the mean stage on each device. Exits.
+if get(ENV, "DR_TIMING_ONLY", "") == "2"
+    nw = length(w_mean) ÷ T                                  # inflow entries per stage
+    for (dev, be) in (("CPU", nothing), ("GPU", CUDA.CUDABackend()))
+        secs_t = zeros(T); iters_t = zeros(Int, T)
+        for t in 1:T
+            p = build_hydro_de(power_data, hydro_data, 1; backend = be, float_type = Float64,
+                               formulation = FORMULATION, target_penalty = TARGET_PEN_ARG,
+                               deficit_cost = DEFICIT_COST,
+                               demand_matrix = demand_mat === nothing ? nothing : demand_mat[t:t, :],
+                               reactive_demand_matrix = reactive_mat === nothing ? nothing : reactive_mat[t:t, :],
+                               load_scaler = load_scaler, strict_targets = true,
+                               reactive_deficit_cost = REACTIVE_DEFICIT_COST, demand_spread = DEMAND_SPREAD)
+            xin = t == 1 ? x0_init : xhat_mean[(nHyd * (t - 2) + 1):(nHyd * (t - 1))]   # incoming state x̂_{t-1}
+            w_t = w_mean[(nw * (t - 1) + 1):(nw * t)]                                   # inflow of stage t
+            x_t = xhat_mean[(nHyd * (t - 1) + 1):(nHyd * t)]                            # target x̂_t
+            ExaModels.set_parameter!(p.core, p.p_x0, xin)
+            ExaModels.set_parameter!(p.core, p.p_inflow, w_t)
+            ExaModels.set_parameter!(p.core, p.p_target, x_t)
+            prepare_solve!(p, xin, w_t, x_t)
+            MadNLP.madnlp(p.model; SOLVER_KWARGS...)                                    # warm-up, untimed
+            secs_t[t] = @elapsed r = MadNLP.madnlp(p.model; SOLVER_KWARGS...)
+            iters_t[t] = r.iter
+            solve_succeeded(r) || @warn "[stagetiming] stage $t on $dev did not converge" status = r.status
+        end
+        @info "[stagetiming] $T single stages on $dev" max_s = round(maximum(secs_t); digits = 4) mean_s = round(sum(secs_t) / T; digits = 4) sum_s = round(sum(secs_t); digits = 3) slowest_stage = argmax(secs_t) max_iter = maximum(iters_t)
+        println("[stagetiming] $dev seconds per stage: ", join(round.(secs_t; digits = 4), " "))
+        flush(stderr); flush(stdout)
     end
     exit(0)
 end
