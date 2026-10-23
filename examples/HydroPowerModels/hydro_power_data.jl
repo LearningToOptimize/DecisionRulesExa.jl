@@ -10,6 +10,7 @@
 # (DC-OPF susceptance formula, branch-variable formulation).
 
 using JSON, CSV, Tables, Statistics, Random
+using StableRNGs   # seeded demand-noise draws for the paired eval protocol
 
 # ── Power system data structures ─────────────────────────────────────────────
 
@@ -244,7 +245,8 @@ function load_hydro_data(hydro_file::AbstractString,
                           power_data::PowerData;
                           num_stages::Union{Int,Nothing} = nothing)
 
-    hydro_json = JSON.parsefile(hydro_file)["Hydrogenerators"]
+    hydro_root = JSON.parsefile(hydro_file)
+    hydro_json = hydro_root["Hydrogenerators"]
     nHyd = length(hydro_json)
 
     # Build gen_index → gen_pos map
@@ -303,9 +305,18 @@ function load_hydro_data(hydro_file::AbstractString,
         scenario_inflows[r] = Float64.(allinflows[:, ((r-1)*nScenarios+1):(r*nScenarios)])
     end
 
-    # Water balance conversion factor K = 0.0036 (standard HydroPowerModels.jl value)
-    # Converts turbine outflow (m³/s equivalent) to reservoir volume per stage.
-    K = 0.0036
+    # Water-balance conversion factor K = 0.0036 · stage_hours.
+    # 0.0036 converts a flow of m³/s to reservoir volume (hm³) accumulated over one
+    # HOUR (3600 s/h · 1e-6 hm³/m³ = 0.0036). Multiplying by the stage duration
+    # `stage_hours` (hours per stage) gives the per-stage flow→volume factor, so the
+    # reservoir balance `V_{t+1} = V_t + K·(inflow − outflow) − spill(+upstream)`
+    # is dimensionally correct for a `stage_hours`-long stage.
+    # `stage_hours` is read from hydro.json and defaults to 1 (⇒ K = 0.0036) for
+    # backward compatibility with cases predating the field. This exactly mirrors
+    # HydroPowerModels.jl `constraint_hydro_balance` (k = 0.0036, coefficient
+    # k · params["stage_hours"]) so the Exa and JuMP engines share one water balance.
+    stage_hours = Int(get(hydro_root, "stage_hours", 1))
+    K = 0.0036 * stage_hours
 
     return HydroData(nHyd, units, upstream_turns, upstream_spills,
                      K, initial_volumes, scenario_inflows, nScenarios, nStagesSample)
@@ -387,6 +398,233 @@ function mean_inflow(hydro_data::HydroData, T::Int)
         for r in 1:nHyd
             w[(t-1)*nHyd + r] = mean(hydro_data.scenario_inflows[r][t_row, :])
         end
+    end
+    return w
+end
+
+# ── Stochastic demand (demand_scenarios.csv) ──────────────────────────────────
+#
+# Demand model for the STOCHASTIC-demand variant of this case (see
+# the MAIN repo): an i.i.d. per-stage MULTIPLICATIVE factor on every bus's
+# active demand,
+#
+#     ξ_t ∈ {1 − s, 1, 1 + s},  P = 1/3 each,  independent of the inflow noise,
+#
+# with the spread s read from `<case>/demand_scenarios.csv` (single line
+# `s,<value>`). On the ExaModels side ξ_t travels INSIDE the per-stage
+# uncertainty vector: an augmented scenario is stage-major
+# `[w_t; ξ_t]` (length T·(nHyd+1)), so the policy observes ξ_t exactly like it
+# observes the stage inflow, and `prepare_solve!` applies base_demand·ξ_t to
+# the p_demand parameter via `set_demand!` before every solve.
+
+# Seed of the column-keyed demand-noise protocol: eval scenario column c draws
+# its demand path from StableRNG(DEMAND_NOISE_SEED + c). Shared by
+# train_hydro_exa_strict.jl (protocol eval set) and eval_paired_exa_strict.jl
+# (paired-500 protocol), so both see IDENTICAL demand paths per inflow column.
+const DEMAND_NOISE_SEED = 20260714
+
+"""
+    load_demand_spread(path::AbstractString) -> Union{Float64, Nothing}
+
+Read the demand-noise spread `s` from a `demand_scenarios.csv` file.
+
+The file holds a single data line `s,<value>` (e.g. `s,0.10`) defining the
+three-atom multiplicative demand distribution
+
+```math
+\\xi_t \\in \\{1 - s,\\; 1,\\; 1 + s\\}, \\qquad P = \\tfrac{1}{3} \\text{ each}.
+```
+
+# Arguments
+- `path::AbstractString`: path to `demand_scenarios.csv`.
+
+# Returns
+- `Float64` spread `s ∈ [0, 1)` when the file exists.
+- `nothing` when the file does not exist (deterministic demand — every code
+  path then behaves bit-identically to the pre-demand-noise implementation).
+"""
+function load_demand_spread(path::AbstractString)
+    # Missing file ⇒ deterministic demand (backwards-compatible default).
+    isfile(path) || return nothing
+    # Exactly one non-empty line carries the single `s,<value>` record.
+    lines = [strip(line) for line in eachline(path) if !isempty(strip(line))]
+    length(lines) == 1 || error(
+        "demand_scenarios.csv must contain exactly one non-empty line `s,<value>`; " *
+        "found $(length(lines))",
+    )
+    line = only(lines)
+    # Split into the key token and the numeric value.
+    parts = split(line, ',')
+    # Enforce the exact two-field `s,<value>` format shared by both engines.
+    length(parts) == 2 && strip(parts[1]) == "s" ||
+        error("demand_scenarios.csv must contain a single line `s,<value>`; got `$line`")
+    # Parse the spread value.
+    s = parse(Float64, strip(parts[2]))
+    # A spread ≥ 1 would make the low atom non-positive demand; forbid it.
+    0.0 <= s < 1.0 || error("demand spread must satisfy 0 ≤ s < 1; got $s")
+    return s
+end
+
+"""
+    demand_noise_atoms(spread::Real) -> Vector{Float64}
+
+Return the three equiprobable multiplicative demand atoms
+
+```math
+\\{1 - s,\\; 1,\\; 1 + s\\}
+```
+
+for spread `s` (each with probability 1/3, i.i.d. across stages).
+"""
+demand_noise_atoms(spread::Real) = begin
+    0.0 <= spread < 1.0 || error("demand spread must satisfy 0 ≤ s < 1; got $spread")
+    [1.0 - Float64(spread), 1.0, 1.0 + Float64(spread)]
+end
+
+"""Return the demand-atom IDs for paired-protocol inflow column `column`."""
+function protocol_demand_atom_indices(T::Integer, column::Integer;
+                                      seed::Integer=DEMAND_NOISE_SEED)
+    T >= 0 || throw(ArgumentError("T must be nonnegative; got $T"))
+    column >= 1 || throw(ArgumentError("column must be positive; got $column"))
+    return rand(StableRNG(seed + column), 1:3, T)
+end
+
+"""
+    sample_demand_factors(rng, T::Int, spread::Real) -> Vector{Float64}
+
+Draw `T` i.i.d. per-stage demand factors `ξ_t` from the three-atom
+distribution `{1−s, 1, 1+s}` (probability 1/3 each) using `rng`.
+
+The draws are made SEQUENTIALLY (one `rand` per stage), so for a fixed seed the
+length-`T₁` path is a prefix of the length-`T₂ ≥ T₁` path — training with
+`T = 126` and evaluating with `T = 96` therefore share the first 96 factors of
+each protocol column.
+
+# Arguments
+- `rng`: any `AbstractRNG` (pass `StableRNG(DEMAND_NOISE_SEED + column)` for
+  protocol-paired draws).
+- `T::Int`: number of stages.
+- `spread::Real`: demand spread `s`.
+
+# Returns
+- `Vector{Float64}` of length `T` with entries in `{1−s, 1, 1+s}`.
+"""
+function sample_demand_factors(rng, T::Int, spread::Real)
+    # The three equiprobable atoms.
+    atoms = demand_noise_atoms(spread)
+    # One sequential draw per stage (prefix property — see docstring).
+    return [atoms[rand(rng, 1:3)] for _ in 1:T]
+end
+
+"""
+    protocol_demand_factors(spread::Real, T::Int, column::Int) -> Vector{Float64}
+
+Seeded demand-factor path for paired-protocol inflow column `column`:
+
+```math
+\\xi^{(c)} = \\mathrm{sample\\_demand\\_factors}(\\mathrm{StableRNG}(\\mathrm{seed} + c),\\; T,\\; s).
+```
+
+Column-keyed seeding pairs the demand path with the inflow column: any script
+evaluating column `c` (training-time protocol eval, paired-500 Exa eval, or
+paired SDDP Historical eval) sees the IDENTICAL atom path, making the complete
+joint uncertainty trajectory reproducible and paired across methods.
+
+# Arguments
+- `spread::Real`: demand spread `s`.
+- `T::Int`: number of stages.
+- `column::Int`: paired-protocol scenario column id.
+
+# Returns
+- `Vector{Float64}` of length `T`.
+"""
+protocol_demand_factors(spread::Real, T::Int, column::Int) =
+    demand_noise_atoms(spread)[protocol_demand_atom_indices(T, column)]
+
+"""
+    augment_scenario(w::AbstractVector, ξ::AbstractVector) -> Vector{Float64}
+
+Interleave a flat stage-major inflow trajectory `w` (length `T·nHyd`) with
+per-stage demand factors `ξ` (length `T`) into the augmented stage-major
+uncertainty vector
+
+```math
+[w_1;\\, \\xi_1;\\; w_2;\\, \\xi_2;\\; \\ldots;\\; w_T;\\, \\xi_T]
+```
+
+of length `T·(nHyd+1)`, i.e. per-stage blocks `[w_t; ξ_t]`. This is the layout
+the demand-noise DE builder sizes `p_inflow` for and the layout
+`HydroReachablePolicy` slices (`n_uncertainty = nHyd + 1`, physical inflow =
+first `nHyd` entries of each block).
+
+# Arguments
+- `w::AbstractVector`: flat inflow trajectory, length divisible by `length(ξ)`.
+- `ξ::AbstractVector`: per-stage demand factors, length `T`.
+
+# Returns
+- `Vector{Float64}` of length `T·(nHyd+1)`.
+"""
+function augment_scenario(w::AbstractVector, ξ::AbstractVector)
+    # Number of stages comes from the factor vector.
+    T = length(ξ)
+    # Per-stage inflow width must divide the flat inflow length exactly.
+    nHyd, rem = divrem(length(w), T)
+    rem == 0 || error("length(w)=$(length(w)) is not divisible by T=$T")
+    # Allocate the augmented stage-major output.
+    out = Vector{Float64}(undef, T * (nHyd + 1))
+    for t in 1:T
+        # Copy the stage-t inflow block.
+        out[(t-1)*(nHyd+1)+1 : (t-1)*(nHyd+1)+nHyd] = @view w[(t-1)*nHyd+1 : t*nHyd]
+        # Append the stage-t demand factor as the block's last entry.
+        out[t*(nHyd+1)] = ξ[t]
+    end
+    return out
+end
+
+"""
+    sample_scenario(hydro_data, T, demand_spread; rng = Random.default_rng())
+        -> Vector{Float64}
+
+Demand-noise variant of [`sample_scenario`](@ref): draws the joint inflow
+trajectory AND i.i.d. per-stage demand factors
+
+```math
+\\xi_t \\sim \\mathrm{Uniform}\\{1-s,\\; 1,\\; 1+s\\}
+```
+
+(independent of the inflow draw), returning the augmented stage-major vector
+`[w_t; ξ_t]` of length `T·(nHyd+1)` (see [`augment_scenario`](@ref)).
+
+# Arguments
+- `hydro_data::HydroData`: inflow scenario data.
+- `T::Int`: number of stages.
+- `demand_spread::Real`: demand spread `s`.
+
+# Keywords
+- `rng`: random number generator (defaults to the task-global RNG, so
+  `Random.seed!` seeds it exactly like the 2-arg method).
+
+# Returns
+- `Vector{Float64}` of length `T·(nHyd+1)`.
+"""
+function sample_scenario(hydro_data::HydroData, T::Int, demand_spread::Real;
+                         rng = Random.default_rng())
+    nHyd = hydro_data.nHyd
+    # The three equiprobable demand atoms.
+    atoms = demand_noise_atoms(demand_spread)
+    # Augmented per-stage width: nHyd inflows + 1 demand factor.
+    nu = nHyd + 1
+    w = Vector{Float64}(undef, T * nu)
+    for t in 1:T
+        # Cyclic raw-row mapping (same convention as the 2-arg method).
+        t_row = mod1(t, hydro_data.nStagesSample)
+        # One joint inflow index per stage — all reservoirs share it.
+        j = rand(rng, 1:hydro_data.nScenarios)
+        for r in 1:nHyd
+            w[(t-1)*nu + r] = hydro_data.scenario_inflows[r][t_row, j]
+        end
+        # Independent demand draw for the same stage (separate rand call).
+        w[t*nu] = atoms[rand(rng, 1:3)]
     end
     return w
 end
