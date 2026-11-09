@@ -17,6 +17,7 @@ jobs:
     permissions:
       actions: write
       contents: read
+      id-token: write # OIDC token for tokenless Codecov uploads (see codecov step)
     strategy:
       fail-fast: false
       matrix:
@@ -37,8 +38,22 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v7
+      # Pinned to v5: codecov-action@v7 silently stopped uploading coverage in
+      # the sibling DecisionRules.jl repo (Codecov "Missing Head Commit" on
+      # PRs); v5 is the last version verified to upload from this workflow
+      # shape. Before re-bumping, migrate deliberately and confirm a commit
+      # appears on Codecov.
+      # Authentication uses OIDC (`use_oidc` + the job's `id-token: write`
+      # permission) because the CODECOV_TOKEN secret is not set in this repo
+      # ("Token length: 0" in CI) and tokenless uploads are rejected on
+      # protected branches. OIDC requires the Codecov GitHub App to be
+      # installed for the organization AND this repository to be activated on
+      # codecov.io (it currently is not); if uploads fail with an OIDC error,
+      # either install the app + activate the repo, or set the CODECOV_TOKEN
+      # secret and replace `use_oidc` with `token: ${{ secrets.CODECOV_TOKEN }}`.
+      - uses: codecov/codecov-action@v5
         with:
           files: lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
+          use_oidc: true
+          # Fail loudly so upload breakage is visible instead of silent.
+          fail_ci_if_error: true
