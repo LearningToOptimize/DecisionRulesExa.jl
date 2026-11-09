@@ -2,8 +2,29 @@
 #
 # Optional scalar critic / control-variate support for TS-DDR training.
 
+"""
+    AbstractCriticControlVariate
+
+Supertype of the critic configurations accepted by `train_tsddr`.
+
+# Notes
+A configuration decides whether a scalar critic ``C(f)`` is trained alongside the
+policy and used as a control variate on the dual-multiplier actor gradient.
+[`NoCriticControlVariate`](@ref) disables it (the plain TS-DDR update);
+[`ScalarCriticControlVariate`](@ref) enables it.
+"""
 abstract type AbstractCriticControlVariate end
 
+"""
+    AbstractCriticTrainingTarget
+
+Supertype of the selectors that decide which objective value the critic is fitted to.
+
+# Notes
+[`DeterministicEquivalentCriticTarget`](@ref) fits the critic to the
+deterministic-equivalent training objective; [`RolloutCriticTarget`](@ref) fits it
+to the cost of a stage-wise rollout of the current policy.
+"""
 abstract type AbstractCriticTrainingTarget end
 
 """

@@ -100,6 +100,44 @@ stage and the decision trace that reproduces it, in the shared long format of
 figures are built from. (Nodal prices are duals and come from the JuMP engine's
 evaluators, which have them directly.)
 
+**5. Timing an update, and spreading it over many cores.** With strict targets
+every reservoir volume is pinned to the policy's target, ``x_t = \hat x_t``, so the
+deterministic equivalent of one scenario stops coupling its weeks: week ``t`` sees
+the previous target ``\hat x_{t-1}`` only as data. An update over ``S`` scenarios of
+``T`` weeks is therefore ``S \times T`` independent one-week problems, and the
+target multiplier the training needs is assembled from the weekly ones,
+``\lambda_t = y_t - y_{t+1}``, where ``y_t`` is the multiplier of week ``t``'s target
+constraint (and ``y_{T+1} = 0``). The trainer exposes four timing modes, each of
+which exits after printing its measurement:
+
+| `DR_TIMING_ONLY` | what is timed |
+|---|---|
+| `1` | one warm solve of the full ``T``-week problem and of a single week, on GPU and CPU |
+| `2` | every week alone, warm, on GPU and CPU: the slowest and the mean week |
+| `3` | the network part of an update (rollout over ``T`` weeks and its reverse pass) and one decision |
+| `4` | complete updates with rollout, weekly solves and gradient on worker processes (`hydro_fulliter.jl`) |
+
+Mode 4 is the one to copy when an update must be fast on a CPU machine. It starts
+`DR_FI_WORKERS` single-threaded worker processes (one per core; threads of one
+process do not run interior-point solves concurrently), each holding one
+one-week model built by the trainer's own builder (`hydro_fulliter_worker.jl`),
+and then runs `DR_FI_BATCHES` updates for every batch size in `DR_FI_TRAJ`:
+
+```bash
+DR_USE_GPU=false DR_TIMING_ONLY=4 DR_FI_WORKERS=24 DR_FI_TRAJ=16+24 DR_FI_NET=pipelined \
+  julia --project=. -t 1 train_hydro_exa_strict.jl
+```
+
+With `DR_FI_NET=workers` the three parts run one after another; with
+`DR_FI_NET=pipelined` a scenario's reverse pass is queued as soon as its ``T``
+weekly multipliers are back, so the gradients overlap the remaining solves and the
+update costs little more than its solves. The first update of every batch size is
+checked against the trainer's own path, the full ``T``-week problem solved per
+scenario and differentiated in one process: the log prints the cosine between the
+two gradients and the largest relative gaps in objective and multipliers, so a
+change that breaks the decomposition shows up at once. Results are written to
+`DR_FI_OUT` (default `logs/fulliter_cpu.json`).
+
 ## Configuration surface of one training stage
 
 `train_hydro_exa_strict.jl` is driven entirely by environment variables, whose

@@ -599,6 +599,13 @@ result0 = MadNLP.madnlp(prob.model; SOLVER_KWARGS..., print_level = MadNLP.WARN)
 isfinite(result0.objective) || error("Smoke test returned non-finite objective")
 solve_succeeded(result0) || @warn "Smoke test did not fully converge; proceeding anyway"
 
+# DR_TIMING_ONLY=4: wall-clock time of complete updates with every part on worker
+# processes, one per core (hydro_fulliter.jl). Run with DR_USE_GPU=false. Exits.
+if get(ENV, "DR_TIMING_ONLY", "") == "4"
+    include(joinpath(SCRIPT_DIR, "hydro_fulliter.jl"))
+    exit(0)
+end
+
 # DR_TIMING_ONLY=3: wall-clock time of the NETWORK part of one training update — the
 # rollout of the policy over T stages for S scenarios and its reverse-mode gradient
 # against the target duals, written exactly as the training closure — and of one
